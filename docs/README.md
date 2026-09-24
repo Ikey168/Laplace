@@ -90,11 +90,13 @@ by area:
 - [Reverse debugging with gdb](testing/reverse-debugging.md) and
   [driving time-travel from MCP](testing/mcp-server.md).
 
-The persistence and time-travel stacks have headless end-to-end demos under
-`scripts/test/` (for example `persistence_demo.sh`, `scrub_demo.sh`,
-`timetravel_live_demo.sh`, `qemu_persistence_demo.sh`) that double as CI gates in
-`.github/workflows/persistence.yml`. Recordings of the live runs are under
-[`media/`](media/).
+The booted kernel is tested in QEMU by `make selftest`,
+`tests/qemu/timetravel_e2e.py` (a heisenbug debugged backward over MCP and gdb),
+and `scripts/test/qemu_persistence_demo.sh` (power cuts and resume). The
+host harnesses under `scripts/test/` (`persistence_demo.sh`, `scrub_demo.sh`,
+`timetravel_live_demo.sh`, ...) exercise the time-travel modules outside the
+kernel. All of them run in CI (`.github/workflows/laplace.yml`). Recordings of
+the QEMU runs, made with `tools/record-cast`, are under [`media/`](media/).
 
 ## Contributing to docs
 

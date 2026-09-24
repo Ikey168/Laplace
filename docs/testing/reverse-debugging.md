@@ -1,103 +1,87 @@
-# Reverse Debugging with GDB (#172)
+# Reverse debugging with gdb
 
-IKOS exposes its time-travel reverse execution to a normal gdb session, so you
-can step and run the whole system backward through its recorded history from the
-gdb prompt.
+Laplace serves the gdb remote serial protocol from inside the kernel, over its
+second serial port (COM2). Stock gdb attaches to it with `target remote` and
+debugs the recorded machine backward and forward: registers, memory,
+breakpoints, watchpoints, `reverse-stepi`, `reverse-continue`, and the usual
+forward commands, all against the reconstructed state.
 
-## How it fits together
+This is not QEMU's gdb server (`qemu -s`), which debugs the emulated CPU and
+knows nothing about Laplace's history. Laplace's stub belongs to the kernel and
+answers from its own recording.
 
-Reverse execution is a property of IKOS's replay engine (#165), not of the
-emulated CPU. Restoring the nearest keyframe (#168) and replaying the input
-journal (#161) forward reconstructs any past moment (#169); stepping that
-position backward is reverse-step / reverse-continue (#170), and scanning back to
-a condition is a reverse breakpoint or watchpoint (#171).
+## A session
 
-GDB drives reverse debugging with two Remote Serial Protocol packets:
-
-| gdb command | RSP packet | IKOS handler |
-|-------------|-----------|--------------|
-| `reverse-stepi` | `bs` | `kreverse_step()` |
-| `reverse-continue` | `bc` | `kreverse_continue()` |
-
-GDB only sends these after the target advertises support, so IKOS's stub answers
-`qSupported` with `ReverseStep+;ReverseContinue+`. The stub lives in
-`kernel/gdbstub.c` (pure RSP framing and dispatch) and `kernel/gdbstub_sync.c`
-(the bs/bc wiring and the serial transport).
-
-This is a separate connection from QEMU's own gdb server (`qemu -s`, used by
-`make debug`): that server debugs the emulated CPU going forward and does not
-know about IKOS's replay history. IKOS's stub runs inside the kernel and speaks
-gdb RSP over the serial port, so gdb talks to IKOS directly for reverse control.
-
-## The serial transport
-
-The stub itself does no I/O: `kernel/gdbstub.c` only frames, checksums, and
-dispatches packets. `kernel/gdb_serial.c` is the transport loop that connects it
-to the serial port. For each request it:
-
-1. reads a framed packet `$<payload>#<cc>` from the line, skipping stray `+`/`-`
-   acks between packets,
-2. acknowledges the request with `+`,
-3. hands the frame to `gdbstub_serve()` (which unframes, dispatches, and reframes
-   the reply), and
-4. writes the framed reply, then waits for gdb's `+` ack, retransmitting the
-   reply if gdb answers `-`.
-
-A `Ctrl-C` (`0x03`) between packets is answered with a stop reply (`S05`). The
-byte I/O is injected, so the loop is host-tested with a scripted byte stream; the
-kernel adapter `kernel/gdb_serial_sync.c` wires it to the 16550 UART.
-
-At boot the kernel calls `gdbstub_serial_init()`, which configures the serial
-line and registers the reverse ops with `gdbstub_bind_reverse()`; the blocking
-serve loop `gdbstub_serial_run()` is entered on demand from the debug path.
-
-## Using it
-
-1. Boot IKOS under QEMU with a serial line gdb can attach to, and with the
-   in-kernel stub enabled (`gdbstub_serial_init()` registers the reverse ops and
-   configures the UART at boot; `gdbstub_serial_run()` serves the packets).
-
-2. From gdb, connect to the serial line and confirm the reverse packets were
-   negotiated:
-
-   ```
-   (gdb) target remote <serial>
-   (gdb) show can-use-reverse-execution
-   ```
-
-3. Drive execution backward:
-
-   ```
-   (gdb) reverse-stepi      # one step back: restores the prior keyframe and
-                            # replays to just before the current point
-   (gdb) reverse-continue   # run backward to the previous stop / the oldest
-                            # retained keyframe
-   ```
-
-The reach of a rewind is bounded by the keyframe retention ring (#168): reverse
-execution stops at the oldest retained keyframe rather than running off the end.
-
-## Verifying the stub
-
-The RSP handling is unit-tested headlessly:
+Boot the heisenbug workload (the default) and wait for the machine to stop:
 
 ```
-cd tests
-gcc -I../include -Wall -o /tmp/t_gdb test_gdbstub.c ../kernel/gdbstub.c && /tmp/t_gdb
+$ make run
+...
+heisenbug: ledger at 0x0000000040001000, batch_limit at 0x0000000040001100
+monitor: stopped (break: pid 1 asserted (code bad)) at epoch 14 step 1689; gdb on COM2, MCP on COM3
 ```
 
-The test checks the checksum/framing, that `qSupported` advertises the reverse
-packets, and that `bs` / `bc` map to reverse-step / reverse-continue. The serial
-transport loop is tested separately over a scripted byte stream:
+`make run` puts COM2 on `127.0.0.1:1235`. In another terminal:
 
 ```
-cd tests
-gcc -I../include -Wall -o /tmp/t_gsl test_gdb_serial.c \
-    ../kernel/gdb_serial.c ../kernel/gdbstub.c ../kernel/gdbstub_sync.c && /tmp/t_gsl
+$ gdb build/user/heisenbug.elf
+(gdb) set remotetimeout 120
+(gdb) target remote :1235
+main () at user/laplace/heisenbug.c:73
+(gdb) print g.batch_limit
+$1 = 10724                                   # should be 48: something clobbered it
+(gdb) watch -l g.batch_limit
+Hardware watchpoint 1: -location g.batch_limit
+(gdb) reverse-continue
+Thread 1 hit Hardware watchpoint 1: -location g.batch_limit
+
+Old value = 10724
+New value = 48
+0x00000000400000ac in produce (payload=payload@entry=10724, burst=burst@entry=1) at user/laplace/heisenbug.c:42
+42	    g.ring[slot] = payload;
+(gdb) info registers rax
+rax            0x40                64        # slot 64 of a 64-slot ring
+(gdb) monitor verify
+byte-exact: 14 epochs re-executed from their keyframes
 ```
 
-It checks that a packet is read past stray acks, acked with `+`, and its reply
-framed and written; that `qSupported`/`bs`/`bc` flow end to end; that a `-`
-reply-ack retransmits; and that a `Ctrl-C` yields a stop reply. Driving a live
-`reverse-stepi` from gdb against a running IKOS exercises the same handlers over
-the real serial transport.
+This transcript is what `tests/qemu/timetravel_e2e.py` runs and checks in CI.
+
+## What gdb sees
+
+- **Threads** are processes (`info threads`); a stop names the current one.
+- **Registers and memory** are read from the machine as reconstructed at the
+  current position. Recorded history is read-only: writes are refused.
+- **`stepi` / `reverse-stepi`** move one instruction. Laplace reaches an
+  instruction by restoring the nearest keyframe, replaying to the enclosing
+  kernel entry, and single-stepping (RFLAGS.TF) to it; moving back across a
+  kernel entry first counts the previous segment's instructions.
+- **`continue` / `reverse-continue`** run to the next or previous hit of a
+  breakpoint or watchpoint (up to four: they are the CPU's debug registers,
+  scoped to the process gdb had selected when they were inserted), or to the end
+  or start of the recording, which gdb reports as "No more reverse-execution
+  history". A watchpoint found going backward stops before the write, with the
+  old value still in memory, which is what gdb expects.
+- **`continue` at the end of the recording** leaves history: the machine runs
+  live, recording, until it stops again (Ctrl-C in gdb stops it).
+- **`monitor where | window | verify | stats | goto E S [I] | help`** are
+  Laplace commands. `verify` re-executes every retained epoch and compares
+  checksums of memory, registers, process table, and scheduler; it can take a
+  few seconds, hence `set remotetimeout 120`.
+
+## Positions
+
+`monitor where` prints the position as `(epoch, step, insn)`. A step is one
+kernel entry (a system call or a fault); insn 0 is the moment the entry traps,
+insn 1 the moment after it was handled, insn k after k-1 further instructions.
+See [`docs/architecture/time-travel.md`](../architecture/time-travel.md).
+
+## Implementation
+
+| Piece | File |
+|-------|------|
+| RSP framing and packet dispatch (pure, unit-tested) | `kernel/gdbstub.c`, `tests/test_gdbstub.c` |
+| Serial packet loop (acks, retransmit) | `kernel/gdb_serial.c`, `tests/test_gdb_serial.c` |
+| Target: registers, memory, threads, stepping, breakpoints | `kernel/core/gdb_target.c` |
+| Navigation (stepi, continue, searches) | `kernel/core/timetravel.c` |
+| Monitor: serves COM2 while the machine is stopped | `kernel/core/monitor.c` |
