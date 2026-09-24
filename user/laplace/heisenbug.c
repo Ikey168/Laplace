@@ -31,7 +31,7 @@ struct ledger {
 
 struct ledger g;
 
-static void produce(uint32_t payload, int burst) {
+__attribute__((noinline)) static void produce(uint32_t payload, int burst) {
     uint32_t slot;
     if (burst) {
         g.bursts++;

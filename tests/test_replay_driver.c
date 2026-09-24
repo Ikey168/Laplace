@@ -187,6 +187,37 @@ int main(void) {
     CHECK(replay_driver_run(&g_d, 8, 7, 0) == REPLAY_ERR_PARAM,
           "keyframe after target rejected");
 
+    /* The epoch's recorded length (#223): a whole-epoch re-drive runs the
+     * epoch to its end, not just to its last preemption point. */
+    rows_reset();
+    add_row(20, REPLAY_EV_SCHED, 0, 3, 3);
+    add_row(20, REPLAY_EV_EPOCH_LEN, 0, 50, 50);
+    add_row(21, REPLAY_EV_EPOCH_LEN, 0, 8, 8);
+    {
+        uint64_t len = 0;
+        bool has = false;
+        uint32_t n_pts2 = 0, n_times2 = 0, n_ent2 = 0;
+        CHECK(replay_split_epoch_ex(&src, 20, pts, &n_pts2, times, &n_times2, ent, &n_ent2,
+                                    &len, &has) == REPLAY_OK && has && len == 50,
+              "split reports the epoch length");
+        rec_total_steps = 0;
+        CHECK(replay_driver_run(&g_d, 20, 21, 2) == REPLAY_OK, "replay across a sized epoch");
+        CHECK(rec_total_steps == 50 + 2, "whole epoch 20 re-driven for its 50 recorded steps");
+    }
+
+    /* replay_driver_bind: the engine carries the driver's hooks for callers
+     * that run it themselves (the rewind verb, #226). */
+    {
+        replay_driver_t* d = &g_d;
+        CHECK(replay_driver_bind(d) == REPLAY_OK, "bind initializes the engine");
+        rec_total_steps = 0;
+        rec_restore_calls = 0;
+        CHECK(replay_run(&d->engine, 21, 21, 5) == REPLAY_OK && rec_restore_calls == 1 &&
+              rec_total_steps == 5, "replay_run on the bound engine restores and drives");
+        replay_driver_t empty = { 0 };
+        CHECK(replay_driver_bind(&empty) == REPLAY_ERR_PARAM, "bind rejects missing hooks");
+    }
+
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
            failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;

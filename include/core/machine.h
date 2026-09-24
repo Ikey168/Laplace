@@ -96,9 +96,10 @@ void machine_start(void);
  * Replay: stops at the target set by machine_set_target(). */
 void machine_resume(void);
 
-/* Replay targets: stop at (current epoch, step) and, when insn > 0, after that
- * many further user instructions (#228). max_step bounds the replay: reaching
- * it without hitting the target stops with STOP_END. */
+/* Replay targets: stop at (current epoch, step). With insn > 0 the target lies
+ * in the segment after entry `step`: insn 1 is right after the entry was
+ * handled, insn k after k-1 further user instructions (#228). max_step bounds
+ * the replay: reaching it without hitting the target stops with STOP_END. */
 void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step);
 void machine_clear_target(void);
 
@@ -116,10 +117,22 @@ typedef struct {
 } machine_hwbp_t;
 void machine_set_hwbp(int slot, const machine_hwbp_t* bp);
 void machine_clear_hwbps(void);
+bool machine_hwbps_set(void);
+/* Arm the set breakpoints for the next runs (continue / search only). */
+void machine_set_hwbp_active(bool on);
 
 /* A callback at every replayed entry, before the stop checks (#226 scans). */
 typedef void (*machine_entry_hook_fn)(void* ctx, uint64_t step);
 void machine_set_entry_hook(machine_entry_hook_fn fn, void* ctx);
+
+/* Breakpoint searches (#228): while set, a hardware breakpoint or watchpoint
+ * hit during replay calls fn(ctx, segment, ordinal, dr6) and execution
+ * continues. `segment` is the entry index the segment follows; `ordinal`
+ * counts hits within that segment from 1; `insn` is the exact position when
+ * the segment is being single-stepped (instruction counting), else 0. */
+typedef void (*machine_hit_hook_fn)(void* ctx, uint64_t segment, uint32_t ordinal, uint64_t insn,
+                                    uint64_t dr6);
+void machine_set_hit_hook(machine_hit_hook_fn fn, void* ctx);
 
 /* Instruction counting for the current segment during replay (#228). */
 void     machine_set_count_insns(bool on);

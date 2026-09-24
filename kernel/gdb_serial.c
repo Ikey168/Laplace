@@ -73,7 +73,8 @@ static uint32_t cstr_len(const char* s) {
 int gdb_serial_serve_once(const gdb_serial_ops_t* ops, gdb_serial_serve_fn serve) {
     if (!ops || !serve) return GDB_SERIAL_ERR;
 
-    char frame[300];
+    /* Static: a register file or memory dump fills several kilobytes. */
+    static char frame[GDB_SERIAL_MAX_FRAME];
     int flen = gdb_serial_read_packet(ops, frame, sizeof(frame));
     if (flen == GDB_SERIAL_CLOSED) return GDB_SERIAL_CLOSED;
     if (flen == GDB_SERIAL_INTERRUPT) {
@@ -85,10 +86,10 @@ int gdb_serial_serve_once(const gdb_serial_ops_t* ops, gdb_serial_serve_fn serve
     /* Ack the well-formed request. */
     if (ops->put_byte(ops->ctx, '+') != 0) return GDB_SERIAL_ERR;
 
-    char reply[300];
+    static char reply[GDB_SERIAL_MAX_FRAME];
     int rlen = serve(frame, (uint32_t)flen, reply, sizeof(reply));
     if (rlen < 0) return GDB_SERIAL_ERR;
-
+    if (rlen == 0) return GDB_SERIAL_OK;   /* the request expects no reply (k) */
     return gdb_serial_send_packet(ops, reply, (uint32_t)rlen);
 }
 

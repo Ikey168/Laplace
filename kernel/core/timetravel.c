@@ -665,3 +665,362 @@ void tt_bind_verbs(void) {
     krevbreak_bind(kreverse_ctx());
     krevbreak_set_scanner(scan_cb, 0);
 }
+
+/* ---- Instruction-level navigation (#227, #228) ---- */
+
+void tt_position(tt_pos_t* p) {
+    p->epoch = machine_epoch();
+    p->step = machine_step();
+    p->insn = machine_insn();
+}
+
+static bool pos_before(const tt_pos_t* a, const tt_pos_t* b) {
+    if (a->epoch != b->epoch) return a->epoch < b->epoch;
+    if (a->step != b->step) return a->step < b->step;
+    return a->insn < b->insn;
+}
+
+static bool neighbour_epoch(uint64_t epoch, bool newer, uint64_t* out) {
+    keyframe_store_t* ks = keyframe_store_get();
+    if (!ks) return false;
+    const keyframe_ring_t* r = keyframe_store_ring(ks);
+    bool found = false;
+    for (uint32_t i = 0; i < KEYFRAME_RING_MAX; i++) {
+        const keyframe_slot_t* s = &r->slots[i];
+        if (!s->valid) continue;
+        if (newer ? (s->epoch > epoch && (!found || s->epoch < *out))
+                  : (s->epoch < epoch && (!found || s->epoch > *out))) {
+            *out = s->epoch;
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool tt_at_end(void) {
+    if (machine_mode() == MACHINE_LIVE) return true;
+    return machine_epoch() == g_end_epoch && machine_step() == g_end_step &&
+           machine_at_entry();
+}
+
+int tt_goto_pos(const tt_pos_t* p) {
+    return tt_goto(p->epoch, p->step, p->insn);
+}
+
+/* The machine sits at the end of epoch `epoch` (its last entry), which is the
+ * state keyframe `next` captured: continue in `next` without restoring. */
+static int cross_into(uint64_t next) {
+    if (replay_load_epoch(next) != 0) return TT_ERR_JOURNAL;
+    machine_set_position(next, 0);
+    kreverse_set_position(next, 0);
+    return TT_OK;
+}
+
+#define TT_SEGMENT_ENDED 10   /* internal: the target lay past its segment's end */
+
+/* Run forward to (epoch, step, insn), continuing from the current state when
+ * the machine is replaying that epoch at or before the target. */
+static int advance_to(uint64_t epoch, uint64_t step, uint64_t insn) {
+    tt_pos_t c, t = { epoch, step, insn };
+    tt_position(&c);
+    uint64_t len;
+    if (!tt_epoch_len(epoch, &len)) return TT_ERR_JOURNAL;
+    if (machine_mode() != MACHINE_REPLAY || c.epoch != epoch || pos_before(&t, &c)) {
+        return tt_goto(epoch, step, insn);
+    }
+    if (!pos_before(&c, &t)) return TT_OK;   /* already there */
+    uint64_t from = machine_step();
+    machine_set_target(step, insn, len);
+    machine_resume();
+    machine_clear_target();
+    g_stats.replayed_steps += machine_step() - from;
+    const machine_stop_t* st = machine_last_stop();
+    kreverse_set_position(machine_epoch(), machine_step());
+    if (st->reason == STOP_TARGET) return TT_OK;
+    if (st->reason == STOP_END && machine_at_entry() && insn > 0 && machine_step() == step + 1) {
+        return TT_SEGMENT_ENDED;
+    }
+    return TT_ERR_REPLAY;
+}
+
+int tt_stepi(void) {
+    if (machine_mode() != MACHINE_REPLAY) return tt_at_end() ? TT_END : TT_ERR_STATE;
+    if (tt_at_end()) return TT_END;
+    tt_pos_t p;
+    tt_position(&p);
+    uint64_t len;
+    if (!tt_epoch_len(p.epoch, &len)) return TT_ERR_JOURNAL;
+    if (machine_at_entry() && p.step == len) {
+        uint64_t next;
+        if (!neighbour_epoch(p.epoch, true, &next)) return TT_END;
+        int rc = cross_into(next);
+        if (rc != TT_OK) return rc;
+        tt_position(&p);
+    }
+    int rc = advance_to(p.epoch, p.step, machine_at_entry() ? 1 : p.insn + 1);
+    if (rc == TT_SEGMENT_ENDED) return TT_OK;   /* landed on the next entry */
+    return rc;
+}
+
+int tt_reverse_stepi(void) {
+    tt_pos_t p;
+    tt_position(&p);
+    if (!machine_at_entry()) {
+        return tt_goto(p.epoch, p.step, p.insn > 1 ? p.insn - 1 : 0);
+    }
+    uint64_t epoch = p.epoch, step = p.step;
+    if (step == 0) {
+        /* (prev, len) is this keyframe: the moment before it is the last
+         * position of the previous non-empty epoch. */
+        uint64_t prev = epoch, len = 0;
+        do {
+            if (!neighbour_epoch(prev, false, &prev)) return TT_BEGIN;
+            if (!tt_epoch_len(prev, &len)) return TT_ERR_JOURNAL;
+        } while (len == 0);
+        epoch = prev;
+        step = len;
+    }
+    uint64_t n;
+    int rc = tt_segment_length(epoch, step - 1, &n);
+    if (rc != TT_OK) return rc;
+    return tt_goto(epoch, step - 1, n + 1);
+}
+
+/* ---- Breakpoint and watchpoint searches ---- */
+
+typedef struct {
+    bool     found;
+    uint64_t segment;
+    uint32_t ordinal;
+    uint64_t insn;
+    uint64_t dr6;
+    uint64_t insn_limit;   /* partial segment: only hits before this position */
+} hit_log_t;
+
+static void log_hit(void* c, uint64_t segment, uint32_t ordinal, uint64_t insn, uint64_t dr6) {
+    hit_log_t* h = (hit_log_t*)c;
+    if (h->insn_limit && insn >= h->insn_limit) return;
+    h->found = true;
+    h->segment = segment;
+    h->ordinal = ordinal;
+    h->insn = insn;
+    h->dr6 = dr6;
+}
+
+static void report_hit(tt_hit_t* hit, uint64_t dr6) {
+    if (!hit) return;
+    hit->hit = true;
+    hit->dr6 = dr6;
+    hit->slot = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (dr6 & (1u << i)) { hit->slot = i; break; }
+    }
+}
+
+/* Land exactly on the `ordinal`-th hit of the segment after entry `segment`,
+ * single-stepping it so the instruction position is exact. */
+static int locate_hit(uint64_t epoch, uint64_t segment, uint32_t ordinal, tt_hit_t* hit) {
+    int rc = tt_goto(epoch, segment, 0);
+    if (rc != TT_OK) return rc;
+    machine_set_hwbp_active(true);
+    machine_set_count_insns(true);
+    machine_set_target(segment + 1, 0, segment + 1);   /* never past the segment */
+    for (;;) {
+        machine_resume();
+        const machine_stop_t* st = machine_last_stop();
+        if (st->reason != STOP_BREAKPOINT) {
+            rc = TT_ERR_REPLAY;
+            break;
+        }
+        if (st->code >= ordinal) {
+            report_hit(hit, st->dr6);
+            rc = TT_OK;
+            break;
+        }
+    }
+    machine_clear_target();
+    machine_set_count_insns(false);
+    machine_set_hwbp_active(false);
+    kreverse_set_position(machine_epoch(), machine_step());
+    return rc;
+}
+
+int tt_continue(tt_hit_t* hit) {
+    if (hit) hit->hit = false;
+    if (machine_mode() != MACHINE_REPLAY || tt_at_end()) return TT_END;
+    if (!machine_hwbps_set()) {
+        tt_pos_t e = { g_end_epoch, g_end_step, 0 };
+        int rc = tt_goto_pos(&e);
+        return rc == TT_OK ? TT_END : rc;
+    }
+    for (;;) {
+        tt_pos_t p;
+        tt_position(&p);
+        uint64_t len;
+        if (!tt_epoch_len(p.epoch, &len)) return TT_ERR_JOURNAL;
+        if (machine_at_entry() && p.step == len) {
+            if (tt_at_end()) return TT_END;
+            uint64_t next;
+            if (!neighbour_epoch(p.epoch, true, &next)) return TT_END;
+            int rc = cross_into(next);
+            if (rc != TT_OK) return rc;
+            continue;
+        }
+        uint64_t from = machine_step();
+        machine_set_target(len, 0, len);
+        machine_set_hwbp_active(true);
+        machine_resume();
+        machine_set_hwbp_active(false);
+        machine_clear_target();
+        g_stats.replayed_steps += machine_step() - from;
+        const machine_stop_t* st = machine_last_stop();
+        if (st->reason == STOP_BREAKPOINT) {
+            /* Stopped right at the hit; re-run its segment to learn the
+             * exact instruction position. */
+            return locate_hit(p.epoch, machine_step(), (uint32_t)st->code, hit);
+        }
+        if (st->reason != STOP_TARGET) return TT_ERR_REPLAY;
+        kreverse_set_position(machine_epoch(), machine_step());
+    }
+}
+
+/* Replay `epoch` from its keyframe up to entry `limit`, logging the last
+ * hardware hit. */
+static int scan_hits(uint64_t epoch, uint64_t limit, hit_log_t* log) {
+    int rc = tt_goto(epoch, 0, 0);
+    if (rc != TT_OK) return rc;
+    if (limit == 0) return TT_OK;
+    uint64_t len;
+    tt_epoch_len(epoch, &len);
+    machine_set_hit_hook(log_hit, log);
+    machine_set_hwbp_active(true);
+    rc = tt_drive(epoch, limit, 0, len);
+    machine_set_hwbp_active(false);
+    machine_set_hit_hook(0, 0);
+    return rc;
+}
+
+int tt_reverse_continue(tt_hit_t* hit) {
+    if (hit) hit->hit = false;
+    tt_pos_t p;
+    tt_position(&p);
+    tt_window_t w;
+    if (!tt_window(&w)) return TT_ERR_STATE;
+    if (!machine_hwbps_set()) {
+        /* Nothing to stop at: run back to the start of the recording. */
+        int rc = tt_goto(w.oldest, 0, 0);
+        return rc == TT_OK ? TT_BEGIN : rc;
+    }
+
+    /* 1. The partial segment before the current position. */
+    if (!machine_at_entry() && p.insn >= 2) {
+        hit_log_t log = { 0 };
+        log.insn_limit = p.insn;
+        int rc = tt_goto(p.epoch, p.step, 0);
+        if (rc != TT_OK) return rc;
+        machine_set_count_insns(true);
+        machine_set_hit_hook(log_hit, &log);
+        machine_set_hwbp_active(true);
+        rc = advance_to(p.epoch, p.step, p.insn);
+        machine_set_hwbp_active(false);
+        machine_set_hit_hook(0, 0);
+        machine_set_count_insns(false);
+        if (rc != TT_OK) return rc;
+        if (log.found) {
+            rc = tt_goto(p.epoch, p.step, log.insn);
+            report_hit(hit, log.dr6);
+            return rc;
+        }
+    }
+
+    /* 2. Whole segments before it, epoch by epoch, newest first. */
+    uint64_t epoch = p.epoch, limit = p.step;
+    for (;;) {
+        hit_log_t log = { 0 };
+        int rc = scan_hits(epoch, limit, &log);
+        if (rc != TT_OK) return rc;
+        if (log.found) return locate_hit(epoch, log.segment, log.ordinal, hit);
+        if (!neighbour_epoch(epoch, false, &epoch)) break;
+        if (!tt_epoch_len(epoch, &limit)) return TT_ERR_JOURNAL;
+    }
+    int rc = tt_goto(w.oldest, 0, 0);
+    return rc == TT_OK ? TT_BEGIN : rc;
+}
+
+/* ---- Last change to a range of user memory (MCP watch_last_write) ---- */
+
+typedef struct {
+    uint32_t pid;
+    uint64_t addr;
+    uint32_t len;
+} watch_t;
+
+static uint64_t watch_probe(void* c) {
+    watch_t* w = (watch_t*)c;
+    process_t* p = proc_by_pid(w->pid);
+    uint64_t v = 0;
+    if (!p || !uaccess_read(p->address_space, w->addr, &v, w->len)) return ~0ULL;
+    return v;
+}
+
+int tt_last_change(uint32_t pid, uint64_t addr, uint32_t len, tt_pos_t* where) {
+    if (len == 0 || len > 8) return TT_ERR_RANGE;
+    watch_t w = { pid, addr, len };
+    int rc;
+    if (!machine_at_entry()) {
+        /* Inside a segment: the latest change may be in the part of it that
+         * already ran. Walk it forward from its entry. */
+        tt_pos_t p;
+        tt_position(&p);
+        if ((rc = tt_goto(p.epoch, p.step, 0)) != TT_OK) return rc;
+        uint64_t v = watch_probe(&w), last = 0;
+        for (uint64_t i = 1; i <= p.insn; i++) {
+            if ((rc = advance_to(p.epoch, p.step, i)) != TT_OK) return rc;
+            uint64_t now = watch_probe(&w);
+            if (now != v) last = i;
+            v = now;
+        }
+        if (last) {
+            if ((rc = tt_goto(p.epoch, p.step, last)) != TT_OK) return rc;
+            tt_position(where);
+            return TT_OK;
+        }
+        /* Unchanged since entry p.step: search the whole steps before it. */
+        if ((rc = tt_goto(p.epoch, p.step, 0)) != TT_OK) return rc;
+    }
+    kreverse_set_position(machine_epoch(), machine_step());
+    reverse_pos_t hit;
+    rc = krevbreak_watchpoint(watch_probe, &w, &hit);
+    if (rc == REVBREAK_NOT_FOUND) return TT_BEGIN;
+    if (rc != REVBREAK_OK) return TT_ERR_REPLAY;
+
+    /* The value first differs at entry hit.offset; it was written in the
+     * segment before it (while the previous entry was handled, or by an
+     * instruction after it). Refine to the exact position. */
+    uint64_t epoch = hit.epoch, seg;
+    if (hit.offset > 0) {
+        seg = hit.offset - 1;
+    } else {
+        uint64_t prev = epoch, plen = 0;
+        do {
+            if (!neighbour_epoch(prev, false, &prev) || !tt_epoch_len(prev, &plen)) {
+                tt_position(where);
+                return TT_OK;   /* cannot see before the oldest keyframe */
+            }
+        } while (plen == 0);
+        epoch = prev;
+        seg = plen - 1;
+    }
+    rc = tt_goto(epoch, seg, 0);
+    if (rc != TT_OK) return rc;
+    uint64_t old = watch_probe(&w);
+    for (uint64_t i = 1;; i++) {
+        rc = advance_to(epoch, seg, i);
+        if (rc == TT_SEGMENT_ENDED) break;   /* changed by the next entry itself */
+        if (rc != TT_OK) return rc;
+        if (watch_probe(&w) != old) break;
+    }
+    tt_position(where);
+    kreverse_set_position(machine_epoch(), machine_step());
+    return TT_OK;
+}

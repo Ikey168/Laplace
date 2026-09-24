@@ -113,8 +113,9 @@ int main(void) {
     reverse_set_position(&rv, 3, STEPS - 1);   /* the run ended here, value = 0xBAD */
 
     td_t td = { &ring, &rw, &rv };
-    mcp_ops_t ops = { op_list, op_rewind, op_step, op_watch, &td };
-    char out[512];
+    mcp_ops_t ops = { .list_checkpoints = op_list, .rewind_to = op_rewind,
+                      .reverse_step = op_step, .watch_last_write = op_watch, .ctx = &td };
+    static char out[8192];   /* tools/list carries input schemas (#229) */
 
     /* 1. Discover the tools. */
     {

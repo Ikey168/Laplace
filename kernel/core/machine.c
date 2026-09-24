@@ -20,7 +20,9 @@ static machine_mode_t  g_mode = MACHINE_LIVE;
 static process_t*      g_cur;
 static uint64_t        g_epoch;          /* keyframe epoch the current segment belongs to */
 static uint64_t        g_step;           /* index of the next (or pending) entry in this epoch */
-static uint64_t        g_insn;           /* instructions into the segment before entry g_step (#228) */
+static uint64_t        g_insn;           /* position inside the segment after entry g_step-1:
+                                           * 1 right after the entry was handled, +1 per
+                                           * executed instruction (#228) */
 static bool            g_at_entry;       /* stopped at an entry (vs. inside a segment) */
 static pending_entry_t g_pending;
 static machine_stop_t  g_stop;
@@ -44,8 +46,13 @@ static uint64_t g_max_step;
 static bool           g_stepping;        /* TF armed on the current segment */
 static bool           g_count_insns;
 static uint64_t       g_counted;
+static uint32_t       g_seg_hits;        /* breakpoint hits in the current segment */
+static machine_hit_hook_fn g_hit_hook;
+static void*               g_hit_hook_ctx;
 static machine_hwbp_t g_hwbp[MACHINE_MAX_HWBP];
-static bool           g_hwbp_armed;
+static bool           g_hwbp_armed;      /* some slot is set */
+static bool           g_hwbp_active;     /* a search or continue wants them on */
+static uint64_t       g_dr_enabled;      /* DR6 B0-B3 bits of the slots DR7 enables now */
 
 /* Scans (#226): called at every replayed entry, before the stop checks. */
 static machine_entry_hook_fn g_entry_hook;
@@ -95,6 +102,10 @@ void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step) {
 void machine_clear_target(void) { g_has_target = false; }
 
 void machine_set_count_insns(bool on) { g_count_insns = on; g_counted = 0; }
+void machine_set_hit_hook(machine_hit_hook_fn fn, void* ctx) {
+    g_hit_hook = fn;
+    g_hit_hook_ctx = ctx;
+}
 void machine_set_entry_hook(machine_entry_hook_fn fn, void* ctx) {
     g_entry_hook = fn;
     g_entry_hook_ctx = ctx;
@@ -117,6 +128,9 @@ void machine_set_hwbp(int slot, const machine_hwbp_t* bp) {
     for (int i = 0; i < MACHINE_MAX_HWBP; i++) g_hwbp_armed |= g_hwbp[i].active;
 }
 
+void machine_set_hwbp_active(bool on) { g_hwbp_active = on; }
+bool machine_hwbps_set(void) { return g_hwbp_armed; }
+
 void machine_clear_hwbps(void) {
     for (int i = 0; i < MACHINE_MAX_HWBP; i++) g_hwbp[i].active = false;
     g_hwbp_armed = false;
@@ -125,6 +139,17 @@ void machine_clear_hwbps(void) {
 /* Program DR0-3/DR7 for the process about to run (breakpoints are per pid). */
 static void load_hwbps(const process_t* p) {
     uint64_t dr7 = 0;
+    if (g_mode != MACHINE_REPLAY || !g_hwbp_active) {
+        /* Breakpoints and watchpoints apply to recorded history, and only
+         * while a continue or a search runs; plain navigation ignores them
+         * (#228). The addresses are cleared too: a CPU may flag a matching
+         * breakpoint in DR6 even when DR7 does not enable it. */
+        write_dr(7, 0);
+        for (int i = 0; i < MACHINE_MAX_HWBP; i++) write_dr(i, 0);
+        g_dr_enabled = 0;
+        return;
+    }
+    g_dr_enabled = 0;
     for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
         const machine_hwbp_t* b = &g_hwbp[i];
         if (!g_hwbp_armed || !b->active || (b->pid && p && b->pid != (uint32_t)p->pid)) continue;
@@ -134,6 +159,7 @@ static void load_hwbps(const process_t* p) {
         if (rw == 0) ln = 0;
         dr7 |= (1ULL << (i * 2));                  /* local enable */
         dr7 |= (rw | (ln << 2)) << (16 + i * 4);
+        g_dr_enabled |= 1ULL << i;
     }
     write_dr(6, 0);
     write_dr(7, dr7);
@@ -273,23 +299,38 @@ static void preempt_decision(uint64_t step) {
     }
 }
 
+/* Single-step the current segment when the replay target lies inside it, or
+ * while counting a segment's instructions (#228). */
+static bool want_stepping(void) {
+    if (g_mode != MACHINE_REPLAY) return false;
+    if (g_count_insns) return true;
+    return g_has_target && g_target_insn > 1 && g_step == g_target_step + 1 &&
+           g_insn < g_target_insn;
+}
+
 /* Complete the pending entry: handle it, decide preemption, advance the clock.
  * Returns false when no process is left to run. */
 static bool complete_entry(void) {
     uint64_t step = g_step;
     if (handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
     g_step = step + 1;
-    g_insn = 0;
+    g_insn = 1;
+    g_seg_hits = 0;
     if (!g_cur) {
         g_cur = proc_next_ready(0);
     }
     if (!g_cur) return false;
     g_cur->state = PROCESS_STATE_RUNNING;
-    /* Single-step the next segment when the target lies inside it. */
     g_at_entry = false;
-    g_stepping = g_mode == MACHINE_REPLAY &&
-                 ((g_has_target && g_target_insn > 0 && g_step == g_target_step + 1) || g_count_insns);
+    g_stepping = want_stepping();
     return true;
+}
+
+/* A replay target at the very start of the segment (entry handled, nothing
+ * executed yet) is reached without running any instruction. */
+static bool target_at_segment_start(void) {
+    return g_mode == MACHINE_REPLAY && g_has_target && g_target_insn == 1 &&
+           g_step == g_target_step + 1 && g_insn == 1;
 }
 
 /* Checks made when an entry arrives, before it is handled. Returns true (and
@@ -353,9 +394,7 @@ void machine_resume(void) {
     if (!g_at_entry) {
         /* Stopped inside a segment (single-step target or breakpoint): keep
          * executing it. Step over an execution breakpoint with RF. */
-        g_stepping = g_mode == MACHINE_REPLAY &&
-                     ((g_has_target && g_target_insn > 0 && g_step == g_target_step + 1) ||
-                      g_count_insns);
+        g_stepping = want_stepping();
         g_cur->context.rflags |= RFLAGS_RF;
         enter();
         return;
@@ -367,6 +406,10 @@ void machine_resume(void) {
     }
     if (!complete_entry()) {
         stop_here(STOP_IDLE, 0);
+        return;
+    }
+    if (target_at_segment_start()) {
+        stop_here(STOP_TARGET, 0);
         return;
     }
     enter();
@@ -389,31 +432,49 @@ static void kernel_trap(trap_frame_t* f) {
           f->vector, f->error, f->rip, read_cr2());
 }
 
-/* #DB from user mode during replay: single-step counting or a breakpoint. */
+/* Save the interrupted registers without the debugger's trap and resume flags. */
+static void save_segment_state(const trap_frame_t* f) {
+    ctx_from_frame(&g_cur->context, f);
+    g_cur->context.rflags &= ~(RFLAGS_TF | RFLAGS_RF);
+}
+
+/* #DB from user mode during replay: single-step counting and/or a hardware
+ * breakpoint or watchpoint (#228). */
 static void on_debug(trap_frame_t* f) {
     uint64_t dr6 = read_dr6();
     write_dr(6, 0);
+    bool stepped = (dr6 & (1ULL << 14)) != 0;
+    /* Only enabled breakpoints count: B0-B3 may report matches that DR7
+     * does not enable (Intel SDM 17.2.3). */
+    dr6 = (dr6 & ~0xFULL) | (dr6 & g_dr_enabled);
+    if (stepped) {
+        g_insn++;
+        if (g_count_insns) g_counted++;
+    }
     if (dr6 & 0xF) {
-        /* A hardware breakpoint or watchpoint: report it to the monitor. */
-        ctx_from_frame(&g_cur->context, f);
+        g_seg_hits++;
+        if (g_hit_hook) {
+            /* Searching: note the hit and keep going (RF steps over an
+             * execution breakpoint). The hit may also be the replay target,
+             * which is checked below. */
+            g_hit_hook(g_hit_hook_ctx, g_step - 1, g_seg_hits, g_stepping ? g_insn : 0, dr6);
+            f->rflags |= RFLAGS_RF;
+            goto target_check;
+        }
+        save_segment_state(f);
         stop_here(STOP_BREAKPOINT, 0);
         g_stop.dr6 = dr6;
         g_stop.vector = VEC_DEBUG;
-        if (dr6 & (1ULL << 14)) g_insn++;    /* a single-step completed too */
+        g_stop.code = g_seg_hits;
         machine_exit();
     }
-    if (dr6 & (1ULL << 14)) {
-        g_insn++;
-        if (g_count_insns) g_counted++;
-        if (g_has_target && g_target_insn > 0 && g_step == g_target_step + 1 &&
-            g_insn == g_target_insn) {
-            ctx_from_frame(&g_cur->context, f);
-            stop_here(STOP_TARGET, 0);
-            machine_exit();
-        }
-        f->rflags |= RFLAGS_TF;
-        return;
+target_check:
+    if (stepped && g_has_target && g_step == g_target_step + 1 && g_insn == g_target_insn) {
+        save_segment_state(f);
+        stop_here(STOP_TARGET, 0);
+        machine_exit();
     }
+    if (g_stepping) f->rflags |= RFLAGS_TF;
 }
 
 void trap_dispatch(trap_frame_t* f) {
@@ -426,7 +487,16 @@ void trap_dispatch(trap_frame_t* f) {
         pic_eoi((uint8_t)(f->vector - VEC_IRQ_BASE));
         return;
     }
-    if (!from_user) kernel_trap(f);
+    if (!from_user) {
+        /* The kernel sets no breakpoints of its own. A #DB here is the second
+         * half of a user instruction that both completed a single step and hit
+         * a data watchpoint: real CPUs report the two in one #DB, QEMU's TCG
+         * delivers a second one at the first instruction of the handler for
+         * the first. DR6 already holds both causes for that handler, so return
+         * without touching it. */
+        if (f->vector == VEC_DEBUG) return;
+        kernel_trap(f);
+    }
 
     if (f->vector == VEC_PAGE_FAULT && (f->error & 0x3) == 0x3) {
         /* A user write to a present page: a snapshot-COW capture is invisible
@@ -441,7 +511,7 @@ void trap_dispatch(trap_frame_t* f) {
 
     /* A kernel entry: one step of the machine. */
     ctx_from_frame(&g_cur->context, f);
-    if (g_stepping && (f->rflags & RFLAGS_TF)) g_cur->context.rflags &= ~RFLAGS_TF;
+    g_cur->context.rflags &= ~(RFLAGS_TF | RFLAGS_RF);
     g_stepping = false;
     g_pending.vector = f->vector;
     g_pending.error = f->error;
@@ -458,6 +528,10 @@ void trap_dispatch(trap_frame_t* f) {
     if (stop_at_entry()) machine_exit();
     if (!complete_entry()) {
         stop_here(STOP_IDLE, 0);
+        machine_exit();
+    }
+    if (target_at_segment_start()) {
+        stop_here(STOP_TARGET, 0);
         machine_exit();
     }
     load_current(f);

@@ -83,9 +83,44 @@ int tt_goto(uint64_t epoch, uint64_t step, uint64_t insn);
 /* Replay to the end of the recording and switch back to live recording. */
 int tt_resume_live(void);
 
-/* Number of user instructions between entry `step` (handled) and the next
- * entry of epoch `epoch` (#228). */
+/* Number of user instructions executed between entry `step` (handled) and the
+ * next entry of epoch `epoch` (#228). The segment's positions are
+ * (epoch, step, 1) .. (epoch, step, insns + 1). */
 int tt_segment_length(uint64_t epoch, uint64_t step, uint64_t* insns);
+
+/* ---- Instruction-level navigation (#227, #228) ---- */
+
+#define TT_BEGIN         1   /* already at the oldest recorded moment */
+#define TT_END           2   /* already at the end of the recording */
+
+typedef struct {
+    uint64_t epoch;
+    uint64_t step;
+    uint64_t insn;           /* 0: at entry `step`; k >= 1: see machine.h */
+} tt_pos_t;
+
+/* A breakpoint or watchpoint hit found by a continue. */
+typedef struct {
+    bool     hit;
+    uint32_t slot;           /* machine hardware breakpoint slot */
+    uint64_t dr6;
+} tt_hit_t;
+
+void tt_position(tt_pos_t* p);
+bool tt_at_end(void);
+int  tt_goto_pos(const tt_pos_t* p);
+/* One position forward / backward through the recording. */
+int  tt_stepi(void);
+int  tt_reverse_stepi(void);
+/* Run forward (backward) to the next (previous) hardware breakpoint or
+ * watchpoint hit, or to the end (start) of the recording. */
+int  tt_continue(tt_hit_t* hit);
+int  tt_reverse_continue(tt_hit_t* hit);
+/* Where did `len` bytes at `addr` in process `pid` last change, at or before
+ * the current position? Lands there (the first position holding the value
+ * the bytes have now) and returns TT_OK, or TT_BEGIN if they never changed
+ * in the window. Kernel writes (system calls) are found too. */
+int  tt_last_change(uint32_t pid, uint64_t addr, uint32_t len, tt_pos_t* where);
 
 /* Re-execute `epoch` from its keyframe and call visit(ctx, step) at every entry
  * 0 .. limit-1 with the machine there. */

@@ -32,7 +32,7 @@ CORE_ASM := kernel/core/boot.asm kernel/core/isr.asm
 CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
-            kernel/core/monitor.c
+            kernel/core/monitor.c kernel/core/gdb_target.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
 # kernel adapters.
@@ -46,8 +46,8 @@ TT_C := kernel/checkpoint.c kernel/snapshot_store.c kernel/checkpoint_extstate.c
         kernel/replay_driver.c kernel/replay_driver_sync.c kernel/divergence.c \
         kernel/divergence_sync.c kernel/divergence_scan.c kernel/divergence_scan_sync.c \
         kernel/rewind.c kernel/rewind_sync.c kernel/reverse.c kernel/reverse_sync.c \
-        kernel/revbreak.c kernel/revbreak_sync.c kernel/gdbstub.c kernel/gdb_serial.c \
-        kernel/mcp.c kernel/mcp_server.c
+        kernel/revbreak.c kernel/revbreak_sync.c kernel/gdbstub.c kernel/gdbstub_sync.c \
+        kernel/gdb_serial.c kernel/mcp.c kernel/mcp_sync.c kernel/mcp_server.c
 
 KERNEL_C    := $(CORE_C) $(TT_C)
 KERNEL_OBJS := $(patsubst %.asm,$(KBUILD)/%.o,$(CORE_ASM)) \

@@ -122,30 +122,6 @@ static void spawn_run_list(void) {
     }
 }
 
-static const char* stop_name(stop_reason_t r) {
-    switch (r) {
-    case STOP_BREAK: return "break (a program asserted)";
-    case STOP_FAULT: return "fault";
-    case STOP_EXITED: return "last process exiting";
-    case STOP_REQUEST: return "debugger request";
-    case STOP_TARGET: return "target reached";
-    case STOP_BREAKPOINT: return "breakpoint";
-    case STOP_END: return "end of recording";
-    case STOP_IDLE: return "nothing to run";
-    case STOP_ERROR: return "error";
-    default: return "none";
-    }
-}
-
-void boot_report_stop(void) {
-    const machine_stop_t* st = machine_last_stop();
-    kprintf("machine: stopped: %s; pid %u at epoch %lu step %lu",
-            stop_name(st->reason), st->pid, machine_epoch(), machine_step());
-    if (st->reason == STOP_BREAK) kprintf(" (code %lx)", st->code);
-    if (st->reason == STOP_FAULT) kprintf(" (vector %lu, error %lx, address %lx)", st->vector, st->error, st->cr2);
-    kprintf("\n");
-}
-
 /* The heisenbug's batch_limit (user/laplace/heisenbug.c: ring[64] + 0). */
 #define HEISENBUG_BATCH_LIMIT 0x40001100ULL
 static uint32_t g_watch_pid;
@@ -193,25 +169,88 @@ static bool selftest(void) {
     ok = ok && bad.diverged;
     tt_verify(&v);   /* back to the end of the recording, clean */
 
-    /* Who last wrote the heisenbug's batch_limit? */
+    /* Who last wrote the heisenbug's batch_limit? Found by value, to the
+     * exact instruction (#228). */
     process_t* hb = 0;
     for (uint32_t i = 0; i < proc_count(); i++) {
         if (strncmp(proc_at(i)->name, "heisenbug", 9) == 0) hb = proc_at(i);
     }
     if (hb) {
-        g_watch_pid = (uint32_t)hb->pid;
+        uint32_t pid = (uint32_t)hb->pid;
+        g_watch_pid = pid;
+        tt_pos_t end, w1, w2;
+        tt_position(&end);
         uint32_t now = (uint32_t)watch_probe(0);
-        reverse_pos_t hit;
-        rc = krevbreak_watchpoint(watch_probe, 0, &hit);
-        uint32_t after = (uint32_t)watch_probe(0);
-        kprintf("selftest: batch_limit is %u at the stop; last written at epoch %lu step %lu "
-                "(value there %u) rc=%d\n", now, hit.epoch, hit.offset, after, rc);
-        if (rc == REVBREAK_OK && hit.offset > 0) {
-            tt_goto(hit.epoch, hit.offset - 1, 0);
-            kprintf("selftest: one step earlier (epoch %lu step %lu) batch_limit was %u\n",
-                    hit.epoch, hit.offset - 1, (uint32_t)watch_probe(0));
-        }
-        ok = ok && rc == REVBREAK_OK;
+        rc = tt_last_change(pid, HEISENBUG_BATCH_LIMIT, 4, &w1);
+        uint64_t rip1 = proc_by_pid(pid) ? proc_by_pid(pid)->context.rip : 0;
+        uint32_t then = (uint32_t)watch_probe(0);
+        kprintf("selftest: batch_limit %u at the stop; last written at (%lu,%lu,%lu), rip %lx, "
+                "value there %u, rc=%d\n", now, w1.epoch, w1.step, w1.insn, rip1, then, rc);
+        ok = ok && rc == TT_OK && then == now;
+        tt_reverse_stepi();
+        kprintf("selftest: one instruction earlier batch_limit was %u (rip %lx)\n",
+                (uint32_t)watch_probe(0), proc_by_pid(pid)->context.rip);
+
+        /* The same answer from a hardware write watchpoint + reverse-continue. */
+        tt_goto_pos(&end);
+        machine_hwbp_t wp = { true, pid, HEISENBUG_BATCH_LIMIT, 1, 4 };
+        machine_set_hwbp(0, &wp);
+        tt_hit_t hit;
+        rc = tt_reverse_continue(&hit);
+        tt_position(&w2);
+        kprintf("selftest: watchpoint reverse-continue rc=%d hit=%d at (%lu,%lu,%lu) rip %lx\n",
+                rc, hit.hit, w2.epoch, w2.step, w2.insn, proc_by_pid(pid)->context.rip);
+        ok = ok && rc == TT_OK && hit.hit && w2.epoch == w1.epoch && w2.step == w1.step &&
+             w2.insn == w1.insn;
+        machine_clear_hwbps();
+
+        /* Step back and forth over instructions and land on the same state. */
+        tt_goto_pos(&end);
+        uint32_t ids[KDIVERGE_COMPONENT_COUNT], a_sums[KDIVERGE_COMPONENT_COUNT];
+        kdiverge_record_epoch(machine_epoch());
+        uint32_t na = kdiverge_journal_sums(0, 0);
+        const uint32_t* pids;
+        const uint32_t* psums;
+        kdiverge_journal_sums(&pids, &psums);
+        for (uint32_t i = 0; i < na; i++) { ids[i] = pids[i]; a_sums[i] = psums[i]; }
+        int back = 0, fwd = 0;
+        for (int i = 0; i < 5; i++) back += tt_reverse_stepi() == TT_OK;
+        tt_pos_t mid;
+        tt_position(&mid);
+        for (int i = 0; i < 5; i++) fwd += tt_stepi() == TT_OK;
+        tt_pos_t again;
+        tt_position(&again);
+        kdiverge_record_epoch(machine_epoch());
+        kdiverge_journal_sums(&pids, &psums);
+        bool same = true;
+        for (uint32_t i = 0; i < na; i++) same = same && ids[i] == pids[i] && a_sums[i] == psums[i];
+        kprintf("selftest: 5 reverse-stepi to (%lu,%lu,%lu), 5 stepi back to (%lu,%lu,%lu): %s\n",
+                mid.epoch, mid.step, mid.insn, again.epoch, again.step, again.insn,
+                same ? "identical state" : "STATE DIFFERS");
+        ok = ok && back == 5 && fwd == 5 && same && again.epoch == end.epoch &&
+             again.step == end.step && again.insn == end.insn;
+
+        /* An execution breakpoint on the store that clobbered batch_limit:
+         * reverse-continue stops at its most recent execution, before it runs. */
+        tt_goto_pos(&end);
+        uint64_t store_pc = rip1 - 7;   /* mov %edi, 0x40001000(,%rax,4) is 7 bytes */
+        machine_hwbp_t bp = { true, pid, store_pc, 0, 1 };
+        machine_set_hwbp(0, &bp);
+        rc = tt_reverse_continue(&hit);
+        tt_pos_t b1;
+        tt_position(&b1);
+        uint64_t rip2 = proc_by_pid(pid)->context.rip;
+        kprintf("selftest: breakpoint at %lx: reverse-continue rc=%d hit=%d at (%lu,%lu,%lu) rip %lx\n",
+                store_pc, rc, hit.hit, b1.epoch, b1.step, b1.insn, rip2);
+        ok = ok && rc == TT_OK && hit.hit && rip2 == store_pc;
+        /* And forward again: continue stops at the next execution. */
+        tt_pos_t b2;
+        rc = tt_continue(&hit);
+        tt_position(&b2);
+        kprintf("selftest: continue rc=%d hit=%d at (%lu,%lu,%lu) rip %lx\n", rc, hit.hit,
+                b2.epoch, b2.step, b2.insn, proc_by_pid(pid) ? proc_by_pid(pid)->context.rip : 0);
+        ok = ok && (rc == TT_END || (rc == TT_OK && hit.hit));
+        machine_clear_hwbps();
     }
     kprintf("selftest: %s\n", ok ? "PASSED" : "FAILED");
     return ok;
@@ -272,8 +311,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     machine_set_mode(MACHINE_LIVE);
     if (resumed) machine_resume(); else machine_start();
 
-    boot_report_stop();
-    tt_seal();
+    monitor_live_stopped();
     if (g_opts.selftest) {
         bool ok = selftest();
         if (g_opts.exit) boot_qemu_exit(ok ? 0 : 1);
