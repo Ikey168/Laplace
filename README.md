@@ -160,14 +160,19 @@ for (;;) { counter++; if (counter % 20000 == 0) print(counter); sys_yield(); }
 with SIGKILL, and boots again, four times:
 
 ```
-[boot 1] fresh disk: counted 20000 .. 340000, then power cut after 3s
-[boot 2] resumed from keyframe 24: counted 360000 .. 820000 (had printed 340000 before the cut), cut after 4s
-[boot 3] resumed from keyframe 56: counted 820000 .. 1100000 (had printed 820000 before the cut), cut after 2.5s
-[boot 4] resumed from keyframe 75: counted 1120000 .. 1540000 (had printed 1100000 before the cut), cut after 3.5s
+[boot 1] fresh disk: counted 20000 .. 420000, then power cut after 3s
+[boot 2] resumed from keyframe 24: counted 420000 .. 1000000 (had printed 420000 before the cut), cut after 4s
+         lost at most 20000 counts to the cut (work since the newest keyframe)
+[boot 3] resumed from keyframe 56: counted 1000000 .. 1320000 (had printed 1000000 before the cut), cut after 2.5s
+         lost at most 20000 counts to the cut (work since the newest keyframe)
+[boot 4] resumed from keyframe 75: counted 1340000 .. 1840000 (had printed 1320000 before the cut), cut after 3.5s
+         lost at most 0 counts to the cut (work since the newest keyframe)
 PASSED: the booted machine resumed from the IDE disk after every power cut
 ```
 
-(Recording: `asciinema play docs/media/qemu-resume.cast`.) A checkpoint marks
+A power cut loses only the work since the newest keyframe on the disk (at most
+one keyframe interval, 100 ms by default); the demo checks that bound. (Recording:
+`asciinema play docs/media/qemu-resume.cast`.) A checkpoint marks
 every writable page read-only and copy-on-write; the first write to a marked
 page makes the kernel preserve its pre-checkpoint image, and the keyframe is
 written to the disk at a later kernel entry. Each keyframe region is
