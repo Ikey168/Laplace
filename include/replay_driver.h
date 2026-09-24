@@ -33,6 +33,7 @@
 #define REPLAY_EV_TIMER     3
 #define REPLAY_EV_ENTROPY   4
 #define REPLAY_EV_SCHED     5
+#define REPLAY_EV_EPOCH_LEN 7   /* journal_capture.h JOURNAL_EV_EPOCH_LEN */
 
 /* Per-epoch delta bounds; match the record wrappers (KTIME_LOG_MAX etc.). */
 #define REPLAY_MAX_PTS      4096
@@ -67,6 +68,15 @@ int replay_split_epoch(replay_event_source_t* src, uint64_t epoch,
                        uint64_t* times,   uint32_t* n_times,
                        uint8_t*  entropy, uint32_t* n_entropy);
 
+/* As replay_split_epoch, and also report the epoch's recorded length (#223):
+ * *has_len is set when the journal carries a REPLAY_EV_EPOCH_LEN event. Either
+ * out pointer may be NULL. */
+int replay_split_epoch_ex(replay_event_source_t* src, uint64_t epoch,
+                          uint64_t* pts,     uint32_t* n_pts,
+                          uint64_t* times,   uint32_t* n_times,
+                          uint8_t*  entropy, uint32_t* n_entropy,
+                          uint64_t* epoch_len, bool* has_len);
+
 /* The driver: injected concrete steps plus scratch for the current epoch's
  * split deltas. Caller-allocated (it is large); no dynamic memory. */
 typedef struct {
@@ -90,6 +100,9 @@ typedef struct {
     uint32_t n_times;
     uint8_t  entropy[REPLAY_MAX_ENTROPY];
     uint32_t n_entropy;
+    /* The epoch's recorded length in steps, when the journal carries it (#223). */
+    uint64_t epoch_len;
+    bool     has_epoch_len;
 
     replay_engine_t engine;
 } replay_driver_t;
@@ -100,11 +113,28 @@ typedef struct {
 int replay_driver_run(replay_driver_t* d, uint64_t keyframe_epoch,
                       uint64_t target_epoch, uint64_t target_offset);
 
-/* ---- Kernel adapter (replay_driver_sync.c) ----
- * Wires the real journal store, keyframe store, and scheduler, and picks the
- * nearest retained keyframe at or before target_epoch. Restores the booted
- * kernel to (target_epoch, target_offset). Returns REPLAY_OK or a negative
- * code. Bracket with replay_enter()/replay_exit() is handled internally. */
-int replay_to(uint64_t target_epoch, uint64_t target_offset);
+/* Initialize d->engine with the driver's hooks without running it, so a caller
+ * that drives the engine itself (the rewind verb calls replay_run on it, #226)
+ * gets the same restore/load/run steps. Returns REPLAY_OK or REPLAY_ERR_PARAM. */
+int replay_driver_bind(replay_driver_t* d);
+
+/* ---- Kernel adapter (replay_driver_sync.c, #225) ----
+ * The driver bound to the booted kernel: keyframes from the keyframe store,
+ * journals from the journal ring, and real re-execution of the user processes.
+ * replay_kernel_bind() initializes the engine the rewind verb drives
+ * (replay_kernel_engine()). replay_set_insn_target() refines the next
+ * reconstruction to that many instructions past the target step (#228).
+ * replay_to() reconstructs (epoch, offset) directly. */
+void             replay_kernel_bind(void);
+replay_engine_t* replay_kernel_engine(void);
+void             replay_set_insn_target(uint64_t insn);
+void             replay_perturb_next(bool on);
+int              replay_load_epoch(uint64_t epoch);
+bool             replay_loaded_epoch_len(uint64_t* len);
+int              replay_to(uint64_t target_epoch, uint64_t target_offset);
+/* The divergence checksums and the length recorded in `epoch`'s journal. */
+int replay_recorded_sums(uint64_t epoch, uint32_t* ids, uint32_t* sums, uint32_t max,
+                         uint32_t* n_out);
+int replay_journal_epoch_len(uint64_t epoch, uint64_t* len);
 
 #endif /* REPLAY_DRIVER_H */

@@ -91,6 +91,7 @@ enum {
     KDIVERGE_USER_PAGES,
     KDIVERGE_FILETABLE,
     KDIVERGE_IPC,
+    KDIVERGE_CONTEXTS,          /* saved user registers of every process (#225) */
     KDIVERGE_COMPONENT_COUNT
 };
 
@@ -101,5 +102,9 @@ int      kdiverge_record(uint32_t component, uint32_t checksum);
 int      kdiverge_expect(uint64_t epoch, const uint32_t* sums, uint32_t n);
 bool     kdiverge_check(uint32_t component, uint32_t checksum);
 bool     kdiverge_ok(void);   /* false once a divergence has been detected */
+/* Clear the sticky verdict and stats before a fresh verification run (#225). */
+void     kdiverge_reset(void);
+/* The global detector, to report which epoch and component diverged. */
+const divergence_t* kdiverge_detector(void);
 
 #endif /* DIVERGENCE_H */

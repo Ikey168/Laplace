@@ -235,6 +235,7 @@ int main(void) {
     {
         checkpoint_init();
         g_pte_count = 0; g_flushes = 0;
+        checkpoint_take(); /* open an epoch (no processes to mark) */
 
         /* Use a real, page-aligned host buffer as the "virtual page" so the
          * hook can read its contents at the fault address. */
@@ -269,6 +270,26 @@ int main(void) {
         CHECK(checkpoint_capture_count() == 1, "no extra capture for ordinary fault");
 
         free(page); free(page2);
+    }
+
+    /* === Test 6: a COW fault after the epoch's writeback committed (#224) === */
+    printf("Test 6: COW fault with no open epoch resolves without capturing\n");
+    {
+        checkpoint_init();               /* epoch 0, nothing open */
+        g_pte_count = 0; g_flushes = 0;
+        uint8_t* page = (uint8_t*)aligned_alloc(PAGE_SIZE, PAGE_SIZE);
+        uint64_t vaddr = (uint64_t)(uintptr_t)page;
+        map_pte(vaddr, PHYS_A | PAGE_PRESENT | PAGE_SNAPSHOT_COW);
+        vm_space_t space = {0};
+        space.owner_pid = 7;
+
+        bool handled = checkpoint_handle_write_fault(&space, vaddr);
+        CHECK(handled == true, "stale snapshot-COW fault still handled");
+        CHECK(checkpoint_capture_count() == 0, "no capture outside an open epoch");
+        pte_t now = *vmm_get_page_table(&space, vaddr, PT_LEVEL, false);
+        CHECK((now & PAGE_WRITABLE) && !(now & PAGE_SNAPSHOT_COW), "page writable again");
+        CHECK(g_flushes == 1, "TLB flushed");
+        free(page);
     }
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",

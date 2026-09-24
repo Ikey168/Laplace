@@ -25,6 +25,10 @@ reverse_pos_t kreverse_position(void) {
     return z;
 }
 
+reverse_ctx_t* kreverse_ctx(void) {
+    return g_reverse_bound ? &g_reverse : 0;
+}
+
 int kreverse_step(void) {
     if (!g_reverse_bound) return REVERSE_ERR_PARAM;
     return reverse_step(&g_reverse);

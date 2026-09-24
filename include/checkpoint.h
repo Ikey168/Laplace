@@ -42,6 +42,10 @@ void checkpoint_init(void);
 /* The epoch of the most recent checkpoint (0 before the first take). */
 uint64_t checkpoint_current_epoch(void);
 
+/* Continue numbering from `epoch` with no epoch open and no captures, after
+ * the machine was rebuilt from that keyframe (#224, #231). */
+void checkpoint_set_epoch(uint64_t epoch);
+
 /* Read-only view of engine state. */
 const checkpoint_state_t* checkpoint_get_state(void);
 
@@ -133,9 +137,11 @@ int checkpoint_capture_context(uint32_t pid, const void* ctx, uint32_t ctx_size)
 int checkpoint_capture_kernel_blob(uint32_t tag, const void* data, uint32_t size);
 
 /* Page-fault hook entry point. If fault_addr in `space` is a present,
- * snapshot-COW page, capture its current contents, restore writability, flush
- * the TLB, and return true (the faulting write may now proceed). Returns false
- * if the page is not a snapshot-COW page (the fault is someone else's). */
+ * snapshot-COW page, capture its current contents (only while an epoch is open,
+ * that is, before its writeback commits), restore writability, flush the TLB,
+ * and return true (the faulting write may now proceed). Returns false if the
+ * page is not a snapshot-COW page (the fault is someone else's). The page is
+ * read at fault_addr, so `space` must be the current address space. */
 bool checkpoint_handle_write_fault(vm_space_t* space, uint64_t fault_addr);
 
 /* Head of the capture list (most-recent-first), its length, and a routine to

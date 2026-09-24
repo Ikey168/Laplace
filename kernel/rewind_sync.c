@@ -24,6 +24,10 @@ bool krewind_runnable(void) {
     return g_rewind_bound && g_rewind.runnable;
 }
 
+rewind_ctx_t* krewind_ctx(void) {
+    return g_rewind_bound ? &g_rewind : 0;
+}
+
 uint64_t krewind_landed_keyframe(void) {
     return g_rewind_bound ? g_rewind.landed_keyframe : 0;
 }

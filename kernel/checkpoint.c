@@ -55,6 +55,14 @@ uint64_t checkpoint_current_epoch(void) {
     return g_checkpoint.current_epoch;
 }
 
+void checkpoint_set_epoch(uint64_t epoch) {
+    /* A machine rebuilt from a keyframe continues numbering after it; any
+     * capture log belongs to the discarded timeline. */
+    checkpoint_clear_captures();
+    g_checkpoint.current_epoch = epoch;
+    g_checkpoint.epoch_open = false;
+}
+
 const checkpoint_state_t* checkpoint_get_state(void) {
     return &g_checkpoint;
 }
@@ -285,6 +293,16 @@ bool checkpoint_handle_write_fault(vm_space_t* space, uint64_t fault_addr) {
     pte_t* pte = vmm_get_page_table(space, page_addr, PT_LEVEL, false);
     if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_SNAPSHOT_COW)) {
         return false; /* not a snapshot-COW fault */
+    }
+
+    if (!g_checkpoint.epoch_open) {
+        /* The epoch's writeback already committed, so the page's checkpoint
+         * image is on disk: there is nothing to preserve. Just make the page
+         * writable. Capturing here would leak a stale pre-write image into the
+         * next checkpoint's stream (#224). */
+        checkpoint_resolve_pte(pte);
+        vmm_flush_tlb_page(page_addr);
+        return true;
     }
 
     /* The faulting page is mapped at page_addr in the current address space,

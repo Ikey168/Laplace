@@ -20,7 +20,9 @@
 #define JOURNAL_CAPTURE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "checkpoint_journal.h"  /* journal_store_t, JOURNAL_EV_*, JOURNAL_OK */
+#include "journal_ring.h"        /* journal_ring_t (#223) */
 
 /* Scheduler preemption/context-switch point. Extends the JOURNAL_EV_* set in
  * checkpoint_journal.h; the switch point's logical clock rides in both the
@@ -30,6 +32,11 @@
 /* Divergence checksum for one component at the epoch boundary (#197). lclock
  * carries the component id, value carries the checksum. */
 #define JOURNAL_EV_DIVERGE 6
+
+/* Epoch length (#223): the number of steps (kernel entries) the epoch ran, so
+ * replay knows where the epoch ends and reverse execution knows how far back a
+ * previous epoch reaches. value carries the step count. */
+#define JOURNAL_EV_EPOCH_LEN 7
 
 /* Injected delta sources. The live kernel wires these to
  * scheduler_preempt_points / ktime_values / kentropy_bytes; tests pass fakes.
@@ -42,6 +49,8 @@ typedef struct {
     /* Divergence checksums for the epoch boundary (#197): returns the component
      * count and points *ids / *sums at parallel arrays. NULL to skip. */
     uint32_t (*divergence_sums)(const uint32_t** ids, const uint32_t** sums);
+    /* Steps the epoch ran (#223). NULL to skip. */
+    uint64_t (*epoch_length)(void);
 } journal_capture_sources_t;
 
 /* Gather the epoch's deltas from src and write them to store as a single
@@ -55,17 +64,18 @@ int journal_capture_epoch(journal_store_t* store, uint64_t epoch,
                           uint64_t base_lclock,
                           const journal_capture_sources_t* src);
 
-/* ---- Kernel adapter (journal_capture_sync.c) ----
- * Binds a journal store to a region of the persistence device and registers a
- * checkpoint post-commit hook (checkpoint_set_journal_hook) that journals each
- * committed epoch's live deltas via journal_capture_epoch(). Call once at boot,
- * after the checkpoint store is armed, with a non-overlapping sector region.
- * Returns JOURNAL_OK when the journal is armed, or a negative JOURNAL_ERR_*. */
+/* ---- Kernel adapter (journal_capture_sync.c, #223) ----
+ * The journal ring bound to the persistence device: one journal per retained
+ * keyframe. journal_capture_init() binds it (formatting every region when
+ * `format` is set). journal_capture_close_epoch() records the divergence
+ * checksums of the current state and writes `epoch`'s journal (with its length
+ * in steps) into the region paired with that keyframe; it is called when the
+ * next keyframe is taken and when the machine stops (sealing the open epoch).
+ * journal_capture_load() opens a reader on a retained epoch's journal. */
 int journal_capture_init(fat_block_device_t* dev, uint32_t base_sector,
-                         uint32_t slot_sectors);
-
-/* The bound journal store, or NULL if journal_capture_init has not armed it.
- * Exposed for the replay path and tests. */
-journal_store_t* journal_capture_store(void);
+                         uint32_t slot_sectors, uint32_t capacity, bool format);
+int journal_capture_close_epoch(uint64_t epoch, uint64_t steps);
+int journal_capture_load(uint64_t epoch, journal_reader_t* reader);
+journal_ring_t* journal_capture_ring(void);
 
 #endif /* JOURNAL_CAPTURE_H */

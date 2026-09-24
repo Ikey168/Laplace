@@ -62,6 +62,28 @@ static uint64_t probe_value(void* c) {
     return value_at(reverse_position((reverse_ctx_t*)c));
 }
 
+/* Scan hook: visit (epoch, 0..limit-1) with the model positioned at each. */
+static int g_scan_calls;
+static int sim_scan(void* sctx, uint64_t epoch, uint64_t limit,
+                    revbreak_visit_fn visit, void* vctx) {
+    reverse_ctx_t* rv = (reverse_ctx_t*)sctx;
+    g_scan_calls++;
+    for (uint64_t o = 0; o < limit; o++) {
+        reverse_set_position(rv, epoch, o);
+        reverse_pos_t p = { epoch, o };
+        visit(vctx, p);
+    }
+    return 0;
+}
+
+/* A value written exactly when keyframe 40 is taken: it differs between the
+ * last position of epoch 30, (30,3), and (40,0). */
+static bool g_boundary_write;
+static uint64_t probe_boundary(void* c) {
+    reverse_pos_t p = reverse_position((reverse_ctx_t*)c);
+    return (g_boundary_write && p.epoch >= 40) ? 7 : 0;
+}
+
 static bool pos_is(reverse_pos_t p, uint64_t e, uint64_t o) {
     return p.epoch == e && p.offset == o;
 }
@@ -130,6 +152,55 @@ int main(void) {
         reverse_pos_t hit;
         CHECK(reverse_watchpoint(&rv, probe_value, &rv, &hit) == REVBREAK_NOT_FOUND,
               "a value that never changed in the window reports NOT_FOUND");
+    }
+
+    /* --- 5. Scan fast path (#226): same answers, each epoch replayed once --- */
+    {
+        keyframe_ring_t ring; sim_t s; replay_engine_t re; rewind_ctx_t rw; reverse_ctx_t rv;
+        fixture(&ring, &s, &re, &rw, &rv, 40, 3);
+        g_scan_calls = 0;
+        reverse_pos_t hit;
+        CHECK(reverse_watchpoint_scan(&rv, sim_scan, &rv, probe_value, &rv, &hit) == REVBREAK_OK &&
+              pos_is(hit, 40, 1), "scan watchpoint lands on the last write (40,1)");
+        CHECK(g_scan_calls == 1, "found within the current epoch: one scan");
+        CHECK(pos_is(reverse_position(&rv), 40, 1), "system left at the write");
+    }
+    {
+        keyframe_ring_t ring; sim_t s; replay_engine_t re; rewind_ctx_t rw; reverse_ctx_t rv;
+        fixture(&ring, &s, &re, &rw, &rv, 40, 0);
+        g_scan_calls = 0;
+        reverse_pos_t hit;
+        CHECK(reverse_watchpoint_scan(&rv, sim_scan, &rv, probe_value, &rv, &hit) == REVBREAK_OK &&
+              pos_is(hit, 30, 2), "scan watchpoint from (40,0) finds (30,2)");
+        CHECK(g_scan_calls == 2, "two epochs scanned, once each");
+    }
+    {
+        /* A write right at an epoch boundary: value changes between (30,3) and (40,0). */
+        keyframe_ring_t ring; sim_t s; replay_engine_t re; rewind_ctx_t rw; reverse_ctx_t rv;
+        fixture(&ring, &s, &re, &rw, &rv, 40, 2);
+        g_boundary_write = true;
+        reverse_pos_t hit;
+        CHECK(reverse_watchpoint_scan(&rv, sim_scan, &rv, probe_boundary, &rv, &hit) == REVBREAK_OK &&
+              pos_is(hit, 40, 0), "a write across the epoch boundary lands at (40,0)");
+        reverse_pos_t hit2;
+        fixture(&ring, &s, &re, &rw, &rv, 40, 2);
+        CHECK(reverse_watchpoint(&rv, probe_boundary, &rv, &hit2) == REVBREAK_OK &&
+              pos_is(hit2, 40, 0), "the step-by-step search agrees");
+        g_boundary_write = false;
+    }
+    {
+        keyframe_ring_t ring; sim_t s; replay_engine_t re; rewind_ctx_t rw; reverse_ctx_t rv;
+        fixture(&ring, &s, &re, &rw, &rv, 40, 3);
+        reverse_pos_t hit;
+        CHECK(reverse_breakpoint_scan(&rv, sim_scan, &rv, cond_value_is_1, &rv, &hit) == REVBREAK_OK &&
+              pos_is(hit, 40, 0), "scan breakpoint stops at (40,0), like the step-by-step search");
+        fixture(&ring, &s, &re, &rw, &rv, 40, 3);
+        CHECK(reverse_breakpoint_scan(&rv, sim_scan, &rv, cond_never, &rv, 0) == REVBREAK_NOT_FOUND,
+              "scan breakpoint that never holds: NOT_FOUND");
+        CHECK(pos_is(reverse_position(&rv), 20, 0), "and leaves the system at the oldest moment");
+        fixture(&ring, &s, &re, &rw, &rv, 20, 2);
+        CHECK(reverse_watchpoint_scan(&rv, sim_scan, &rv, probe_value, &rv, 0) == REVBREAK_NOT_FOUND,
+              "scan watchpoint on an unchanged value: NOT_FOUND");
     }
 
     /* --- 4. Bad params --- */

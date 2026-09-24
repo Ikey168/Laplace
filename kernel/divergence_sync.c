@@ -43,3 +43,12 @@ bool kdiverge_check(uint32_t component, uint32_t checksum) {
 bool kdiverge_ok(void) {
     return !divergence_has_diverged(&g_kdiverge);
 }
+
+void kdiverge_reset(void) {
+    diverge_mode_t mode = g_kdiverge.mode;
+    divergence_init(&g_kdiverge, mode);
+}
+
+const divergence_t* kdiverge_detector(void) {
+    return &g_kdiverge;
+}
