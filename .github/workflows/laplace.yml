@@ -1,101 +1,14 @@
-name: Orthogonal Persistence
+name: Laplace
 
-# Builds and runs the orthogonal-persistence checkpoint/restore test suite and
-# the end-to-end "yank power, it remembers" demo headless (no QEMU required:
-# the demo drives the real checkpoint engine + snapshot store over a file-backed
-# disk, modeling a power cycle as a process restart).
+# Builds the bootable kernel, runs the host-side unit tests of the time-travel
+# and persistence modules, runs the headless demos, and then boots the kernel in
+# QEMU: a heisenbug is recorded and debugged backward over MCP and stock gdb,
+# every retained epoch is re-executed and checked byte-exact, and the machine
+# survives power cuts on its IDE disk.
 
 on:
   push:
-    paths:
-      - 'kernel/checkpoint*.c'
-      - 'kernel/snapshot_store.c'
-      - 'include/checkpoint*.h'
-      - 'include/snapshot_store.h'
-      - 'kernel/sched_record.c'
-      - 'kernel/scheduler.c'
-      - 'include/sched_record.h'
-      - 'include/scheduler.h'
-      - 'kernel/time_record.c'
-      - 'kernel/time_record_sync.c'
-      - 'include/time_record.h'
-      - 'tests/test_checkpoint*.c'
-      - 'tests/test_sched_record.c'
-      - 'tests/test_time_record.c'
-      - 'kernel/entropy_record.c'
-      - 'kernel/entropy_record_sync.c'
-      - 'include/entropy_record.h'
-      - 'tests/test_entropy_record.c'
-      - 'kernel/replay_engine.c'
-      - 'kernel/replay_engine_sync.c'
-      - 'include/replay_engine.h'
-      - 'tests/test_replay_engine.c'
-      - 'kernel/divergence.c'
-      - 'kernel/divergence_sync.c'
-      - 'include/divergence.h'
-      - 'tests/test_divergence.c'
-      - 'tests/test_snapshot_store.c'
-      - 'tests/test_persistence_e2e.c'
-      - 'scripts/test/persistence_demo.sh'
-      - 'kernel/keyframe_ring.c'
-      - 'include/keyframe_ring.h'
-      - 'tests/test_keyframe_ring.c'
-      - 'kernel/rewind.c'
-      - 'kernel/rewind_sync.c'
-      - 'include/rewind.h'
-      - 'tests/test_rewind.c'
-      - 'kernel/reverse.c'
-      - 'kernel/reverse_sync.c'
-      - 'include/reverse.h'
-      - 'tests/test_reverse.c'
-      - 'kernel/revbreak.c'
-      - 'kernel/revbreak_sync.c'
-      - 'include/revbreak.h'
-      - 'tests/test_revbreak.c'
-      - 'kernel/gdbstub.c'
-      - 'kernel/gdbstub_sync.c'
-      - 'include/gdbstub.h'
-      - 'tests/test_gdbstub.c'
-      - 'tests/timetravel_e2e.c'
-      - 'scripts/test/timetravel_demo.sh'
-      - 'tests/scrub_e2e.c'
-      - 'scripts/test/scrub_demo.sh'
-      - 'kernel/mcp.c'
-      - 'kernel/mcp_sync.c'
-      - 'include/mcp.h'
-      - 'tests/test_mcp.c'
-      - 'tests/mcp_heisenbug_e2e.c'
-      - 'scripts/test/mcp_heisenbug_demo.sh'
-      - 'kernel/journal_capture.c'
-      - 'kernel/journal_capture_sync.c'
-      - 'include/journal_capture.h'
-      - 'tests/test_journal_capture.c'
-      - 'kernel/keyframe_store.c'
-      - 'kernel/keyframe_store_sync.c'
-      - 'include/keyframe_store.h'
-      - 'tests/test_keyframe_store.c'
-      - 'kernel/replay_driver.c'
-      - 'kernel/replay_driver_sync.c'
-      - 'include/replay_driver.h'
-      - 'tests/test_replay_driver.c'
-      - 'kernel/divergence_scan.c'
-      - 'kernel/divergence_scan_sync.c'
-      - 'include/divergence_scan.h'
-      - 'tests/test_divergence_scan.c'
-      - 'kernel/gdb_serial.c'
-      - 'kernel/gdb_serial_sync.c'
-      - 'include/gdb_serial.h'
-      - 'tests/test_gdb_serial.c'
-      - 'kernel/mcp_server.c'
-      - 'kernel/mcp_server_sync.c'
-      - 'include/mcp_server.h'
-      - 'tests/test_mcp_server.c'
-      - 'tests/timetravel_live_e2e.c'
-      - 'scripts/test/timetravel_live_demo.sh'
-      - 'tests/test_ide_durable_boot.c'
-      - 'tests/persistence_ide_resume_e2e.c'
-      - 'scripts/test/qemu_persistence_demo.sh'
-      - '.github/workflows/persistence.yml'
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -105,16 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compiler version
-        run: gcc --version
-
-      - name: Freestanding compile check (kernel modules)
+      - name: Toolchain
         run: |
-          set -e
-          for f in kernel/checkpoint.c kernel/snapshot_store.c kernel/checkpoint_extstate.c kernel/checkpoint_ide.c kernel/checkpoint_barrier.c kernel/checkpoint_proctable.c kernel/checkpoint_proctable_sync.c kernel/checkpoint_filetable.c kernel/checkpoint_filetable_sync.c kernel/checkpoint_ipc.c kernel/checkpoint_ipc_sync.c kernel/checkpoint_driver.c kernel/checkpoint_disk.c kernel/checkpoint_disk_sync.c kernel/checkpoint_fb.c kernel/checkpoint_fb_sync.c kernel/checkpoint_restore_seq.c kernel/checkpoint_boot_v2.c kernel/checkpoint_ide_boot.c kernel/checkpoint_journal.c kernel/sched_record.c kernel/time_record.c kernel/time_record_sync.c kernel/entropy_record.c kernel/entropy_record_sync.c kernel/replay_engine.c kernel/replay_engine_sync.c kernel/divergence.c kernel/divergence_sync.c kernel/keyframe_ring.c kernel/rewind.c kernel/rewind_sync.c kernel/reverse.c kernel/reverse_sync.c kernel/revbreak.c kernel/revbreak_sync.c kernel/gdbstub.c kernel/gdbstub_sync.c kernel/mcp.c kernel/mcp_sync.c kernel/journal_capture.c kernel/journal_capture_sync.c kernel/keyframe_store.c kernel/keyframe_store_sync.c kernel/replay_driver.c kernel/replay_driver_sync.c kernel/divergence_scan.c kernel/divergence_scan_sync.c kernel/gdb_serial.c kernel/gdb_serial_sync.c kernel/mcp_server.c kernel/mcp_server_sync.c kernel/ramdisk.c; do
-            echo "freestanding: $f"
-            gcc -ffreestanding -fno-stack-protector -m64 -Iinclude -Wall -Wextra -fsyntax-only "$f"
-          done
+          sudo apt-get update
+          sudo apt-get install -y nasm
+          gcc --version | head -1
+          nasm -v
+
+      - name: Build the kernel (freestanding, -Werror)
+        run: make kernel
 
       - name: Checkpoint / store / restore unit tests
         run: |
@@ -161,21 +73,40 @@ jobs:
           gcc -I../include -Wall -o /tmp/t_ds     test_divergence_scan.c      ../kernel/divergence_scan.c ../kernel/divergence.c && /tmp/t_ds
           gcc -I../include -Wall -o /tmp/t_gsl    test_gdb_serial.c           ../kernel/gdb_serial.c ../kernel/gdbstub.c ../kernel/gdbstub_sync.c && /tmp/t_gsl
           gcc -I../include -Wall -o /tmp/t_msl    test_mcp_server.c           ../kernel/mcp_server.c ../kernel/mcp.c && /tmp/t_msl
+          gcc -I../include -Wall -o /tmp/t_jr     test_journal_ring.c         ../kernel/journal_ring.c ../kernel/checkpoint_journal.c ../kernel/journal_capture.c ../kernel/keyframe_ring.c && /tmp/t_jr
 
-  e2e-demo:
+  headless-demos:
     runs-on: ubuntu-latest
     needs: unit-tests
     steps:
       - uses: actions/checkout@v4
-      - name: End-to-end "yank power, it remembers" demo
+      - name: Persistence demo (host harness)
         run: bash scripts/test/persistence_demo.sh
-      - name: Time-travel "record, replay, byte-identical" demo
+      - name: Record and replay byte-identically (host harness)
         run: bash scripts/test/timetravel_demo.sh
-      - name: Time-travel "scrub the machine backwards" demo
+      - name: Scrub backwards (host harness)
         run: bash scripts/test/scrub_demo.sh
-      - name: MCP heisenbug demo (agent rewinds to find the bug)
+      - name: MCP heisenbug (host harness)
         run: bash scripts/test/mcp_heisenbug_demo.sh
-      - name: Live boot/record/reverse-step end-to-end (#200)
+      - name: Keyframe store + journal + MCP loop (host harness)
         run: bash scripts/test/timetravel_live_demo.sh
-      - name: In-QEMU boot demo (skips gracefully if QEMU is unavailable)
+
+  qemu:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm qemu-system-x86 gdb grub-pc-bin xorriso mtools
+      - name: Build
+        run: make
+      - name: Boot, record, verify every epoch byte-exact (in-kernel self-test)
+        run: make selftest
+      - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
+        run: python3 tests/qemu/timetravel_e2e.py
+      - name: Power cut and resume on the IDE disk (in QEMU)
         run: bash scripts/test/qemu_persistence_demo.sh
+      - name: Bootable ISO (GRUB, BIOS)
+        run: make iso

@@ -123,7 +123,8 @@ int  tt_reverse_continue(tt_hit_t* hit);
 int  tt_last_change(uint32_t pid, uint64_t addr, uint32_t len, tt_pos_t* where);
 
 /* Re-execute `epoch` from its keyframe and call visit(ctx, step) at every entry
- * 0 .. limit-1 with the machine there. */
+ * 0 .. limit-1 with the machine there (limit is capped at the epoch's length
+ * + 1: its last position is (epoch, len)). */
 typedef void (*tt_visit_fn)(void* ctx, uint64_t step);
 int tt_scan_epoch(uint64_t epoch, uint64_t limit, tt_visit_fn visit, void* ctx);
 

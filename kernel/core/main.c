@@ -133,6 +133,14 @@ static uint64_t watch_probe(void* ctx) {
     return v;
 }
 
+static uint64_t g_scan_count;
+static bool     g_scan_ok;
+static void scan_count(void* ctx, uint64_t step) {
+    (void)ctx;
+    if (step != g_scan_count || machine_step() != step) g_scan_ok = false;
+    g_scan_count++;
+}
+
 /* QEMU's isa-debug-exit device: the process exits with status (v << 1) | 1. */
 void boot_qemu_exit(uint8_t v) {
     outb(0xF4, v);
@@ -168,6 +176,16 @@ static bool selftest(void) {
             bad.first_component);
     ok = ok && bad.diverged;
     tt_verify(&v);   /* back to the end of the recording, clean */
+
+    /* A scan of the newest epoch visits every position through the stop
+     * point, and nothing else. */
+    g_scan_count = 0;
+    g_scan_ok = true;
+    rc = tt_scan_epoch(w.newest, w.end_step + 1, scan_count, 0);
+    kprintf("selftest: scan of epoch %lu visited %lu positions (want %lu) rc=%d\n",
+            w.newest, g_scan_count, w.end_step + 1, rc);
+    ok = ok && rc == TT_OK && g_scan_ok && g_scan_count == w.end_step + 1;
+    tt_verify(&v);
 
     /* Who last wrote the heisenbug's batch_limit? Found by value, to the
      * exact instruction (#228). */

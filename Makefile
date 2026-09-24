@@ -1,9 +1,11 @@
 # Laplace: a time-traveling debugger built as an operating system.
 #
 #   make            build the kernel (build/laplace.elf) and its user programs
-#   make run        boot it in QEMU (console on stdio, gdb on tcp:1235, MCP on tcp:1236)
+#   make run        boot it in QEMU (console on stdio, gdb on tcp:1235, MCP on tcp:1236,
+#                   recording to build/disk.img; APPEND="run=counter" etc. passes options)
+#   make selftest   boot, record the heisenbug, verify the replay, and exit
 #   make iso        build a GRUB rescue ISO (build/laplace.iso) for BIOS machines
-#   make test       host unit tests + the in-QEMU end-to-end gates
+#   make test       the self-test plus the in-QEMU end-to-end gates
 #   make legacy     the pre-Laplace wildcard build (does not compile; see #233)
 #
 # Needs gcc, GNU ld, nasm, and (to boot) qemu-system-x86_64.
@@ -13,6 +15,7 @@ CC      ?= gcc
 LD      ?= ld
 OBJCOPY ?= objcopy
 QEMU    ?= qemu-system-x86_64
+GRUB_MKRESCUE ?= grub-mkrescue   # needs grub-pc-bin, xorriso, mtools
 
 BUILD   := build
 KBUILD  := $(BUILD)/kernel
@@ -64,7 +67,7 @@ UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
 ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -z noexecstack \
             -T user/laplace/user.ld
 
-.PHONY: all kernel user run iso clean legacy
+.PHONY: all kernel user run selftest test iso clean legacy
 
 all: kernel
 
@@ -91,15 +94,46 @@ $(KBUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 -g -F dwarf -o $@ $<
 
+# The machine's disk: keyframes and journals live here and survive reboots.
+DISK       ?= $(BUILD)/disk.img
+GDB_PORT   ?= 1235
+MCP_PORT   ?= 1236
+APPEND     ?=
 QEMU_FLAGS ?= -m 256M -display none -no-reboot
-run: kernel
-	$(QEMU) $(QEMU_FLAGS) -kernel $(BUILD)/laplace.elf -serial stdio
+
+$(DISK):
+	@mkdir -p $(dir $@)
+	truncate -s 64M $@
+
+# Console on stdio; gdb (COM2) and MCP (COM3) on TCP. Attach with
+#   gdb build/user/heisenbug.elf -ex 'target remote :$(GDB_PORT)'
+#   tools/laplace-mcp --port $(MCP_PORT)
+run: kernel $(DISK)
+	$(QEMU) $(QEMU_FLAGS) -kernel $(BUILD)/laplace.elf -append "$(APPEND)" \
+	    -drive file=$(DISK),format=raw,if=ide,index=0 \
+	    -serial mon:stdio -serial tcp:127.0.0.1:$(GDB_PORT),server,nowait \
+	    -serial tcp:127.0.0.1:$(MCP_PORT),server,nowait
+
+# Record the heisenbug until it fires, then verify every retained epoch
+# byte-exact, check that a perturbed replay is caught, and find the clobbering
+# store backward. QEMU exits 1 on success (isa-debug-exit), 3 on failure.
+selftest: kernel
+	@$(QEMU) $(QEMU_FLAGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+	    -kernel $(BUILD)/laplace.elf -append "selftest exit" \
+	    -serial stdio -serial null -serial null; \
+	 status=$$?; [ $$status -eq 1 ] || { echo "selftest failed (status $$status)"; exit 1; }
+
+# Everything CI runs: host unit tests are in .github/workflows/laplace.yml;
+# these are the booted-kernel gates.
+test: all selftest
+	python3 tests/qemu/timetravel_e2e.py
+	bash scripts/test/qemu_persistence_demo.sh
 
 iso: kernel
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(BUILD)/laplace.elf $(BUILD)/iso/boot/laplace.elf
 	printf 'set timeout=0\nset default=0\nmenuentry "Laplace" {\n  multiboot /boot/laplace.elf\n  boot\n}\n' > $(BUILD)/iso/boot/grub/grub.cfg
-	grub-mkrescue -o $(BUILD)/laplace.iso $(BUILD)/iso
+	$(GRUB_MKRESCUE) -o $(BUILD)/laplace.iso $(BUILD)/iso
 
 legacy:
 	$(MAKE) -f Makefile.legacy all

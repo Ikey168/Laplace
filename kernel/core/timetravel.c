@@ -176,7 +176,7 @@ uint32_t tt_required_sectors(uint32_t keyframes) {
 /* ---- Setup ---- */
 
 static uint32_t label_crc(const tt_label_t* l) {
-    return snapshot_crc32(0, l, (uint32_t)(sizeof(*l) - sizeof(l->crc)));
+    return snapshot_crc32(0, l, (uint32_t)__builtin_offsetof(tt_label_t, crc));
 }
 
 int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe) {
@@ -204,7 +204,7 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
 
     static uint8_t sector[512];
     bool reuse = false;
-    if (dev->read_sectors(dev, 0, 1, sector) == 0) {
+    if (dev->read_sectors(dev->private_data, 0, 1, sector) == 0) {
         tt_label_t have;
         memcpy(&have, sector, sizeof(have));
         reuse = have.crc == label_crc(&have) && have.magic == want.magic &&
@@ -218,7 +218,7 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
          * then provision both stores and write the label last. */
         memset(sector, 0, sizeof(sector));
         for (uint32_t s = 0; s < KF_BASE + KF_INDEX_SECTORS; s++) {
-            dev->write_sectors(dev, s, 1, sector);
+            dev->write_sectors(dev->private_data, s, 1, sector);
         }
     }
     if (keyframe_store_arm(dev, KF_BASE, KF_INDEX_SECTORS, capacity, KF_SLOT_SECTORS)
@@ -233,7 +233,10 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
     if (!reuse) {
         memset(sector, 0, sizeof(sector));
         memcpy(sector, &want, sizeof(want));
-        if (dev->write_sectors(dev, 0, 1, sector) != 0) return -1;
+        if (dev->write_sectors(dev->private_data, 0, 1, sector) != 0) {
+            kprintf("timetravel: cannot write the disk label\n");
+            return -1;
+        }
     }
 
     const keyframe_ring_t* ring = keyframe_store_ring(keyframe_store_get());
@@ -522,14 +525,18 @@ int tt_scan_epoch(uint64_t epoch, uint64_t limit, tt_visit_fn visit, void* ctx) 
     if (!g_ready) return TT_ERR_STATE;
     uint64_t len;
     if (!in_window(epoch) || !tt_epoch_len(epoch, &len)) return TT_ERR_RANGE;
-    if (limit > len) limit = len;
+    /* An epoch's positions are its entries 0 .. len; (epoch, len) is where it
+     * ends (the next keyframe, or the stop point of the newest epoch). */
+    if (limit > len + 1) limit = len + 1;
     if (tt_restore_keyframe(epoch) != TT_OK) return TT_ERR_RESTORE;
     if (replay_load_epoch(epoch) != 0) return TT_ERR_JOURNAL;
     if (limit == 0) return TT_OK;
     visit(ctx, 0);
     if (limit == 1) return TT_OK;
+    /* The hook fires at every replayed entry, including the one the drive
+     * stops at: driving to limit - 1 visits 1 .. limit - 1. */
     machine_set_entry_hook(visit, ctx);
-    int rc = tt_drive(epoch, limit, 0, len);
+    int rc = tt_drive(epoch, limit - 1, 0, len);
     machine_set_entry_hook(0, 0);
     return rc;
 }

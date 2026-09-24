@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Laplace MCP bridge (#229).
+
+A stdio MCP server that relays to the MCP server inside the Laplace kernel.
+The kernel speaks newline-delimited JSON-RPC on its third serial port (COM3);
+`make run` exposes that port as a TCP socket. MCP clients launch stdio
+servers, so this relays each line from stdin to the socket and each line from
+the socket to stdout, nothing more: the protocol (initialize, tools/list,
+tools/call, ...) is implemented by the kernel.
+
+    make run                                   # QEMU: MCP on 127.0.0.1:1236
+    tools/laplace-mcp --port 1236              # a stdio MCP server
+    claude mcp add laplace -- /path/to/Laplace/tools/laplace-mcp
+
+A request that reaches a machine running live stops it at its next kernel
+entry, then gets answered from the stopped machine.
+"""
+
+import argparse
+import socket
+import sys
+import threading
+import time
+
+
+def connect(host, port, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return socket.create_connection((host, port))
+        except OSError as err:
+            if time.monotonic() >= deadline:
+                sys.stderr.write(f"laplace-mcp: cannot reach {host}:{port}: {err}\n")
+                sys.exit(1)
+            time.sleep(0.25)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=1236, help="the VM's COM3 TCP port")
+    ap.add_argument("--connect-timeout", type=float, default=30.0,
+                    help="seconds to wait for the VM to start listening")
+    args = ap.parse_args()
+
+    sock = connect(args.host, args.port, args.connect_timeout)
+    from_vm = sock.makefile("rb")
+
+    def vm_to_stdout():
+        for line in from_vm:
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+        # The VM closed the port: end the session.
+        sys.stdout.close()
+
+    threading.Thread(target=vm_to_stdout, daemon=True).start()
+
+    for line in sys.stdin.buffer:
+        if not line.strip():
+            continue
+        if not line.endswith(b"\n"):
+            line += b"\n"
+        sock.sendall(line)
+    # The client closed stdin: give the last reply a moment to arrive.
+    time.sleep(0.2)
+    sock.close()
+
+
+if __name__ == "__main__":
+    main()
