@@ -60,5 +60,8 @@ void     krewind_bind(const keyframe_ring_t* ring, replay_engine_t* engine);
 int      krewind_to(uint64_t target_epoch, uint64_t target_offset);
 bool     krewind_runnable(void);
 uint64_t krewind_landed_keyframe(void);
+/* The bound rewind context, for binding reverse execution to it (#226). NULL
+ * until krewind_bind() succeeds. */
+rewind_ctx_t* krewind_ctx(void);
 
 #endif /* REWIND_H */

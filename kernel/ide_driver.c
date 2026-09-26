@@ -320,7 +320,14 @@ int ide_identify_drive(ide_device_t* ide_dev, uint8_t drive) {
     if (ide_select_drive(ide_dev, drive) != IDE_SUCCESS) {
         return IDE_ERROR_INVALID_PARAM;
     }
-    
+
+    /* No device answers: the status register floats (0xFF) or reads 0 when
+     * the other drive on the channel is present. Don't wait out a timeout. */
+    uint8_t probe = ide_read_reg(ide_dev, IDE_REG_STATUS);
+    if (probe == 0x00 || probe == 0xFF) {
+        return IDE_ERROR_NO_DRIVE;
+    }
+
     /* Wait for drive to be ready */
     if (ide_wait_ready(ide_dev, 1000) != IDE_SUCCESS) {
         debug_print("IDE: Drive %d not ready\n", drive);
@@ -359,6 +366,10 @@ int ide_identify_drive(ide_device_t* ide_dev, uint8_t drive) {
 /**
  * Identify all drives on controller
  */
+bool ide_drive_present(ide_device_t* ide_dev, uint8_t drive) {
+    return ide_dev && drive < 2 && ide_dev->drives[drive].present;
+}
+
 int ide_identify_drives(ide_device_t* ide_dev) {
     if (!ide_dev) {
         return IDE_ERROR_INVALID_PARAM;

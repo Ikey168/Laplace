@@ -35,14 +35,17 @@ int mcp_server_read_line(const mcp_transport_t* t, char* buf, uint32_t cap) {
 int mcp_server_serve_once(const mcp_transport_t* t, mcp_handle_fn handle) {
     if (!t || !handle) return MCP_SERVER_ERR;
 
-    char req[1024];
+    /* Static: an MCP client's initialize request and a tools/list reply with
+     * input schemas run to several kilobytes. */
+    static char req[MCP_SERVER_MAX_LINE];
     int rlen = mcp_server_read_line(t, req, sizeof(req));
     if (rlen == MCP_SERVER_CLOSED) return MCP_SERVER_CLOSED;
     if (rlen < 0) return MCP_SERVER_ERR;
 
-    char resp[1024];
+    static char resp[MCP_SERVER_MAX_LINE];
     int n = handle(req, (uint32_t)rlen, resp, sizeof(resp));
     if (n < 0) return MCP_SERVER_ERR;
+    if (n == 0) return MCP_SERVER_OK;   /* a notification: no response */
 
     for (int i = 0; i < n; i++) {
         if (t->put_byte(t->ctx, (uint8_t)resp[i]) != 0) return MCP_SERVER_ERR;

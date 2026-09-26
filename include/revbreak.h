@@ -55,10 +55,33 @@ int reverse_breakpoint(reverse_ctx_t* rv, revbreak_cond_fn cond, void* ctx,
 int reverse_watchpoint(reverse_ctx_t* rv, revbreak_probe_fn probe, void* ctx,
                        reverse_pos_t* hit);
 
+/* ---- Scan fast path (#226) ----
+ *
+ * The functions above walk backward one position at a time, and every step is a
+ * full rewind (restore a keyframe, replay to the position): O(n^2) replay work
+ * for an n-step epoch. A scanner instead re-executes an epoch once, forward,
+ * visiting every step position in order with the system state there; the
+ * search then walks epochs backward, newest first, and each epoch is replayed
+ * once. Same results as the step-by-step functions.
+ *
+ * scan(sctx, epoch, limit, visit, vctx) replays `epoch` from its keyframe and
+ * calls visit(vctx, pos) at (epoch, 0), (epoch, 1), ..., (epoch, limit - 1),
+ * with the system restored at each. Returns 0 on success, negative on failure. */
+typedef void (*revbreak_visit_fn)(void* vctx, reverse_pos_t pos);
+typedef int  (*revbreak_scan_fn)(void* sctx, uint64_t epoch, uint64_t limit,
+                                 revbreak_visit_fn visit, void* vctx);
+
+int reverse_breakpoint_scan(reverse_ctx_t* rv, revbreak_scan_fn scan, void* sctx,
+                            revbreak_cond_fn cond, void* ctx, reverse_pos_t* hit);
+int reverse_watchpoint_scan(reverse_ctx_t* rv, revbreak_scan_fn scan, void* sctx,
+                            revbreak_probe_fn probe, void* ctx, reverse_pos_t* hit);
+
 /* ---- Kernel adapter (revbreak_sync.c) ----
  * Reverse breakpoint / watchpoint bound to a reverse context, for the debugger
  * front end (the GDB bridge in #172). */
 void krevbreak_bind(reverse_ctx_t* rv);
+/* Install the kernel's epoch scanner; krevbreak_* then use the scan fast path. */
+void krevbreak_set_scanner(revbreak_scan_fn scan, void* sctx);
 int  krevbreak_breakpoint(revbreak_cond_fn cond, void* ctx, reverse_pos_t* hit);
 int  krevbreak_watchpoint(revbreak_probe_fn probe, void* ctx, reverse_pos_t* hit);
 

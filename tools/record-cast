@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Record a command's terminal output as an asciicast v2 file (#232).
+
+    tools/record-cast OUT.cast "Title" -- command args...
+
+Runs the command under a pseudo-terminal and writes every chunk of output with
+the time it actually arrived, so `asciinema play OUT.cast` replays the real run.
+A minimal stand-in for `asciinema rec` where asciinema is not installed; the
+docs/media recordings are made with it. Exits with the command's status.
+"""
+
+import json
+import os
+import pty
+import select
+import sys
+import time
+
+
+def main():
+    if len(sys.argv) < 5 or sys.argv[3] != "--":
+        sys.stderr.write(__doc__)
+        return 2
+    out_path, title, cmd = sys.argv[1], sys.argv[2], sys.argv[4:]
+    width, height = 110, 40
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["COLUMNS"] = str(width)
+        os.environ["LINES"] = str(height)
+        os.execvp(cmd[0], cmd)
+
+    start = time.monotonic()
+    events = [[0.0, "o", "$ " + " ".join(cmd) + "\r\n"]]
+    while True:
+        try:
+            ready, _, _ = select.select([fd], [], [], 1.0)
+        except InterruptedError:
+            continue
+        if not ready:
+            continue
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        text = data.decode("utf-8", errors="replace")
+        events.append([round(time.monotonic() - start, 6), "o", text])
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    _, status = os.waitpid(pid, 0)
+
+    header = {"version": 2, "width": width, "height": height,
+              "timestamp": int(time.time()), "title": title,
+              "env": {"TERM": "xterm-256color", "SHELL": "/bin/bash"}}
+    with open(out_path, "w") as f:
+        f.write(json.dumps(header) + "\n")
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+    return os.waitstatus_to_exitcode(status)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,9 +1,15 @@
-/* In-QEMU-style end-to-end: boot, record, reverse-step live (#200).
+/* Host harness: keyframe store + journal + divergence + MCP loop (#200, #230).
+ *
+ * NOT a boot. This runs on the host, over a RAM-array block device, and its
+ * whole "machine state" is a single uint64_t. It checks that the storage,
+ * journal, divergence, and MCP modules compose. The booted end-to-end test,
+ * which records real processes in QEMU and re-executes them, is
+ * tests/qemu/timetravel_e2e.py.
  *
  * Proves the whole live-capture + replay + front-end + divergence stack works
  * together, over the REAL merged modules (no mocks of the modules under test):
  *
- *   1. BOOT   - format a keyframe retention store (#195) and a journal (#194)
+ *   1. SETUP  - format a keyframe retention store (#195) and a journal (#194)
  *               over a RAM-backed block device, arm the divergence detector
  *               (#166/#197), and bind the MCP tool ops (#188).
  *   2. RECORD - run a short session of E epochs whose state folds in the epoch's
@@ -228,10 +234,10 @@ static bool verify_no_divergence(uint64_t epoch) {
 }
 
 int main(void) {
-    printf("=== In-QEMU-style time-travel end-to-end (#200) ===\n\n");
+    printf("=== Host harness: keyframe store + journal + divergence + MCP loop ===\n\n");
 
-    /* ---- 1. BOOT ---- */
-    printf("[boot] arming keyframe retention store + journal + divergence\n");
+    /* ---- 1. SETUP ---- */
+    printf("[setup] arming keyframe retention store + journal + divergence\n");
     fat_block_device_t* dev = make_dev();
     CHECK(keyframe_store_init(&g_ks, dev, KF_BASE, 3, CAP, 10) == KEYFRAME_STORE_OK, "keyframe store init");
     CHECK(keyframe_store_format(&g_ks) == KEYFRAME_STORE_OK, "keyframe store format");
@@ -320,6 +326,6 @@ int main(void) {
     bool caught = !verify_no_divergence(newest);
     CHECK(caught, "a corrupted reconstruction IS caught by the divergence detector");
 
-    printf("\n%s\n", failures ? "FAILED" : "PASSED: booted, recorded, reverse-stepped, no leak");
+    printf("\n%s\n", failures ? "FAILED" : "PASSED: stores, journal, divergence, and MCP loop compose (host harness)");
     return failures ? 1 : 0;
 }

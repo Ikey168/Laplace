@@ -12,6 +12,15 @@ int replay_split_epoch(replay_event_source_t* src, uint64_t epoch,
                        uint64_t* pts,     uint32_t* n_pts,
                        uint64_t* times,   uint32_t* n_times,
                        uint8_t*  entropy, uint32_t* n_entropy) {
+    return replay_split_epoch_ex(src, epoch, pts, n_pts, times, n_times,
+                                 entropy, n_entropy, NULL, NULL);
+}
+
+int replay_split_epoch_ex(replay_event_source_t* src, uint64_t epoch,
+                          uint64_t* pts,     uint32_t* n_pts,
+                          uint64_t* times,   uint32_t* n_times,
+                          uint8_t*  entropy, uint32_t* n_entropy,
+                          uint64_t* epoch_len, bool* has_len) {
     if (!src || !src->begin_epoch || !src->next ||
         !pts || !n_pts || !times || !n_times || !entropy || !n_entropy) {
         return REPLAY_ERR_PARAM;
@@ -20,6 +29,8 @@ int replay_split_epoch(replay_event_source_t* src, uint64_t epoch,
     *n_pts = 0;
     *n_times = 0;
     *n_entropy = 0;
+    if (epoch_len) *epoch_len = 0;
+    if (has_len) *has_len = false;
 
     if (src->begin_epoch(src->ctx, epoch) != 0) {
         return REPLAY_ERR_LOAD; /* that epoch's journal is unavailable */
@@ -49,6 +60,10 @@ int replay_split_epoch(replay_event_source_t* src, uint64_t epoch,
             }
             break;
         }
+        case REPLAY_EV_EPOCH_LEN:
+            if (epoch_len) *epoch_len = ev.value;
+            if (has_len) *has_len = true;
+            break;
         default:
             /* Unknown event types are ignored so the format can grow. */
             break;
@@ -68,10 +83,11 @@ static int drv_restore(void* c, uint64_t epoch) {
 
 static int drv_load(void* c, uint64_t epoch) {
     replay_driver_t* d = (replay_driver_t*)c;
-    int rc = replay_split_epoch(&d->source, epoch,
-                                d->pts, &d->n_pts,
-                                d->times, &d->n_times,
-                                d->entropy, &d->n_entropy);
+    int rc = replay_split_epoch_ex(&d->source, epoch,
+                                   d->pts, &d->n_pts,
+                                   d->times, &d->n_times,
+                                   d->entropy, &d->n_entropy,
+                                   &d->epoch_len, &d->has_epoch_len);
     if (rc != REPLAY_OK) return rc;
     return d->load_subsystems(epoch, d->pts, d->n_pts, d->times, d->n_times,
                               d->entropy, d->n_entropy);
@@ -81,19 +97,22 @@ static int drv_run(void* c, uint64_t epoch, uint64_t limit) {
     replay_driver_t* d = (replay_driver_t*)c;
     uint64_t steps = limit;
     if (limit == REPLAY_WHOLE_EPOCH) {
-        /* A whole epoch is re-driven through its last recorded switch point:
-         * the deltas just loaded for this epoch bound the logical clock, and
-         * the scheduler's replay clock starts at 0 each epoch. */
-        steps = 0;
-        for (uint32_t i = 0; i < d->n_pts; i++) {
-            if (d->pts[i] > steps) steps = d->pts[i];
+        if (d->has_epoch_len) {
+            /* The journal records how many steps the epoch ran (#223). */
+            steps = d->epoch_len;
+        } else {
+            /* Older journals: re-drive through the last recorded switch point
+             * (the epoch may have run further; its length was not recorded). */
+            steps = 0;
+            for (uint32_t i = 0; i < d->n_pts; i++) {
+                if (d->pts[i] > steps) steps = d->pts[i];
+            }
         }
     }
     return d->drive_steps(d->ctx, epoch, steps);
 }
 
-int replay_driver_run(replay_driver_t* d, uint64_t keyframe_epoch,
-                      uint64_t target_epoch, uint64_t target_offset) {
+int replay_driver_bind(replay_driver_t* d) {
     if (!d || !d->restore_keyframe || !d->load_subsystems || !d->drive_steps ||
         !d->source.begin_epoch || !d->source.next) {
         return REPLAY_ERR_PARAM;
@@ -104,8 +123,12 @@ int replay_driver_run(replay_driver_t* d, uint64_t keyframe_epoch,
     hooks.load_epoch = drv_load;
     hooks.run_epoch = drv_run;
     hooks.ctx = d;
+    return replay_init(&d->engine, &hooks);
+}
 
-    int rc = replay_init(&d->engine, &hooks);
+int replay_driver_run(replay_driver_t* d, uint64_t keyframe_epoch,
+                      uint64_t target_epoch, uint64_t target_offset) {
+    int rc = replay_driver_bind(d);
     if (rc != REPLAY_OK) return rc;
     return replay_run(&d->engine, keyframe_epoch, target_epoch, target_offset);
 }

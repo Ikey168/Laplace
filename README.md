@@ -1,9 +1,9 @@
 # Laplace
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Orthogonal Persistence](https://github.com/Ikey168/Laplace/actions/workflows/persistence.yml/badge.svg)](https://github.com/Ikey168/Laplace/actions/workflows/persistence.yml)
+[![CI](https://github.com/Ikey168/Laplace/actions/workflows/laplace.yml/badge.svg)](https://github.com/Ikey168/Laplace/actions/workflows/laplace.yml)
 [![Architecture](https://img.shields.io/badge/Architecture-x86__64-blue.svg)]()
-[![Kernel](https://img.shields.io/badge/Kernel-Microkernel-orange.svg)]()
+[![Boot](https://img.shields.io/badge/Boot-Multiboot-orange.svg)]()
 
 > *"An intellect which at a certain moment would know all forces that set nature
 > in motion, and all positions of all items of which nature is composed... for
@@ -24,457 +24,284 @@ as many times as you need. The bug cannot escape into a different interleaving,
 because the interleaving is part of the recording.
 
 The name is the thesis. Laplace's demon, the intellect in the epigraph, is
-fiction in physics; here it is an implementation: the present state plus the
-recorded journal determines every past moment of the machine, and the kernel
-computes it on demand.
+fiction in physics; here it is an implementation: a recorded state of the
+machine plus the journal of everything nondeterministic that followed
+determines every later moment, and the kernel recomputes any of them on demand.
 
-Two front ends drive it:
+Two front ends drive it, both served from inside the kernel while the machine is
+stopped:
 
-- **gdb**: `reverse-stepi` / `reverse-continue` against the running OS over the
-  serial port, using gdb's native reverse-execution protocol.
-- **MCP**: `list_checkpoints`, `rewind_to`, `reverse_step`, and
-  `watch_last_write` exposed as JSON-RPC tools, so an AI agent can drive the
-  machine backward. Agents are bad at exactly what this is good at: reproducing
-  a flaky bug and keeping the world stable between attempts. Laplace turns an
-  agent into a time-traveling debugger.
+- **gdb**: stock gdb attaches with `target remote` and debugs the recorded
+  machine in both directions: `reverse-stepi`, `reverse-continue`, hardware
+  watchpoints and breakpoints, registers, memory, one thread per process.
+- **MCP**: an MCP client (an AI agent) connects through `tools/laplace-mcp` and
+  gets tools like `watch_last_write`, `rewind_to`, `reverse_stepi`,
+  `read_memory`, and `verify_replay`. Agents are bad at exactly what this is
+  good at: reproducing a flaky bug and keeping the world stable between
+  attempts.
 
 ## See it
 
-The live end-to-end run: boot the stack, record a session, then drive
-rewind/reverse over the MCP loop and verify every reconstructed moment,
-byte-exact:
+A planted heisenbug (`user/laplace/heisenbug.c`): an off-by-one ring write that
+fires only when preemption, the clock, and a random payload line up. Laplace
+records the machine until the program's assertion stops it, then an agent asks
+who clobbered the value, over MCP, and gets the exact instruction:
 
 ```
-=== In-QEMU-style time-travel end-to-end (#200) ===
-[record] retained window: epochs 3..6 (last 4 of 6)
-[agent] driving rewind/reverse over the MCP JSON-RPC loop
-        rewound to epoch=5 offset=0  ->  stepped back to epoch=4  ->  epoch=3
-[verify] epoch 3..6: state=match divergence=clean
-  divergence detector reports NO leak over the live run
-PASSED: booted, recorded, reverse-stepped, no leak
+[run ] break: pid 1 asserted (code bad) at epoch 14, step 1689
+  mcp> read_memory(pid=1, addr=0x40001100, len=4)
+       pid=1 addr=0x40001100 len=4 bytes=e4290000 u32=10724       # should be 48
+  mcp> watch_last_write(pid=1, addr=0x40001100, len=4)
+       last write at epoch=14 offset=1616 insn=26 pid=1 rip=0x400000b3
+  mcp> get_registers(pid=1)
+       pid=1 rax=0x40 ...                                            # slot 64 of a 64-slot ring
+  mcp> reverse_stepi()
+       now at epoch=14 offset=1616 insn=25 pid=1 rip=0x400000ac     # the store itself
+  mcp> read_memory(pid=1, addr=0x40001100, len=4)
+       pid=1 addr=0x40001100 len=4 bytes=30000000 u32=48
+  mcp> verify_replay()
+       byte-exact: epochs_checked=14 epochs_diverged=0
 ```
 
-(Recording: `asciinema play docs/media/timetravel-live.cast`.)
+and gdb, attached to the same stopped machine:
 
-All the demos run headless against the real modules and gate CI:
+```
+(gdb) watch -l g.batch_limit
+(gdb) reverse-continue
+Thread 1 hit Hardware watchpoint 1: -location g.batch_limit
+Old value = 10724
+New value = 48
+0x00000000400000ac in produce (payload=payload@entry=10724, burst=burst@entry=1) at user/laplace/heisenbug.c:42
+42	    g.ring[slot] = payload;
+```
+
+Every past moment in that session is reconstructed by restoring a keyframe
+from the disk and re-executing the recorded processes. `verify_replay`
+re-executes every retained epoch and compares checksums of all memory, all
+registers, the process table, and the scheduler with the ones recorded live.
+
+Recording of the full session (`asciinema play docs/media/laplace-heisenbug.cast`)
+is `tests/qemu/timetravel_e2e.py`, which CI runs on every push:
 
 ```bash
-# Boot, record, reverse-step: keyframe store + journal + divergence detector +
-# MCP front end, with every reconstructed moment verified leak-free:
-./scripts/test/timetravel_live_demo.sh
-
-# An AI agent debugs a planted heisenbug by rewinding the machine:
-./scripts/test/mcp_heisenbug_demo.sh
-
-# Record a session, scrub it backward, and match every past moment:
-./scripts/test/scrub_demo.sh
-
-# A recorded session replays byte-identically:
-./scripts/test/timetravel_demo.sh
+make                                  # kernel + user programs (needs gcc, nasm)
+python3 tests/qemu/timetravel_e2e.py  # boot, record, debug backward over MCP and gdb
+make selftest                         # in-kernel: verify every epoch, catch a perturbed replay
+bash scripts/test/qemu_persistence_demo.sh   # pull the power, boot, resume
 ```
 
 ## Using the debugger
 
-From gdb, over the serial port (the stub advertises `ReverseStep+` /
-`ReverseContinue+`, so gdb's stock reverse commands just work):
-
-```
-(gdb) target remote <serial>
-(gdb) reverse-stepi      # one step back: restore the prior keyframe, replay to
-                         # just before the current point
-(gdb) reverse-continue   # run backward to the previous stop / oldest keyframe
+```bash
+make run    # QEMU: console on stdio, gdb on :1235 (COM2), MCP on :1236 (COM3),
+            # recording to build/disk.img. APPEND="run=counter" picks programs.
 ```
 
-From an MCP client, as newline-delimited JSON-RPC (one response line per
-request):
+When the machine stops (an assertion, a fault, the last process exiting, or a
+debugger connecting while it runs) the kernel serves both ports:
 
 ```
-{"jsonrpc":"2.0","id":1,"method":"tools/list"}
-{"id":2,"method":"tools/call","params":{"name":"rewind_to","arguments":{"epoch":35,"offset":2}}}
-{"id":3,"method":"tools/call","params":{"name":"reverse_step","arguments":{}}}
-{"id":4,"method":"tools/call","params":{"name":"watch_last_write","arguments":{}}}
+$ gdb build/user/heisenbug.elf -ex 'set remotetimeout 120' -ex 'target remote :1235'
+(gdb) reverse-stepi
+(gdb) monitor where
+(gdb) monitor verify
+
+$ claude mcp add laplace -- /path/to/Laplace/tools/laplace-mcp --port 1236
 ```
 
-How-tos: [gdb reverse debugging](docs/testing/reverse-debugging.md) and
-[driving time-travel from MCP](docs/testing/mcp-server.md).
+`continue` (gdb) or `resume` (MCP) at the end of the recording runs the machine
+live again, still recording, until the next stop. How-tos:
+[gdb reverse debugging](docs/testing/reverse-debugging.md) and
+[driving time travel from MCP](docs/testing/mcp-server.md).
 
 ## Why the debugger is an operating system
 
 Record/replay debuggers exist: rr records single Linux processes from the
 outside, and emulator-level record/replay (QEMU, Simics) records a virtual
 machine from underneath. Laplace moves the recorder inside: time travel is an OS
-service. The kernel owns its keyframes, its input journal, its replay engine,
-and a divergence detector that checksums system state every epoch on both runs
-to prove each reconstruction is byte-exact. Nothing is instrumented and no
-emulator sits in the loop; the unit of replay is the whole machine, kernel and
-schedule included.
+service. The kernel owns its keyframes, its input journal, its replay, and a
+divergence detector that checksums the whole machine at every epoch boundary on
+both runs. The unit of replay is every process on the machine and the schedule
+between them.
 
 It works like film: a **keyframe** (a whole-system checkpoint) every interval,
 and between keyframes a CRC-protected **journal** of every nondeterministic
-input, each entry stamped with a logical clock:
+input the programs can observe:
 
-- preemption points: the exact logical moment of every context switch
-- timer and cycle reads (RDTSC virtualized on replay)
-- entropy draws
+- preemption: the step (kernel entry) at which every involuntary context switch
+  happened; timer interrupts only mark the slice expired, so switches happen at
+  kernel entries and replay forces the same ones
+- clock reads (`SYS_TIME`)
+- entropy (`SYS_RANDOM`)
 
-Restoring the nearest keyframe and re-driving execution with the journaled
-inputs reconstructs any `(epoch, offset)` in the recorded window. Reverse-step
-is "restore the prior keyframe, replay to just before here"; a reverse
-watchpoint scans backward for the last write. The retention ring keeps the last
-N keyframes on disk (the rewind horizon), and its index survives a reboot.
+Restoring the nearest keyframe and re-executing with the journaled inputs
+reconstructs any `(epoch, step, instruction)` in the retained window.
+Instruction precision comes from single-stepping the last segment with the trap
+flag; breakpoints and watchpoints use the CPU's debug registers while replaying.
+The keyframe ring and one journal per keyframe live on the disk and survive a
+reboot.
 
-Full design and the module map:
+Full design, module map, and limits:
 [`docs/architecture/time-travel.md`](docs/architecture/time-travel.md).
 
 ## The substrate: orthogonal persistence
 
-The recorder falls out of a stranger property: Laplace is a persistent OS. There
-is no save, no load, and no shutdown; the running system is the durable state.
-Pull the power cord, plug it back in, and your work is where you left it. The
-periodic whole-system checkpoints that make that true are exactly the keyframes
-time travel needs, which is why the debugger could be built as an OS at all.
-(The lineage is real: KeyKOS, EROS, Phantom OS, IBM i's single-level store. No
-other hobby-tier microkernel implements it.)
-
-A program does **nothing special** to be durable. The counter below has no
-`save()`, no `load()`, no serialization:
+The recorder falls out of a stranger property: Laplace is a persistent OS. The
+periodic whole-system checkpoints that make power cuts harmless are exactly the
+keyframes time travel needs. A program does **nothing special** to be durable:
 
 ```c
-/* user/persistent_counter.c - the entire persistence "logic" */
-uint64_t counter = 0;
-for (;;) { counter++; print_u64(counter); yield(); }
+/* user/laplace/counter.c: the entire persistence "logic" */
+static uint64_t counter;
+for (;;) { counter++; if (counter % 20000 == 0) print(counter); sys_yield(); }
 ```
 
-The end-to-end demo (`scripts/test/persistence_demo.sh`) proves it against the
-real checkpoint engine and on-disk store, modeling a power cut as a process
-restart:
+`scripts/test/qemu_persistence_demo.sh` boots it on an IDE disk, kills QEMU
+with SIGKILL, and boots again, four times:
 
 ```
-[cycle 1] boot fresh, count to 5
-  [run] counter now = 5 (then power is cut)
-[reboot] counter must have survived at 5
-  [verify] counter = 5  == expected 5  : REMEMBERED
-[cycle 2] count 5 more (resumes from 5)
-  [run] counter now = 10 (then power is cut)
-[reboot] counter must have survived at 10
-  [verify] counter = 10  == expected 10  : REMEMBERED
-[crash test] cut power mid-run (kill -9), then reboot
-  [crash] reloaded a valid checkpoint; counter = 3903 (>= 10, monotonic)
-PASSED: the counter remembered itself across every power cycle
+[boot 1] fresh disk: counted 20000 .. 420000, then power cut after 3s
+[boot 2] resumed from keyframe 24: counted 420000 .. 1000000 (had printed 420000 before the cut), cut after 4s
+         lost at most 20000 counts to the cut (work since the newest keyframe)
+[boot 3] resumed from keyframe 56: counted 1000000 .. 1320000 (had printed 1000000 before the cut), cut after 2.5s
+         lost at most 20000 counts to the cut (work since the newest keyframe)
+[boot 4] resumed from keyframe 75: counted 1340000 .. 1840000 (had printed 1320000 before the cut), cut after 3.5s
+         lost at most 0 counts to the cut (work since the newest keyframe)
+PASSED: the booted machine resumed from the IDE disk after every power cut
 ```
 
-How: a checkpoint marks every writable page read-only and copy-on-write (cheap;
-it copies nothing). The first write to a marked page faults, and the kernel
-preserves the pre-checkpoint contents before letting the write proceed. A
-background pass streams those pages into the **inactive** one of two on-disk
-slots; a single superblock-sector write flips the active slot and is the only
-commit point, so a crash mid-checkpoint always leaves the previous one intact
-(CRC32 guards every slot). On boot, a valid checkpoint is reloaded instead of
-cold-starting.
-
-```bash
-# Headless proof against the real checkpoint engine (no emulator needed):
-./scripts/test/persistence_demo.sh
-
-# Yank power, boot, resume - on the durable IDE store. Runs a headless resume
-# gate over the same IDE binding the kernel wires at boot (always), then the
-# booted-system QEMU run when an emulator + image are present:
-./scripts/test/qemu_persistence_demo.sh
-```
-
-The checkpoint store lives on a real IDE disk when one is present (true
-power-cut durability; the kernel binds it at boot and falls back to the
-volatile RAM disk otherwise). Recording of the yank-power/boot/resume cycle:
-`asciinema play docs/media/qemu-resume.cast`. Full design:
+A power cut loses only the work since the newest keyframe on the disk (at most
+one keyframe interval, 100 ms by default); the demo checks that bound. (Recording:
+`asciinema play docs/media/qemu-resume.cast`.) A checkpoint marks
+every writable page read-only and copy-on-write; the first write to a marked
+page makes the kernel preserve its pre-checkpoint image, and the keyframe is
+written to the disk at a later kernel entry. Each keyframe region is
+double-buffered with a superblock flip as its commit point, CRC-checked, and the
+boot path resumes from the newest valid one. Design:
 [`docs/architecture/orthogonal-persistence.md`](docs/architecture/orthogonal-persistence.md).
 
-## What actually works vs. roadmap
+## What works
 
-Being honest about maturity. The debugging stack:
+Everything in this table runs in the booted kernel and is exercised in CI
+(`.github/workflows/laplace.yml`):
 
-| Layer | Status |
-|-------|--------|
-| Deterministic replay core: input journal, deterministic preemption, virtualized time, deterministic entropy | Implemented, unit-tested |
-| Live capture: every checkpoint commit journals its epoch's inputs and divergence checksums | Implemented, unit-tested |
-| Keyframe retention store: last N checkpoints across on-disk regions, index survives reboot | Implemented, unit-tested |
-| Replay driver: land the booted system at an arbitrary (epoch, offset) | Implemented, unit-tested; the live journal retains the latest epoch (a deeper journal ring is future work) |
-| Divergence detector fed by real component checksums (process table, scheduler) | Implemented, unit-tested |
-| Rewind-to, reverse-step/continue, reverse breakpoints and watchpoints | Implemented, unit-tested |
-| gdb front end: RSP stub (bs/bc) + serial transport loop | Implemented, unit-tested |
-| MCP front end: JSON-RPC tools + server loop | Implemented, unit-tested |
-| End-to-end: byte-identical replay, scrub-backwards, agent heisenbug hunt, live boot/record/reverse-step | Passing headlessly in CI; the in-QEMU layer runs when an emulator + image are present |
+| Capability | Tested by |
+|------------|-----------|
+| Multiboot boot (QEMU `-kernel`, GRUB ISO), long mode, paging, ring-3 processes, system calls | every QEMU job; `make iso` |
+| Recording: keyframes with deferred copy-on-write writeback, one journal per keyframe, on the IDE disk | `make selftest`, e2e |
+| Replay by re-executing the processes to any (epoch, step, instruction) | e2e, `make selftest` |
+| Byte-exact verification of every retained epoch; a perturbed replay is caught | `make selftest`, `verify_replay`, `monitor verify` |
+| gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
+| MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
+| Resume live after debugging, recording continues | e2e |
+| Power cut and resume from the disk | `qemu_persistence_demo.sh` |
 
-And the persistence substrate it rides on:
+Limits, stated plainly:
 
-| Layer | Status |
-|-------|--------|
-| Snapshot store: double-buffered slots + CRC, single superblock-flip commit | Implemented, unit-tested |
-| Checkpoint engine: stop-the-world COW marking, page-fault capture, background writeback | Implemented, unit-tested |
-| Restore + boot decision; context and process-table reconstruction | Implemented, unit-tested |
-| Periodic trigger + external-state policy (sockets/DMA/devices severed on restore) | Implemented, unit-tested |
-| IDE-backed durable store wired into the boot path (falls back to the RAM disk) | Implemented; durability + counter resume across a power cut gated headlessly in CI, with a scripted QEMU booted-system demo |
-| Process register/scheduler-state resume actually executing | Table/context restore done; scheduler bridge + QEMU boot pending |
-| Kernel-internal and driver state | v2 design (v1 cold-inits the kernel/drivers and restores user spaces on top) |
-
-The broader subsystems below describe the project's overall scope; several are
-partial or aspirational. The debugging and persistence stacks are the parts
-with end-to-end tests and CI today.
+- One CPU. Preemption is at kernel-entry granularity: a process that never
+  enters the kernel is not preempted while recording.
+- The journaled inputs are preemption, clock, and entropy. There is no device
+  input (keyboard, network) yet, so there is nothing else to journal.
+- Programs may not use x87/SSE state; user programs build with
+  `-mgeneral-regs-only`.
+- Workloads are the programs embedded in the kernel (`user/laplace/`).
+- Recorded history is read-only from the debuggers.
 
 ## The machine
 
-The system being recorded is Laplace's own microkernel for x86/x86_64 consumer
-devices (the project was formerly named IKOS, and the source tree still carries
-that name in places). Two of its properties are what make the debugger work:
+The system being recorded is Laplace's own small kernel (`kernel/core/`): a
+Multiboot entry into long mode, a frame allocator and per-process 4-level page
+tables, ring-3 processes loaded from embedded ELF images, `int 0x80` system
+calls, and a round-robin scheduler. The kernel runs with interrupts disabled and
+never blocks, so a kernel entry is an atomic, deterministic step; the whole
+time-travel stack (`kernel/*.c`, host-tested under `tests/`) sits on top of it.
 
-- **Copy-on-write virtual memory.** A keyframe is a COW marking pass: mark every
-  writable page read-only, copy nothing, and capture a page lazily on its first
-  write. That makes whole-system checkpoints cheap enough to take on a timer,
-  which is what makes "a keyframe every interval" affordable.
-- **A small, message-passing microkernel.** The kernel surface that must be
-  recorded and reconstructed (scheduler, process table, IPC) is small enough to
-  checksum every epoch and reason about deterministically. Replay is
-  deterministic on a single CPU today; SMP-safe replay is future work.
-
-Around that core the project carries the scaffolding of a general-purpose OS, in
-varying states of maturity (see the table above): a custom multi-stage
-bootloader (real mode to long mode), a VFS with FAT support, a framebuffer and
-GUI stack, a TCP/IP stack with a sockets API, audio scaffolding, and an
-authentication framework.
-
-```
-+-----------------------------------------------------------------+
-|                    User Applications                            |
-|   GUI Apps      Terminal      File Manager      Web Browser     |
-+-----------------------------------------------------------------+
-|                    System Services                              |
-|   File System   Network       Audio            Graphics        |
-|   Service       Service       Service          Service         |
-+-----------------------------------------------------------------+
-|                    Device Drivers                               |
-|   Storage       Network       Audio            Input           |
-|   Drivers       Drivers       Drivers          Drivers         |
-+-----------------------------------------------------------------+
-|                      Microkernel                                |
-|   IPC           Scheduler     VMM              Interrupts      |
-|   Manager       Manager       Manager          Handler         |
-+-----------------------------------------------------------------+
-|                      Hardware Layer                             |
-|   CPU           Memory        Storage          Peripherals     |
-+-----------------------------------------------------------------+
-```
-
-The recorder lives in the microkernel layer: the checkpoint engine, the input
-journal, and the record/replay wrappers sit beside the scheduler and the VMM.
-That placement is why the unit of replay is the whole machine, kernel and
-schedule included, rather than a single process.
+The project was formerly named IKOS, and the tree carries a broad scaffold of a
+general-purpose OS from that era (GUI, USB, networking, audio, daemons, a
+multi-stage boot sector). That code is **not** in the bootable kernel and does
+not compile today; `make legacy` runs its old build. Issue #233 tracks either
+repairing or removing it.
 
 ## Getting started
 
-### Prerequisites
-
-A Unix-like environment with `nasm`, `gcc`, `make`, `git`, and (to boot the OS)
-`qemu-system-x86`:
-
 ```bash
 # Ubuntu/Debian
-sudo apt-get install -y nasm gcc make qemu-system-x86 build-essential git
-# Fedora/CentOS/RHEL
-sudo dnf install -y nasm gcc make qemu-system-x86 gcc-c++ git
-# macOS (Homebrew)
-brew install nasm gcc make qemu git
-```
+sudo apt-get install -y gcc make nasm qemu-system-x86 gdb python3
+# for make iso: grub-pc-bin xorriso mtools
 
-### Run the debugger first (no OS build required)
-
-The entire debugging stack is host-testable: every demo compiles the real
-kernel modules with the host `gcc` and drives them headlessly, so you can watch
-record / rewind / reverse work before ever booting the OS:
-
-```bash
 git clone https://github.com/Ikey168/Laplace.git && cd Laplace
-
-./scripts/test/timetravel_live_demo.sh   # boot, record, reverse-step, verify
-./scripts/test/mcp_heisenbug_demo.sh     # an agent hunts a heisenbug by rewinding
-./scripts/test/persistence_demo.sh       # yank power, it remembers
+make            # build/laplace.elf and build/user/*.elf
+make selftest   # boots, records the heisenbug, verifies the replay, exits
+make run        # boot it for real and attach gdb / MCP
 ```
 
-### Build and boot the OS
+Kernel command line (`make run APPEND="..."`):
 
-```bash
-make all       # bootloader + kernel image
-make test      # comprehensive test suite
-make debug     # boot in QEMU with a gdb server attached
-```
-
-### Debug it, forward and backward
-
-Forward debugging uses QEMU's gdb server as usual:
-
-```bash
-make debug
-gdb kernel/kernel.elf
-(gdb) target remote localhost:1234
-(gdb) break kernel_main
-(gdb) continue
-```
-
-Backward debugging talks to Laplace's own stub instead, over the serial port
-(COM1); the stub owns the machine's recorded history, which QEMU's gdb server
-knows nothing about. The MCP server listens on COM2 so the two front ends never
-collide. See [Using the debugger](#using-the-debugger) above and
-[`docs/testing/reverse-debugging.md`](docs/testing/reverse-debugging.md).
-
-### Build targets
+| Option | Meaning |
+|--------|---------|
+| `run=a,b,c` | programs to start on a cold boot: `heisenbug`, `noise`, `counter`, `hello` (default `heisenbug,noise,noise`) |
+| `interval=N` | keyframe cadence in timer ticks (1 ms each; default 100) |
+| `keyframes=N` | retained keyframes, the rewind horizon (default 16) |
+| `fresh` | ignore a recording on the disk and cold-boot |
+| `stop_after=N` | stop for the debugger after N keyframes |
 
 | Target | Description |
 |--------|-------------|
-| `make all` | Build complete Laplace system |
-| `make bootloader` | Build all bootloader variants |
-| `make kernel` | Build kernel components |
-| `make test` | Run comprehensive test suite |
-| `make debug` | Boot in QEMU with a gdb server |
-| `make clean` | Clean all build artifacts |
+| `make` | kernel and user programs |
+| `make run` | boot in QEMU with gdb and MCP ports and a disk |
+| `make selftest` | in-kernel verification, exits QEMU with the result |
+| `make test` | `selftest` plus the in-QEMU end-to-end gates |
+| `make iso` | GRUB rescue ISO for BIOS machines |
+| `make legacy` | the old IKOS wildcard build (does not compile; #233) |
 
 ## Testing
 
-CI runs the debugger's whole verification pyramid on every push
-(`.github/workflows/persistence.yml`): host-side unit tests for every module,
-freestanding compile checks proving the same sources build into the kernel, and
-the headless end-to-end demos as gates:
+CI (`.github/workflows/laplace.yml`) builds the kernel with `-Werror`, runs the
+host unit tests of every time-travel and persistence module, runs the host
+harnesses (`scripts/test/{persistence,timetravel,scrub,mcp_heisenbug,timetravel_live}_demo.sh`,
+which exercise the modules outside the kernel), then boots the kernel in QEMU
+for `make selftest`, `tests/qemu/timetravel_e2e.py`, the power-cut demo, and
+`make iso`.
 
-```bash
-make test                                 # complete system test
-
-./scripts/test/timetravel_live_demo.sh    # boot, record, reverse-step, no leak
-./scripts/test/mcp_heisenbug_demo.sh      # agent rewinds to find a planted bug
-./scripts/test/scrub_demo.sh              # scrub backwards, match every moment
-./scripts/test/timetravel_demo.sh         # byte-identical replay
-./scripts/test/persistence_demo.sh        # power-cycle resume (file-backed disk)
-./scripts/test/qemu_persistence_demo.sh   # power-cut resume on the IDE store
-```
-
-Component test scripts for the broader OS (audio, GUI, input, USB, memory,
-paging, real hardware) live under `scripts/test/`.
-
-## Project Structure
+## Project structure
 
 ```
 Laplace/
-  boot/                  Multi-stage bootloader implementations
-    boot.asm             Basic real mode bootloader
-    boot_enhanced.asm    Enhanced bootloader with memory detection
-    boot_longmode.asm    Long mode (64-bit) bootloader
-    boot_elf_loader.asm  ELF kernel loading bootloader
-    boot.ld              Bootloader linker script
-  kernel/                Microkernel implementation
-    checkpoint*.c        Checkpoint engine, snapshot store, restore (keyframes)
-    *_record*.c          Record/replay wrappers: preemption, time, entropy
-    journal_capture*.c   Per-epoch input journal, written beside each checkpoint
-    keyframe_*.c         Keyframe retention ring + N-deep on-disk store
-    replay_*.c           Replay engine + driver (land at any epoch/offset)
-    rewind*.c reverse*.c revbreak*.c   The time-travel verbs
-    divergence*.c        Byte-exact replay verification
-    gdbstub*.c gdb_serial*.c   gdb reverse-execution front end (serial)
-    mcp*.c               MCP JSON-RPC front end for AI agents
-    scheduler.c          Process scheduler (the deterministic-preemption seam)
-    vmm.c                Virtual memory manager (COW: what makes keyframes cheap)
-    interrupts.c ipc.c gui.c framebuffer.c network_driver.c ...   The OS proper
-    Makefile             Kernel build system
-  include/               System headers and definitions
-  tests/                 Component and integration test suites
-  user/                  User-space applications and demos
-  docs/                  Architecture, implementation, and testing docs
-  scripts/               Build, test, validation, and debug scripts
-  tools/                 Development tools and utilities
-  examples/              Demo scripts and examples
-  Makefile               Main build system
+  kernel/core/        the bootable kernel: boot.asm, isr.asm, cpu, mm, proc,
+                      machine (steps, scheduling, traps), timetravel (record,
+                      restore, replay, navigation), monitor, gdb_target, main
+  kernel/*.c          the time-travel and persistence modules (checkpoint,
+                      snapshot/keyframe/journal stores, record wrappers, replay,
+                      divergence, rewind/reverse/revbreak, gdbstub, mcp), plus
+                      the legacy IKOS subsystems (not built)
+  include/            headers (include/core/ for the kernel core)
+  user/laplace/       the recorded programs: heisenbug, noise, counter, hello
+  tests/              host unit tests; tests/qemu/ the booted end-to-end gate
+  tools/              laplace-mcp (MCP stdio bridge), record-cast
+  scripts/test/       host harnesses and the QEMU power-cut demo
+  docs/               architecture and how-tos
 ```
 
 ## Roadmap
 
-The time-travel debugging stack and the persistence substrate it rides on are the
-mature parts of Laplace, with unit tests and CI demos (see the sections above). The items
-below are the broader OS scaffolding, in rough priority order.
-
-Recently landed: the IDE-backed durable store wired into the boot path, the in-QEMU
-persistence-resume demo, and the full live time-travel stack (see the maturity table
-and the time-travel section above).
-
-Short term:
-- [ ] UEFI boot support
-- [ ] Performance optimizations
-
-Medium term:
-- [ ] SMP (symmetric multiprocessing) support
-- [ ] Persisting kernel-internal and driver state (persistence v2)
-- [ ] Broader networking features
-- [ ] Package management
-
-Long term:
-- [ ] Container and virtualization support
-- [ ] Advanced power management
-- [ ] Hardware abstraction layer
-
-## Contributing
-
-Contributions are welcome from developers of all skill levels.
-
-### Development Setup
-1. Fork and clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/Laplace.git
-   cd Laplace
-   ```
-
-2. Set up the development environment:
-   ```bash
-   make install-deps    # Install development dependencies
-   make all             # Build the complete system
-   make test            # Run the test suite
-   ```
-
-3. Create a feature branch:
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-### Contribution Guidelines
-- **Code Style**: follow the established coding conventions
-- **Testing**: add tests for new features and bug fixes
-- **Documentation**: update documentation for any API changes
-- **Commit Messages**: use clear, descriptive commit messages
-- **Pull Requests**: provide detailed descriptions of changes
-
-### Areas Looking for Contributors
-- Deepen the journal: a multi-epoch journal ring (the live journal retains the
-  latest epoch today)
-- The live in-QEMU run: drive `reverse-stepi` from a real gdb against a booted image
-- More divergence components (user pages, file table, IPC) to tighten the
-  byte-exact guarantee
+- Journal device input (keyboard, disk completions) so interactive programs
+  can be recorded
+- A loader for programs not embedded in the kernel
+- x87/SSE state in contexts and keyframes
+- Retired-instruction counting (where available) for preemption finer than a
+  kernel entry
 - SMP-safe deterministic replay
-- Device drivers, documentation, and testing for the broader OS
+- Repair or remove the legacy subsystems (#233)
 
 ## Documentation
 
 Full index: [`docs/README.md`](docs/README.md).
 
-### Headline features
-- [Orthogonal persistence (design)](docs/architecture/orthogonal-persistence.md) and
-  [persistence v2](docs/architecture/orthogonal-persistence-v2.md)
-- [Time-travel debugging (design + module map)](docs/architecture/time-travel.md)
+- [Time-travel debugging: design, module map, limits](docs/architecture/time-travel.md)
 - [Reverse debugging with gdb](docs/testing/reverse-debugging.md)
-- [Driving time-travel from an MCP client](docs/testing/mcp-server.md)
-
-### Architecture and subsystems
-- [Virtual Memory Manager](docs/architecture/VMM_README.md)
-- [Device Driver Framework](docs/architecture/DEVICE_DRIVER_FRAMEWORK.md)
-- [Network Stack](docs/architecture/NETWORK_STACK.md) and [TCP/IP](docs/architecture/TCPIP.md)
-- Per-subsystem reference notes in [`docs/implementation/`](docs/implementation/)
-
-### Testing and debugging
-- [Bootloader and system testing guide](docs/TESTING.md)
-- [QEMU and real-hardware testing](docs/testing/QEMU_REAL_HARDWARE_TEST.md)
-- [Runtime kernel debugger](docs/testing/RUNTIME_KERNEL_DEBUGGER.md)
+- [Driving time travel from MCP](docs/testing/mcp-server.md)
+- [Orthogonal persistence](docs/architecture/orthogonal-persistence.md) and
+  [persistence v2](docs/architecture/orthogonal-persistence-v2.md)
 
 ## License
 

@@ -1,4 +1,4 @@
-/* IKOS Orthogonal Persistence - Divergence component scan adapter (#197)
+/* IKOS Orthogonal Persistence - Divergence component scan adapter (#197, #225)
  *
  * See include/divergence_scan.h. Wires the pure scan core to the global
  * divergence detector (#166), a registry of live component sources, and the
@@ -7,16 +7,21 @@
  * the recomputed ones, so a nondeterminism leak halts at the exact epoch and
  * component.
  *
- * The concrete component sources checksum the restored subsystems. Process
- * table and scheduler order are wired here (both reachable through stable
- * process-manager accessors); further components register as their subsystems
- * expose deterministic snapshot accessors.
+ * The component sources cover what "byte-exact" means for the recorded machine
+ * (#225): the process table, the scheduler (current process, run order, and the
+ * pending kernel entry), the contents of every mapped user page, and every
+ * process's saved registers. Physical addresses and page-table permission bits
+ * are excluded: a restored machine maps the same contents at the same virtual
+ * addresses through different frames, and copy-on-write marking changes
+ * permissions without changing anything a program can observe.
  */
 
 #include "divergence_scan.h"
 #include "divergence.h"          /* kdiverge_*, divergence_checksum */
 #include "process_manager.h"     /* pm_get_process_list, pm_get_process */
-#include "scheduler.h"           /* task_get_current */
+#include "core/proc.h"           /* process table order */
+#include "core/mm.h"             /* vmm_for_each_page */
+#include "core/machine.h"        /* machine_current, machine_pending */
 #include <stddef.h>
 
 /* ---- Source registry ---- */
@@ -41,37 +46,72 @@ void kdiverge_register(uint32_t component, diverge_source_fn source, void* ctx) 
     g_nsources++;
 }
 
-/* ---- Concrete component sources over the restored subsystems ---- */
+/* ---- Concrete component sources over the recorded machine ---- */
 
-/* Process table: the pid and state of every live process, in list order. */
+/* Process table: pid, liveness, and name of every process, in table order. */
 static uint32_t sum_proctable(void* ctx) {
     (void)ctx;
-    uint32_t pids[PM_MAX_PROCESSES];
-    uint32_t n = 0;
-    if (pm_get_process_list(pids, PM_MAX_PROCESSES, &n) != 0) return 0;
     uint32_t crc = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        process_t* p = pm_get_process(pids[i]);
-        if (!p) continue;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
         uint32_t pid = (uint32_t)p->pid;
-        uint32_t st = (uint32_t)p->state;
+        uint32_t alive = p->state != PROCESS_STATE_TERMINATED;
         crc = divergence_checksum(crc, &pid, sizeof(pid));
-        crc = divergence_checksum(crc, &st, sizeof(st));
+        crc = divergence_checksum(crc, &alive, sizeof(alive));
+        crc = divergence_checksum(crc, p->name, sizeof(p->name));
     }
     return crc;
 }
 
-/* Scheduler: the currently-running pid and the ready order (the process list
- * order), which the deterministic-preemption replay must reproduce. */
+/* Scheduler: the current process, the run order, and the kernel entry the
+ * current process is stopped at. */
 static uint32_t sum_scheduler(void* ctx) {
     (void)ctx;
-    task_t* cur = task_get_current();
+    process_t* cur = machine_current();
     uint32_t cpid = cur ? (uint32_t)cur->pid : 0xFFFFFFFFu;
     uint32_t crc = divergence_checksum(0, &cpid, sizeof(cpid));
-    uint32_t pids[PM_MAX_PROCESSES];
-    uint32_t n = 0;
-    if (pm_get_process_list(pids, PM_MAX_PROCESSES, &n) == 0 && n > 0) {
-        crc = divergence_checksum(crc, pids, n * (uint32_t)sizeof(pids[0]));
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        uint32_t pid = (uint32_t)proc_at(i)->pid;
+        crc = divergence_checksum(crc, &pid, sizeof(pid));
+    }
+    uint64_t vec = machine_pending()->vector;
+    return divergence_checksum(crc, &vec, sizeof(vec));
+}
+
+/* User memory: every mapped page's address and contents, per process. */
+typedef struct { uint32_t crc; } page_sum_t;
+static void sum_one_page(void* c, uint64_t virt, uint64_t phys, pte_t pte) {
+    (void)pte;
+    page_sum_t* s = (page_sum_t*)c;
+    s->crc = divergence_checksum(s->crc, &virt, sizeof(virt));
+    s->crc = divergence_checksum(s->crc, (const void*)phys, PAGE_SIZE);
+}
+static uint32_t sum_user_pages(void* ctx) {
+    (void)ctx;
+    page_sum_t s = { 0 };
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        uint32_t pid = (uint32_t)p->pid;
+        s.crc = divergence_checksum(s.crc, &pid, sizeof(pid));
+        vmm_for_each_page(p->address_space, sum_one_page, &s);
+    }
+    return s.crc;
+}
+
+/* Registers: the general registers, instruction pointer, stack pointer, and
+ * the program-visible flags (arithmetic, direction, interrupt) of every
+ * process. Trap and resume flags belong to the debugger, not the program. */
+static uint32_t sum_contexts(void* ctx) {
+    (void)ctx;
+    uint32_t crc = 0;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        const process_context_t* c = &proc_at(i)->context;
+        uint64_t regs[19] = {
+            c->rax, c->rbx, c->rcx, c->rdx, c->rsi, c->rdi, c->rbp, c->rsp,
+            c->r8, c->r9, c->r10, c->r11, c->r12, c->r13, c->r14, c->r15,
+            c->rip, c->rflags & 0xED5ULL, (uint64_t)proc_at(i)->pid,
+        };
+        crc = divergence_checksum(crc, regs, sizeof(regs));
     }
     return crc;
 }
@@ -80,6 +120,8 @@ void kdiverge_register_kernel_sources(void) {
     kdiverge_reset_sources();
     kdiverge_register(KDIVERGE_PROCTABLE, sum_proctable, NULL);
     kdiverge_register(KDIVERGE_SCHEDULER, sum_scheduler, NULL);
+    kdiverge_register(KDIVERGE_USER_PAGES, sum_user_pages, NULL);
+    kdiverge_register(KDIVERGE_CONTEXTS, sum_contexts, NULL);
 }
 
 /* ---- Record side ---- */

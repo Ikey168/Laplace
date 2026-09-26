@@ -36,6 +36,10 @@ typedef struct {
 typedef int (*mcp_handle_fn)(const char* request, uint32_t reqlen,
                              char* out, uint32_t outcap);
 
+/* Longest request or response line. A handler returning 0 sends nothing (a
+ * JSON-RPC notification). */
+#define MCP_SERVER_MAX_LINE 16384
+
 #define MCP_SERVER_OK      0
 #define MCP_SERVER_CLOSED -1   /* transport reached end of stream */
 #define MCP_SERVER_ERR    -2
@@ -53,13 +57,8 @@ int mcp_server_serve_once(const mcp_transport_t* t, mcp_handle_fn handle);
  * (MCP_SERVER_CLOSED on a clean disconnect, or the first error). */
 int mcp_server_loop(const mcp_transport_t* t, mcp_handle_fn handle);
 
-/* ---- Kernel adapter (mcp_server_sync.c) ----
- * Configure the UART at `port` (0 selects COM2, so the MCP server and the gdb
- * stub on COM1 do not collide), bind the MCP ops (mcp_bind), register the
- * keyframe ring (from the keyframe store) and a watch probe, then serve the
- * JSON-RPC loop against mcp_handle(). mcp_server_run blocks until the connection
- * closes. */
-void mcp_server_init(uint16_t port);
-int  mcp_server_run(void);
+/* In the booted kernel the debug monitor (kernel/core/monitor.c) owns the
+ * transport: it serves mcp_server_serve_once() against mcp_handle() with the
+ * kernel's ops on COM3 whenever the machine is stopped (#226). */
 
 #endif /* MCP_SERVER_H */

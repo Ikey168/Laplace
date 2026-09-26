@@ -13,44 +13,109 @@ Both build on the existing checkpoint engine (`kernel/checkpoint.c`,
 reconstruct path). See [orthogonal-persistence.md](orthogonal-persistence.md) for that
 foundation. Work is tracked in the epic and its sub-issues on the issue tracker.
 
-The deterministic replay core and the time-travel UX are implemented; the
-["Implemented architecture"](#implemented-architecture) section below maps the design to
-the modules that ship it, and `scripts/test/scrub_demo.sh` runs the whole pipeline
-headlessly.
+Everything below runs in the booted kernel (`make run`, `make selftest`,
+`tests/qemu/timetravel_e2e.py`). The sections after "Why this is tractable here"
+are the original plan, kept for the reasoning behind it.
 
-## Implemented architecture
+## How the booted machine records and replays
 
-The pipeline, from recording inputs to scrubbing the machine backward, and the module that
-ships each piece:
+**The machine.** `build/laplace.elf` is a Multiboot kernel (QEMU `-kernel`, or
+GRUB via `make iso`) with a small core in `kernel/core/`: paging with one
+address space per process, ring-3 processes loaded from ELF images embedded in
+the kernel (`user/laplace/`), `int 0x80` system calls, and a round-robin
+scheduler. The kernel runs with interrupts disabled; only user mode takes the
+timer. Everything the time-travel modules expect from the kernel (the
+`vmm_*`, `pm_*`, and `process_*` calls the checkpoint engine makes) is
+implemented over that core.
 
-| Stage | What it does | Modules |
-|-------|--------------|---------|
-| Input journal | Records the nondeterministic inputs between two keyframes (keystrokes, disk completions, timer/cycle reads, entropy), each tagged with epoch and a logical clock, in a CRC-protected double-buffered store | `kernel/checkpoint_journal.c` |
-| Live journal capture | On every checkpoint commit, gathers the closing epoch's recorded deltas (preemption points, time reads, entropy bytes) and writes them to the input journal alongside the checkpoint, via a checkpoint post-commit hook | `kernel/journal_capture.c`, `kernel/journal_capture_sync.c` |
-| Deterministic preemption | Records the logical point of every context switch on a live run and forces switches at the same points on replay | `kernel/sched_record.c` + the `scheduler_tick` seam |
-| Virtualized time | Records RDTSC/timer reads and returns the recorded values on replay | `kernel/time_record.c`, `kernel/time_record_sync.c` |
-| Deterministic entropy | Records entropy draws and returns the recorded bytes on replay | `kernel/entropy_record.c`, `kernel/entropy_record_sync.c` |
-| Replay engine | Restores the nearest keyframe and re-drives forward to a target epoch plus offset | `kernel/replay_engine.c`, `kernel/replay_engine_sync.c` |
-| Replay driver | Assembles the engine's load_epoch/run_epoch hooks: splits each epoch's journal events back into the three delta arrays, installs them in REPLAY mode, and re-drives the live scheduler, landing the booted system at an arbitrary (epoch, offset) | `kernel/replay_driver.c`, `kernel/replay_driver_sync.c` |
-| Divergence detector | Checksums system state per epoch on record and replay, flagging any nondeterminism leak with the epoch and component | `kernel/divergence.c`, `kernel/divergence_sync.c` |
-| Divergence component scan | Feeds the detector real per-component checksums (process table, scheduler, ...) at each epoch boundary: records them into the journal on a record run and compares the recomputed sums on replay, halting at the exact epoch and component | `kernel/divergence_scan.c`, `kernel/divergence_scan_sync.c` |
-| Keyframe retention ring | Keeps the last N keyframes so rewind is not limited to the latest | `kernel/keyframe_ring.c` |
-| Keyframe retention store | Spreads checkpoints across N on-disk regions driven by the ring, persists the ring index (rebuilding it from region superblocks if torn), and restores an arbitrary retained keyframe by epoch | `kernel/keyframe_store.c`, `kernel/keyframe_store_sync.c` |
-| Rewind-to | The core verb: nearest keyframe at or before the target, then replay to the target | `kernel/rewind.c`, `kernel/rewind_sync.c` |
-| Reverse execution | reverse-step / reverse-continue as restore-prior-keyframe-and-replay | `kernel/reverse.c`, `kernel/reverse_sync.c` |
-| Reverse breakpoints/watchpoints | Scan backward to the last hit or the last write to a value, bounded by the ring | `kernel/revbreak.c`, `kernel/revbreak_sync.c` |
-| GDB bridge | Maps gdb `reverse-stepi` / `reverse-continue` (RSP bs/bc) onto the reverse engine | `kernel/gdbstub.c`, `kernel/gdbstub_sync.c` |
-| GDB serial transport | Serves RSP packets over the serial port: reads a framed request past stray acks, acks it, calls gdbstub_serve, and writes the framed reply with retransmit-on-NAK | `kernel/gdb_serial.c`, `kernel/gdb_serial_sync.c` |
-| MCP interface | Exposes record / rewind / reverse execution as JSON-RPC tools an AI agent can call | `kernel/mcp.c`, `kernel/mcp_sync.c` |
-| MCP server transport | Serves the MCP tools over a newline-delimited JSON-RPC loop: reads a request line, calls mcp_handle over the bound kernel ops, writes the response line; registers the keyframe ring and watch probe | `kernel/mcp_server.c`, `kernel/mcp_server_sync.c` |
+**Steps.** Every kernel entry a process makes (a system call or a fault) is one
+step. A position `(epoch, step)` is the machine at the moment the step-th entry
+of that epoch has trapped and not been handled; with an instruction index,
+`(epoch, step, i)` for `i >= 1` is the moment entry `step` has been handled and
+`i - 1` further user instructions have run (`include/core/machine.h`).
 
-Each stage has a host-side unit test under `tests/` and a freestanding compile check in CI.
-Two end-to-end demos tie them together, both headless: `scripts/test/timetravel_demo.sh`
-records a session, persists it to the journal, replays it, and asserts the final state is
-byte-identical; `scripts/test/scrub_demo.sh` records a session and then scrubs it backward
-(rewind and reverse-step), showing the reconstructed state at each past moment matches the
-recorded timeline. See also [reverse-debugging.md](../testing/reverse-debugging.md) for
-driving it from gdb.
+**Determinism.** A timer interrupt never changes user-visible state: it only
+marks the time slice expired. Context switches happen only at kernel entries,
+through `sched_record_decide()`, which records the step of every preemption on
+a live run and forces the same switches on replay. This is what makes the
+logical clock execution-derived; the original design counted timer ticks, which
+land at a different instruction on every run. The clock (`SYS_TIME`) and
+entropy (`SYS_RANDOM`) system calls go through `ktime_read()` and
+`kentropy_fill()`. Everything else a program can observe is a function of its
+memory and registers, so re-executing from a keyframe with the journal
+reproduces the run exactly.
+
+**Recording** (`kernel/core/timetravel.c`). At the first entry, and then
+whenever the interval elapses or a record buffer fills, the kernel closes the
+epoch (its journal goes to the journal ring) and takes a keyframe at that entry:
+`checkpoint_take()` marks every writable user page copy-on-write and captures
+registers, and a kernel-state blob captures the process table, each space's
+regions, the run order, and the pending entry. Writeback to the keyframe store
+runs at a later entry, so programs write in between and the COW hook preserves
+the checkpoint-time images.
+
+**Storage.** The first IDE disk (or a RAM disk) holds a label, the keyframe
+store (a ring index plus N double-buffered regions), and the journal ring: one
+journal per retained keyframe (`kernel/journal_ring.c`). Journal E holds the
+inputs from keyframe E to keyframe E+1 (or to the stop point, for the newest
+epoch): preemption steps, time reads, entropy, the divergence checksums of the
+state at its end, and its length in steps.
+
+**Replay.** `tt_goto()` drives the rewind verb, whose engine the replay driver
+binds (`kernel/replay_driver_sync.c`): restore the keyframe (tear down the live
+processes, rebuild them from the blob, pages, and registers), load the epoch's
+journal into the wrappers in REPLAY mode, and re-run the processes until the
+step clock reaches the target. Instruction targets are reached by single-stepping
+the target segment with RFLAGS.TF. Console output is suppressed while replaying.
+
+**Verification.** The divergence checksums cover every mapped user page, every
+process's registers, the process table, and the scheduler state. `verify`
+re-executes each retained epoch from its keyframe to its end and compares.
+
+**Searches.** Reverse breakpoints and watchpoints re-execute each epoch once,
+forward, newest epoch first (`reverse_*_scan` in `kernel/revbreak.c`).
+Hardware breakpoints and watchpoints (DR0-DR3) are armed only during searches
+and continues; a hit's exact instruction is found by single-stepping its
+segment. `watch_last_write` compares values at every step, then single-steps
+the segment where the value changed.
+
+**Front ends.** When the machine stops (a failed assertion, a fault, the last
+exit, or a debugger request) the debug monitor (`kernel/core/monitor.c`) serves
+the gdb remote protocol on COM2 and MCP on COM3. Resuming replays to the end of
+the recording and continues live, still recording.
+
+### Limits
+
+- One CPU. Deterministic replay of SMP is not attempted.
+- Preemption is at kernel-entry granularity: a process that never enters the
+  kernel is not preempted while recording.
+- The journaled inputs are the ones programs can see today: preemption, time,
+  and entropy. There is no device input (keyboard, network) to journal yet.
+- Programs may not use x87/SSE state (the context switch saves the general
+  registers only); user programs are built with `-mgeneral-regs-only`.
+- Recorded history is read-only: gdb memory and register writes are refused.
+- The workloads are the embedded programs in `user/laplace/`.
+
+## Modules
+
+| Stage | Modules |
+|-------|---------|
+| Boot, CPU, memory, processes, system calls | `kernel/core/{boot.asm,isr.asm,cpu.c,mm.c,proc.c,machine.c,main.c}` |
+| Recording, keyframes, restore, replay, verify, navigation | `kernel/core/timetravel.c` |
+| Input journal (double-buffered store) and live capture | `kernel/checkpoint_journal.c`, `kernel/journal_capture.c`, `kernel/journal_capture_sync.c` |
+| Journal ring (one journal per retained keyframe) | `kernel/journal_ring.c` |
+| Deterministic preemption, time, entropy | `kernel/sched_record.c`, `kernel/time_record*.c`, `kernel/entropy_record*.c` |
+| Checkpoint engine (COW marking, capture, writeback) | `kernel/checkpoint.c`, `kernel/snapshot_store.c` |
+| Keyframe retention ring and store | `kernel/keyframe_ring.c`, `kernel/keyframe_store.c`, `kernel/keyframe_store_sync.c` |
+| Replay engine and driver | `kernel/replay_engine*.c`, `kernel/replay_driver*.c` |
+| Divergence detector and component checksums | `kernel/divergence*.c` |
+| Rewind, reverse, reverse breakpoints/watchpoints | `kernel/rewind*.c`, `kernel/reverse*.c`, `kernel/revbreak*.c` |
+| gdb remote protocol and target | `kernel/gdbstub.c`, `kernel/gdbstub_sync.c`, `kernel/gdb_serial.c`, `kernel/core/gdb_target.c` |
+| MCP protocol and tools | `kernel/mcp.c`, `kernel/mcp_sync.c`, `kernel/mcp_server.c`, `tools/laplace-mcp` |
+| Debug monitor | `kernel/core/monitor.c` |
+
+The pure modules have host unit tests under `tests/`. The booted kernel is
+tested by `make selftest` and `tests/qemu/timetravel_e2e.py`.
 
 ## Why this is tractable here
 
@@ -123,7 +188,7 @@ This catalog fixed the scope of the deterministic replay core: the primary work 
 deterministic preemption, the input journal for keyboard input and entropy, and a gate for
 RDTSC before it goes live; the RDTSC stub, the hardcoded MAC, and severed network
 randomness needed no work. Those pieces are now implemented, per the
-["Implemented architecture"](#implemented-architecture) table above.
+[Modules](#modules) table above.
 
 ### Components
 

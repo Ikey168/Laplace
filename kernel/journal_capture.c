@@ -87,6 +87,16 @@ int journal_capture_epoch(journal_store_t* store, uint64_t epoch,
         }
     }
 
+    /* 5. The epoch's length in steps (#223), written last so a reader that
+     *    sees it knows the journal is complete. */
+    if (src->epoch_length) {
+        uint64_t len = src->epoch_length();
+        rc = journal_writer_append(&writer, JOURNAL_EV_EPOCH_LEN, len, len);
+        if (rc != JOURNAL_OK) {
+            return rc;
+        }
+    }
+
     /* Commit: the journal store flips its superblock, atomically publishing
      * this epoch's journal next to the checkpoint that closed the epoch. */
     return journal_store_commit(&writer);

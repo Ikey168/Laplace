@@ -32,6 +32,10 @@ typedef struct {
 
 /* The serve step: turn a framed request "$<payload>#<cc>" into a framed reply.
  * Signature matches gdbstub_serve(). */
+/* Largest framed packet: "$" + a GDBSTUB_PACKET_MAX payload + "#cc", with
+ * slack. A serve function returning 0 sends nothing (for 'k'). */
+#define GDB_SERIAL_MAX_FRAME 8200
+
 typedef int (*gdb_serial_serve_fn)(const char* frame, uint32_t flen,
                                    char* out, uint32_t outcap);
 
@@ -60,11 +64,8 @@ int gdb_serial_serve_once(const gdb_serial_ops_t* ops, gdb_serial_serve_fn serve
  * (GDB_SERIAL_CLOSED on a clean disconnect, or the first error). */
 int gdb_serial_loop(const gdb_serial_ops_t* ops, gdb_serial_serve_fn serve);
 
-/* ---- Kernel adapter (gdb_serial_sync.c) ----
- * Configure the UART at `port` (0 selects COM1), register the reverse ops
- * (gdbstub_bind_reverse), then serve the gdb serial loop against gdbstub_serve.
- * gdbstub_serial_run blocks serving until the connection closes. */
-void gdbstub_serial_init(uint16_t port);
-int  gdbstub_serial_run(void);
+/* In the booted kernel the debug monitor (kernel/core/monitor.c) owns the
+ * transport: it serves gdb_serial_serve_once() against gdbstub_serve on COM2
+ * whenever the machine is stopped (#226). */
 
 #endif /* GDB_SERIAL_H */

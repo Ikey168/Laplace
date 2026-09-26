@@ -75,5 +75,8 @@ void          kreverse_set_position(uint64_t epoch, uint64_t offset);
 reverse_pos_t kreverse_position(void);
 int           kreverse_step(void);
 int           kreverse_continue(reverse_stop_fn should_stop, void* pctx);
+/* The bound reverse context, for binding reverse breakpoints to it (#226). NULL
+ * until kreverse_bind() succeeds. */
+reverse_ctx_t* kreverse_ctx(void);
 
 #endif /* REVERSE_H */
