@@ -195,14 +195,44 @@ void mm_init(const uint32_t* mbi) {
     }
     g_frames = g_max_phys / PAGE_SIZE;
 
-    /* Reserve low memory, the kernel image, the heap (placed right after the
-     * kernel), and the multiboot structures. */
-    uint64_t heap_base = PAGE_ALIGN((uint64_t)_kernel_end);
-    mark_range(0, V2P((void*)heap_base) + HEAP_SIZE, true);
-    uint64_t mbi_phys = V2P(mbi) & ~0xFFFULL;
-    mark_range(mbi_phys, mbi_phys + PAGE_SIZE, true);
-    heap_init(heap_base);
-    g_hint = (V2P((void*)heap_base) + HEAP_SIZE) / PAGE_SIZE;
+    /* The boot loader puts the Multiboot information, its memory map and
+     * command line, and the modules (#240) after the kernel image: reserve
+     * them, and place the heap above all of it. */
+    uint64_t boot_end = V2P(_kernel_end);
+#define RESERVE(a, b) do { uint64_t a_ = (a), b_ = (b); \
+        mark_range(a_ & ~0xFFFULL, PAGE_ALIGN(b_), true); \
+        if (PAGE_ALIGN(b_) > boot_end) boot_end = PAGE_ALIGN(b_); } while (0)
+    uint64_t mbi_phys = V2P(mbi);
+    RESERVE(mbi_phys, mbi_phys + 128);
+    if (flags & (1u << 6)) RESERVE(mbi[12], (uint64_t)mbi[12] + mbi[11]);
+    if (flags & (1u << 2)) {
+        const char* c = (const char*)P2V(mbi[4]);
+        uint64_t n = 0;
+        while (c[n]) n++;
+        RESERVE(mbi[4], (uint64_t)mbi[4] + n + 1);
+    }
+    if (flags & (1u << 3)) {
+        uint32_t count = mbi[5];
+        RESERVE(mbi[6], (uint64_t)mbi[6] + 16ULL * count);
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t* m = (const uint32_t*)P2V(mbi[6] + 16ULL * i);
+            RESERVE(m[0], m[1]);
+            if (m[2]) {
+                const char* c = (const char*)P2V(m[2]);
+                uint64_t n = 0;
+                while (c[n]) n++;
+                RESERVE(m[2], (uint64_t)m[2] + n + 1);
+            }
+        }
+    }
+#undef RESERVE
+    /* Low memory and the kernel image; then the heap, reached through the
+     * direct map. */
+    mark_range(0, V2P(_kernel_end), true);
+    uint64_t heap_phys = PAGE_ALIGN(boot_end);
+    mark_range(heap_phys, heap_phys + HEAP_SIZE, true);
+    heap_init((uint64_t)P2V(heap_phys));
+    g_hint = (heap_phys + HEAP_SIZE) / PAGE_SIZE;
 
     extend_direct_map();
     /* The identity map was only for the jump into long mode. */

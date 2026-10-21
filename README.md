@@ -194,6 +194,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Raw `rdtsc`/`rdtscp`/`cpuid` in user code replay exactly; a divergence names the instruction that caused it | `tests/qemu/determinism_gate.sh` |
 | x87/SSE/AVX state survives preemption, is in every keyframe, and is part of what replay verifies | `tests/qemu/fpu_gate.sh`, `make selftest` |
 | Unmodified static Linux programs (musl) run; their clock and random reads replay exactly | `tests/qemu/linux_gate.sh` |
+| Programs load from outside the kernel (Multiboot modules, static and static-PIE) with argv and envp; a recording refuses to resume with changed binaries | `tests/qemu/loader_gate.sh` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
@@ -215,9 +216,10 @@ Limits, stated plainly:
   227 pages), so the recorded machine must fit in under 1 MiB (#244).
 - x87, SSE, and AVX state is saved and verified (#237); AVX-512 is not enabled
   in XCR0, so programs see no AVX-512.
-- Workloads are the programs embedded in the kernel: Laplace's own
-  (`user/laplace/`, `int 0x80`) and unmodified static Linux programs built
-  with `musl-gcc -static` (`user/linux/`, the Linux `syscall` ABI, #238). The
+- Workloads are Laplace's own programs (`user/laplace/`, `int 0x80`) and
+  unmodified static Linux programs (`musl-gcc -static` or `-static-pie`, the
+  Linux `syscall` ABI, #238), embedded in the kernel (`user/linux/`) or passed
+  as Multiboot modules (`-initrd`, #240). The
   Linux interface so far covers startup, TLS, stdio to the console, the clocks,
   and `getrandom`; unimplemented calls return ENOSYS and are logged once.
 - Recorded history is read-only from the debuggers.
@@ -255,7 +257,8 @@ Kernel command line (`make run APPEND="..."`):
 
 | Option | Meaning |
 |--------|---------|
-| `run=a,b,c` | programs to start on a cold boot: `heisenbug`, `noise`, `counter`, `hello` (default `heisenbug,noise,noise`) |
+| `run=a,b,c` | programs to start on a cold boot, each with arguments: an embedded name (`heisenbug`, `noise`, `counter`, `hello`, `musl_hello`, ...) or the path of a module passed with `-initrd`, e.g. `run="/args.elf one two",noise` (default `heisenbug,noise,noise`) |
+| `env="A=1 B=2"` | the environment of every Linux program |
 | `interval=N` | keyframe cadence in timer ticks (1 ms each; default 100) |
 | `keyframes=N` | retained keyframes, the rewind horizon (default 16) |
 | `fresh` | ignore a recording on the disk and cold-boot |

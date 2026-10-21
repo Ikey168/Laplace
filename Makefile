@@ -140,6 +140,7 @@ test: all selftest
 	bash tests/qemu/determinism_gate.sh
 	bash tests/qemu/fpu_gate.sh
 	bash tests/qemu/linux_gate.sh
+	bash tests/qemu/loader_gate.sh
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 

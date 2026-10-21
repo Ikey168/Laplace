@@ -32,7 +32,7 @@ void* memcpy(void* dst, const void* src, size_t n);
  *   [J_BASE, J_BASE + j)          journal ring: N regions
  */
 #define LABEL_MAGIC       0x3145434150414C4CULL   /* "LLAPACE1" */
-#define LABEL_VERSION     3   /* 2: CPUID table (#241); 3: clock base (#238) */
+#define LABEL_VERSION     4   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240) */
 #define KF_BASE           8
 #define KF_INDEX_SECTORS  4
 #define KF_SLOT_SECTORS   2048   /* per region slot: up to 227 page records */
@@ -65,7 +65,8 @@ typedef struct {
     uint32_t state;
     char     name[MAX_PROCESS_NAME];
     uint32_t nregions;
-    uint32_t reserved;
+    uint32_t exe_crc;             /* the executable's image (#240) */
+    char     exe[64];
     kstate_region_t regions[KSTATE_MAX_REGIONS];
 } kstate_proc_t;
 
@@ -278,6 +279,8 @@ static void capture_kstate(uint64_t epoch) {
         kp->pid = (uint32_t)p->pid;
         kp->state = (uint32_t)p->state;
         memcpy(kp->name, p->name, sizeof(kp->name));
+        memcpy(kp->exe, p->exe_path, sizeof(kp->exe));
+        kp->exe_crc = p->exe_crc;
         for (vm_region_t* r = p->address_space->regions; r && kp->nregions < KSTATE_MAX_REGIONS;
              r = r->next) {
             kstate_region_t* kr = &kp->regions[kp->nregions++];
@@ -451,6 +454,8 @@ int tt_restore_keyframe(uint64_t epoch) {
         process_t* p = proc_alloc(kp->pid, kp->name);
         if (!p) return TT_ERR_RESTORE;
         p->state = (process_state_t)kp->state;
+        memcpy(p->exe_path, kp->exe, sizeof(p->exe_path));
+        p->exe_crc = kp->exe_crc;
         for (uint32_t r = 0; r < kp->nregions && r < KSTATE_MAX_REGIONS; r++) {
             kstate_region_t* kr = &kp->regions[r];
             vmm_create_region(p->address_space, kr->start, kr->end - kr->start, kr->flags,
@@ -720,6 +725,18 @@ int tt_resume_from_store(void) {
     if (!tt_window(&w)) return TT_ERR_STATE;
     int rc = tt_restore_keyframe(w.newest);
     if (rc != TT_OK) return rc;
+    /* The recording's programs must be the ones this boot has (#240): the
+     * debuggers read their symbols from these binaries. */
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        const lp_image_t* img = p->exe_path[0] ? proc_find_image(p->exe_path) : 0;
+        if (p->exe_path[0] && (!img || proc_image_crc(img) != p->exe_crc)) {
+            kprintf("timetravel: the recording ran %s, which this boot %s\n", p->exe_path,
+                    img ? "has in a different version" : "does not have");
+            proc_destroy_all();
+            return TT_ERR_RESTORE;
+        }
+    }
     /* Continue live from the keyframe: a new timeline from (newest, 0). This
      * boot's TSC is not the recording's: keep the recorded clocks running from
      * the keyframe's time, and record the new base in a keyframe at once. */

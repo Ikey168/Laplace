@@ -34,7 +34,8 @@ size_t strlen(const char* s);
 #define MB_FLAG_CMDLINE (1u << 2)
 
 typedef struct {
-    char     run[128];
+    char     run[512];
+    char     env[256];
     uint32_t interval;
     uint32_t keyframes;
     uint32_t stop_after;
@@ -51,6 +52,16 @@ static uint32_t parse_u32(const char* s, uint32_t len) {
     return v;
 }
 
+/* Copy a token's value, dropping the double quotes that let it hold spaces
+ * (run="/bin/lua /t.lua"). */
+static void copy_value(char* dst, uint32_t cap, const char* v, uint32_t len) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < len && n + 1 < cap; i++) {
+        if (v[i] != '"') dst[n++] = v[i];
+    }
+    dst[n] = 0;
+}
+
 static void parse_cmdline(const char* cmd) {
     const char* dflt = "heisenbug,noise,noise";
     for (uint32_t i = 0; dflt[i]; i++) g_opts.run[i] = dflt[i];
@@ -60,11 +71,16 @@ static void parse_cmdline(const char* cmd) {
     while (*cmd) {
         while (*cmd == ' ') cmd++;
         const char* tok = cmd;
-        while (*cmd && *cmd != ' ') cmd++;
+        bool quoted = false;
+        while (*cmd && (quoted || *cmd != ' ')) {
+            if (*cmd == '"') quoted = !quoted;
+            cmd++;
+        }
         uint32_t len = (uint32_t)(cmd - tok);
-        if (len > 4 && strncmp(tok, "run=", 4) == 0 && len - 4 < sizeof(g_opts.run)) {
-            for (uint32_t i = 0; i < sizeof(g_opts.run); i++) g_opts.run[i] = 0;
-            for (uint32_t i = 0; i < len - 4; i++) g_opts.run[i] = tok[4 + i];
+        if (len > 4 && strncmp(tok, "run=", 4) == 0) {
+            copy_value(g_opts.run, sizeof(g_opts.run), tok + 4, len - 4);
+        } else if (len > 4 && strncmp(tok, "env=", 4) == 0) {
+            copy_value(g_opts.env, sizeof(g_opts.env), tok + 4, len - 4);
         } else if (len > 9 && strncmp(tok, "interval=", 9) == 0) {
             g_opts.interval = parse_u32(tok + 9, len - 9);
         } else if (len > 10 && strncmp(tok, "keyframes=", 10) == 0) {
@@ -105,22 +121,45 @@ static int entropy_source(void* ctx, void* buf, uint32_t len) {
     return 0;
 }
 
+/* Split `s` at spaces into words (in place), at most `max`. */
+static uint32_t split_words(char* s, const char** out, uint32_t max) {
+    uint32_t n = 0;
+    while (*s && n < max) {
+        while (*s == ' ') *s++ = 0;
+        if (!*s) break;
+        out[n++] = s;
+        while (*s && *s != ' ') s++;
+    }
+    return n;
+}
+
+/* run= is a comma-separated list of programs, each with its arguments:
+ * run="/bin/lua /scripts/t.lua,noise". env= is the environment for every
+ * Linux program, space-separated. */
 static void spawn_run_list(void) {
+    static char envbuf[sizeof(g_opts.env)];
+    const char* envp[32];
+    for (uint32_t i = 0; i < sizeof(envbuf); i++) envbuf[i] = g_opts.env[i];
+    uint32_t envc = split_words(envbuf, envp, 32);
+
     const char* p = g_opts.run;
     while (*p) {
-        char name[32];
+        static char entry[256];
         uint32_t n = 0;
-        while (*p && *p != ',' && n < sizeof(name) - 1) name[n++] = *p++;
-        name[n] = 0;
+        while (*p && *p != ',' && n < sizeof(entry) - 1) entry[n++] = *p++;
+        entry[n] = 0;
         if (*p == ',') p++;
-        const lp_image_t* img = proc_find_image(name);
+        const char* argv[32];
+        uint32_t argc = split_words(entry, argv, 32);
+        if (argc == 0) continue;
+        const lp_image_t* img = proc_find_image(argv[0]);
         if (!img) {
-            kprintf("boot: no program named '%s'\n", name);
+            kprintf("boot: no program named '%s'\n", argv[0]);
             continue;
         }
-        process_t* proc = proc_spawn(img);
-        if (!proc) panic("boot: cannot start %s", name);
-        kprintf("boot: started %s as pid %d\n", name, proc->pid);
+        process_t* proc = proc_spawn_args(img, argc, argv, envc, envp);
+        if (!proc) panic("boot: cannot start %s", argv[0]);
+        kprintf("boot: started %s as pid %d\n", argv[0], proc->pid);
     }
 }
 
@@ -310,6 +349,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     cpu_init();
     cpu_cpuid_init();
     mm_init(mbi);
+    proc_register_modules(mbi);
     pic_init();
     pit_init(MACHINE_TIMER_HZ);
     clock_init();

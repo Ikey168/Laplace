@@ -174,6 +174,9 @@ typedef struct process {
      * include/core/proc.h), and the allocation it lives in. */
     void* arch;
     void* arch_block;
+    /* The executable (#240): its path and a CRC of its image. */
+    char     exe_path[64];
+    uint32_t exe_crc;
 } process_t;
 
 /* Process management functions */

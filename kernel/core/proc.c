@@ -6,6 +6,7 @@
 #include "process_manager.h"
 #include "core/machine.h"
 #include "entropy_record.h"
+#include "snapshot_store.h"   /* snapshot_crc32 */
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -44,11 +45,61 @@ const lp_image_t* proc_images(uint32_t* count) {
     return g_images;
 }
 
+/* ---- Programs loaded as Multiboot modules (#240) ---- */
+
+#define MAX_MODULES 32
+static lp_image_t g_modules[MAX_MODULES];
+static char       g_module_paths[MAX_MODULES][64];
+static uint32_t   g_nmodules;
+
+void proc_register_modules(const uint32_t* mbi) {
+    if (!(mbi[0] & (1u << 3))) return;
+    uint32_t count = mbi[5];
+    for (uint32_t i = 0; i < count && g_nmodules < MAX_MODULES; i++) {
+        const uint32_t* m = (const uint32_t*)P2V(mbi[6] + 16ULL * i);
+        /* The module's string is "path [args]": its first word names it. */
+        const char* str = m[2] ? (const char*)P2V(m[2]) : "";
+        char* path = g_module_paths[g_nmodules];
+        uint32_t n = 0;
+        while (str[n] && str[n] != ' ' && n < sizeof(g_module_paths[0]) - 1) {
+            path[n] = str[n];
+            n++;
+        }
+        path[n] = 0;
+        lp_image_t* img = &g_modules[g_nmodules++];
+        img->name = path;
+        img->start = (const uint8_t*)P2V(m[0]);
+        img->end = (const uint8_t*)P2V(m[1]);
+        img->linux_abi = true;
+        kprintf("boot: module %s (%lu bytes)\n", path, (uint64_t)m[1] - m[0]);
+    }
+}
+
+static const char* basename_of(const char* path) {
+    const char* b = path;
+    for (const char* q = path; *q; q++) {
+        if (*q == '/') b = q + 1;
+    }
+    return b;
+}
+
+/* An embedded program by name, or a module by path or by the last component
+ * of its path (run=/musl_args.elf finds build/user/musl_args.elf). */
 const lp_image_t* proc_find_image(const char* name) {
     for (uint32_t i = 0; i < sizeof(g_images) / sizeof(g_images[0]); i++) {
         if (strcmp(g_images[i].name, name) == 0) return &g_images[i];
     }
+    for (uint32_t i = 0; i < g_nmodules; i++) {
+        if (strcmp(g_modules[i].name, name) == 0) return &g_modules[i];
+    }
+    for (uint32_t i = 0; i < g_nmodules; i++) {
+        if (strcmp(basename_of(g_modules[i].name), basename_of(name)) == 0) return &g_modules[i];
+    }
     return 0;
+}
+
+uint32_t proc_image_crc(const lp_image_t* img) {
+    return snapshot_crc32(0, img->start, (uint32_t)(img->end - img->start));
 }
 
 /* ---- Table ---- */
@@ -209,14 +260,34 @@ static void push_u64(ustack_t* u, uint64_t v) { push_bytes(u, &v, 8); }
  * static Linux binary's startup code reads. No AT_SYSINFO_EHDR: without a
  * vDSO, libc reads the time through a (journaled) system call. AT_RANDOM's
  * bytes come from the entropy source; they are in the first keyframe. */
+typedef struct {
+    uint32_t           argc;
+    const char* const* argv;
+    uint32_t           envc;
+    const char* const* envp;
+} proc_args_t;
+
+static uint64_t push_str(ustack_t* u, const char* str) {
+    uint64_t n = 0;
+    while (str[n]) n++;
+    return push_bytes(u, str, n + 1);
+}
+
+/* argv, envp, and the auxiliary vector a static Linux binary's startup code
+ * reads. No AT_SYSINFO_EHDR: without a vDSO, libc reads the time through a
+ * (journaled) system call. AT_RANDOM's bytes come from the entropy source;
+ * they are in the first keyframe. `base` is the load bias (static-PIE). */
+#define MAX_ARGS 64
 static bool linux_initial_stack(process_t* p, const elf64_ehdr_t* eh, uint64_t phdr_va,
-                                uint64_t top) {
+                                uint64_t base, uint64_t top, const proc_args_t* a) {
     ustack_t u = { p->address_space, top, true };
-    const char* name = p->name;
-    uint64_t name_len = 0;
-    while (name[name_len]) name_len++;
-    uint64_t name_ptr = push_bytes(&u, name, name_len + 1);
-    uint64_t plat_ptr = push_bytes(&u, "x86_64", 7);
+    uint32_t argc = a->argc < MAX_ARGS ? a->argc : MAX_ARGS;
+    uint32_t envc = a->envc < MAX_ARGS ? a->envc : MAX_ARGS;
+    uint64_t argp[MAX_ARGS], envq[MAX_ARGS];
+    for (uint32_t i = 0; i < envc; i++) envq[i] = push_str(&u, a->envp[i]);
+    for (uint32_t i = 0; i < argc; i++) argp[i] = push_str(&u, a->argv[i]);
+    uint64_t exec_ptr = argc ? argp[0] : push_str(&u, p->name);
+    uint64_t plat_ptr = push_str(&u, "x86_64");
     uint8_t rnd[16];
     kentropy_fill(rnd, sizeof(rnd));
     uint64_t rand_ptr = push_bytes(&u, rnd, sizeof(rnd));
@@ -226,28 +297,34 @@ static bool linux_initial_stack(process_t* p, const elf64_ehdr_t* eh, uint64_t p
     cpu_cpuid(1, 0, r);
     const uint64_t aux[][2] = {
         { AT_PHDR, phdr_va }, { AT_PHENT, eh->phentsize }, { AT_PHNUM, eh->phnum },
-        { AT_PAGESZ, PAGE_SIZE }, { AT_BASE, 0 }, { AT_FLAGS, 0 }, { AT_ENTRY, eh->entry },
+        { AT_PAGESZ, PAGE_SIZE }, { AT_BASE, 0 }, { AT_FLAGS, 0 }, { AT_ENTRY, base + eh->entry },
         { AT_UID, 0 }, { AT_EUID, 0 }, { AT_GID, 0 }, { AT_EGID, 0 },
         { AT_PLATFORM, plat_ptr }, { AT_HWCAP, r[3] }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
-        { AT_RANDOM, rand_ptr }, { AT_HWCAP2, 0 }, { AT_EXECFN, name_ptr }, { AT_NULL, 0 },
+        { AT_RANDOM, rand_ptr }, { AT_HWCAP2, 0 }, { AT_EXECFN, exec_ptr }, { AT_NULL, 0 },
     };
     uint64_t naux = sizeof(aux) / sizeof(aux[0]);
-    /* argc, argv[0], NULL, envp NULL, auxv: keep rsp 16-byte aligned at argc. */
-    uint64_t words = 1 + 2 + 1 + 2 * naux;
+    /* argc, argv..., NULL, envp..., NULL, auxv: rsp 16-byte aligned at argc. */
+    uint64_t words = 1 + (argc + 1) + (envc + 1) + 2 * naux;
     if (words & 1) push_u64(&u, 0);
     for (uint64_t i = naux; i-- > 0;) {
         push_u64(&u, aux[i][1]);
         push_u64(&u, aux[i][0]);
     }
-    push_u64(&u, 0);            /* envp terminator */
-    push_u64(&u, 0);            /* argv terminator */
-    push_u64(&u, name_ptr);     /* argv[0] */
-    push_u64(&u, 1);            /* argc */
+    push_u64(&u, 0);
+    for (uint32_t i = envc; i-- > 0;) push_u64(&u, envq[i]);
+    push_u64(&u, 0);
+    for (uint32_t i = argc; i-- > 0;) push_u64(&u, argp[i]);
+    push_u64(&u, argc);
     p->context.rsp = u.sp;
     return u.ok;
 }
 
-static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux_abi) {
+#define PT_INTERP    3
+#define ET_DYN       3
+#define PIE_BASE     0x555555554000ULL   /* where Linux puts a PIE (no ASLR) */
+
+static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux_abi,
+                     const proc_args_t* args) {
     const elf64_ehdr_t* eh = (const elf64_ehdr_t*)img;
     if (size < sizeof(*eh) || eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
         eh->ident[2] != 'L' || eh->ident[3] != 'F' || eh->ident[4] != 2 ||
@@ -256,15 +333,29 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
     }
     vm_space_t* s = p->address_space;
     uint64_t phdr_va = 0;
+    /* A static PIE is loaded at a fixed base; a program that needs a dynamic
+     * loader is not supported yet (#254). */
+    uint64_t base = eh->type == ET_DYN ? PIE_BASE : 0;
+    for (uint16_t i = 0; i < eh->phnum; i++) {
+        const elf64_phdr_t* ph = (const elf64_phdr_t*)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+        if (ph->type == PT_INTERP) {
+            kprintf("load: %s is dynamically linked; not supported yet\n", p->name);
+            return false;
+        }
+    }
     for (uint16_t i = 0; i < eh->phnum; i++) {
         const elf64_phdr_t* ph = (const elf64_phdr_t*)(img + eh->phoff + (uint64_t)i * eh->phentsize);
         if (ph->type != PT_LOAD || ph->memsz == 0) continue;
         if (eh->phoff >= ph->offset && eh->phoff < ph->offset + ph->filesz) {
-            phdr_va = ph->vaddr + (eh->phoff - ph->offset);
+            phdr_va = base + ph->vaddr + (eh->phoff - ph->offset);
         }
-        if (ph->vaddr < LP_USER_BASE || ph->offset + ph->filesz > size) return false;
-        uint64_t start = ph->vaddr & ~0xFFFULL;
-        uint64_t end = PAGE_ALIGN(ph->vaddr + ph->memsz);
+        uint64_t vaddr = base + ph->vaddr;
+        if (vaddr < LP_USER_BASE || vaddr + ph->memsz > LP_USER_END ||
+            ph->offset + ph->filesz > size) {
+            return false;
+        }
+        uint64_t start = vaddr & ~0xFFFULL;
+        uint64_t end = PAGE_ALIGN(vaddr + ph->memsz);
         bool writable = (ph->flags & PF_W) != 0;
         uint32_t rflags = VMM_FLAG_READ | VMM_FLAG_USER |
                           (writable ? VMM_FLAG_WRITE : 0) | ((ph->flags & PF_X) ? VMM_FLAG_EXEC : 0);
@@ -279,7 +370,7 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
         }
         /* Copy the file bytes through the physical mapping. */
         for (uint64_t off = 0; off < ph->filesz; ) {
-            uint64_t va = ph->vaddr + off;
+            uint64_t va = vaddr + off;
             uint64_t chunk = PAGE_SIZE - (va & 0xFFF);
             if (chunk > ph->filesz - off) chunk = ph->filesz - off;
             memcpy(P2V(vmm_get_physical_addr(s, va)), img + ph->offset + off, chunk);
@@ -299,32 +390,46 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
     }
 
     memset(&p->context, 0, sizeof(p->context));
-    p->context.rip = eh->entry;
+    p->context.rip = base + eh->entry;
     p->context.rsp = LP_STACK_TOP - 8;     /* as if _start had been called */
     p->context.rflags = RFLAGS_IF | 0x2;
     p->context.cs = SEL_UCODE;
     p->context.ss = SEL_UDATA;
     p->context.ds = p->context.es = SEL_UDATA;
-    p->entry_point = eh->entry;
+    p->entry_point = base + eh->entry;
     p->stack_start = stack_lo;
     p->stack_end = LP_STACK_TOP;
-    if (linux_abi) return linux_initial_stack(p, eh, phdr_va, LP_STACK_TOP);
+    if (linux_abi) return linux_initial_stack(p, eh, phdr_va, base, LP_STACK_TOP, args);
     return true;
 }
 
-process_t* proc_spawn(const lp_image_t* image) {
-    process_t* p = proc_alloc(g_next_pid, image->name);
+process_t* proc_spawn_args(const lp_image_t* image, uint32_t argc, const char* const* argv,
+                           uint32_t envc, const char* const* envp) {
+    process_t* p = proc_alloc(g_next_pid, basename_of(image->name));
     if (!p) return 0;
-    if (!load_elf(p, image->start, (uint64_t)(image->end - image->start), image->linux_abi)) {
+    proc_args_t args = { argc, argv, envc, envp };
+    if (!load_elf(p, image->start, (uint64_t)(image->end - image->start), image->linux_abi,
+                  &args)) {
         vmm_destroy_address_space(p->address_space);
         kfree(p->arch_block);
         kfree(p);
         return 0;
     }
+    /* What it runs (#240): the debuggers need the binary, and a recording
+     * resumed with a different one is refused. */
+    for (uint32_t i = 0; image->name[i] && i < sizeof(p->exe_path) - 1; i++) {
+        p->exe_path[i] = image->name[i];
+    }
+    p->exe_crc = proc_image_crc(image);
     g_next_pid++;
     p->state = PROCESS_STATE_READY;
     proc_append(p);
     return p;
+}
+
+process_t* proc_spawn(const lp_image_t* image) {
+    const char* argv[1] = { image->name };
+    return proc_spawn_args(image, 1, argv, 0, 0);
 }
 
 /* ---- Context <-> frame ---- */

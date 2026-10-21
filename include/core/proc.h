@@ -38,9 +38,16 @@ typedef struct {
 const lp_image_t* proc_find_image(const char* name);
 const lp_image_t* proc_images(uint32_t* count);
 
-/* Create a process from an embedded image, append it to the table (READY).
- * Returns NULL on a bad image or out of memory. */
+/* Create a process from an image, append it to the table (READY). Returns
+ * NULL on a bad image or out of memory. A Linux image gets argv and envp on
+ * its initial stack (#240); proc_spawn passes argv = { name }. */
 process_t* proc_spawn(const lp_image_t* image);
+process_t* proc_spawn_args(const lp_image_t* image, uint32_t argc, const char* const* argv,
+                           uint32_t envc, const char* const* envp);
+
+/* Programs passed as Multiboot modules (QEMU -initrd "path args,..."). */
+void     proc_register_modules(const uint32_t* mbi);
+uint32_t proc_image_crc(const lp_image_t* image);
 
 /* Remove a process from the table and free it (address space included). */
 void proc_destroy(process_t* p);
