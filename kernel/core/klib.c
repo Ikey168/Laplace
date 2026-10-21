@@ -5,18 +5,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* String instructions: fast on current CPUs (ERMSB) and under QEMU's TCG,
+ * which runs them natively rather than byte by byte. */
 void* memcpy(void* dst, const void* src, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    while (n--) *d++ = *s++;
+    void* d = dst;
+    __asm__ volatile("rep movsb" : "+D"(d), "+S"(src), "+c"(n) : : "memory");
     return dst;
 }
 
 void* memmove(void* dst, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
-    if (d < s) {
-        while (n--) *d++ = *s++;
+    if (d < s || d >= s + n) {
+        return memcpy(dst, src, n);
     } else if (d > s) {
         d += n;
         s += n;
@@ -26,8 +27,8 @@ void* memmove(void* dst, const void* src, size_t n) {
 }
 
 void* memset(void* dst, int c, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    while (n--) *d++ = (uint8_t)c;
+    void* d = dst;
+    __asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
     return dst;
 }
 

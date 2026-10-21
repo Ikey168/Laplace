@@ -9,6 +9,7 @@
 #include "core/console.h"
 #include "divergence.h"
 #include "divergence_scan.h"
+#include "core/kio.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -237,6 +238,7 @@ const char* kstate_component_name(uint32_t component) {
     case KDIVERGE_SCHEDULER:  return "scheduler";
     case KDIVERGE_USER_PAGES: return "user pages";
     case KDIVERGE_CONTEXTS:   return "registers";
+    case KDIVERGE_INPUTS:     return "inputs";
     default: break;
     }
     for (uint32_t i = 0; i < g_reg.count; i++) {

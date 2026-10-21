@@ -25,6 +25,7 @@
 #include "core/timetravel.h"
 #include "core/kstate.h"
 #include "core/files.h"
+#include "core/kio.h"
 #include "core/kfpages.h"
 #include "core/monitor.h"
 #include "core/clock.h"
@@ -221,6 +222,8 @@ static bool selftest(void) {
             w.oldest, w.newest, w.count, w.end_step, s->keyframes_taken, s->cow_captures,
             s->journals_written);
     const kfp_stats_t* ps = kfp_stats();
+    kprintf("selftest: inputs: %lu records, %lu payload bytes journaled\n", kio_stats()->records,
+            kio_stats()->bytes);
     kprintf("selftest: keyframe pages: %lu written, %lu kept their slot; the newest keyframe has "
             "%lu pages and wrote %lu; pool %u of %u slots in use\n", ps->pages_written,
             ps->pages_reused, ps->last_pages, ps->last_written, ps->slots_used, ps->slots_total);
@@ -288,6 +291,20 @@ static bool selftest(void) {
             bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
             bad.first_component, who);
     ok = ok && bad.diverged && strcmp(who, "fs") == 0;
+    /* ... and a replay whose input call is not the recorded one (#242),
+     * caught at that call's step. */
+    kio_perturb_record_next(true);
+    rc = tt_verify(&bad);
+    who = bad.diverged ? kstate_component_name(bad.first_component) : "-";
+    if (!kio_perturb_record_applied()) {
+        kprintf("selftest: input record with other arguments: the oldest epoch has no input "
+                "records (skipped)\n");
+    } else {
+        kprintf("selftest: input record with other arguments: %s (epoch %lu component %u: %s, "
+                "step %lu)\n", bad.diverged ? "divergence detected" : "NOT detected",
+                bad.first_epoch, bad.first_component, who, bad.diag_step_lo);
+        ok = ok && bad.diverged && strcmp(who, "inputs") == 0;
+    }
     tt_verify(&v);   /* back to the end of the recording, clean */
     kprintf("selftest: restored pages: %lu frames kept, %lu from the cache, %lu read from the pool\n",
             kfp_stats()->restore_kept, kfp_stats()->restore_cached, kfp_stats()->restore_read);
@@ -417,6 +434,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     kentropy_set_source(entropy_source, 0);
     machine_init();
     kstate_init();
+    kio_init();
     const lp_image_t* seed = proc_seed_module(g_opts.root);
     files_init(seed ? seed->start : 0, seed ? (uint64_t)(seed->end - seed->start) : 0,
                seed ? seed->name : "");

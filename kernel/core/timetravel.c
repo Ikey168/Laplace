@@ -24,6 +24,7 @@
 #include "core/vm.h"
 #include "core/kstate.h"
 #include "core/kfpages.h"
+#include "core/kio.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -49,7 +50,8 @@ void* memcpy(void* dst, const void* src, size_t n);
 #define KF_INDEX_SECTORS  4
 #define KF_SLOT_MIN       512    /* per keyframe region (x2, double-buffered) */
 #define KF_SLOT_MAX       4096
-#define J_SLOT_SECTORS    640    /* per journal slot: up to 10224 events */
+#define J_SLOT_MIN        640    /* per journal slot: 10224 events ... */
+#define J_SLOT_MAX        2560   /* ... to 40944 */
 #define POOL_MIN_SLOTS    1024
 #define KFP_TAG           0x4D50u   /* "PM": the page manifest blob */
 
@@ -68,14 +70,15 @@ typedef struct {
 
 typedef struct {
     uint32_t slot;          /* keyframe region sectors */
+    uint32_t jslot;         /* journal slot sectors */
     uint32_t j_base;
     uint32_t pool_base;
     uint32_t pool_slots;
 } geom_t;
 
-static uint32_t meta_sectors(uint32_t keyframes, uint32_t slot) {
+static uint32_t meta_sectors(uint32_t keyframes, uint32_t slot, uint32_t jslot) {
     return KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, slot)
-         + journal_ring_total_sectors(keyframes, J_SLOT_SECTORS);
+         + journal_ring_total_sectors(keyframes, jslot);
 }
 
 static bool geometry(uint32_t total, uint32_t keyframes, geom_t* g) {
@@ -83,9 +86,14 @@ static bool geometry(uint32_t total, uint32_t keyframes, geom_t* g) {
     if (slot < KF_SLOT_MIN) slot = KF_SLOT_MIN;
     if (slot > KF_SLOT_MAX) slot = KF_SLOT_MAX;
     slot &= ~7u;
-    uint32_t base = (meta_sectors(keyframes, slot) + 7) & ~7u;
+    uint32_t jslot = total / (keyframes * 128);
+    if (jslot < J_SLOT_MIN) jslot = J_SLOT_MIN;
+    if (jslot > J_SLOT_MAX) jslot = J_SLOT_MAX;
+    jslot &= ~7u;
+    uint32_t base = (meta_sectors(keyframes, slot, jslot) + 7) & ~7u;
     if (base > total || (total - base) / 8 < POOL_MIN_SLOTS) return false;
     g->slot = slot;
+    g->jslot = jslot;
     g->j_base = KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, slot);
     g->pool_base = base;
     g->pool_slots = (total - base) / 8;
@@ -186,7 +194,8 @@ fat_block_device_t* tt_ram_device(uint32_t sectors) {
 
 uint32_t tt_required_sectors(uint32_t keyframes, uint32_t pool_mib) {
     /* Enough for the largest keyframe regions plus the pool asked for. */
-    uint64_t n = ((meta_sectors(keyframes, KF_SLOT_MAX) + 7) & ~7u) + (uint64_t)pool_mib * 2048;
+    uint64_t n = ((meta_sectors(keyframes, KF_SLOT_MAX, J_SLOT_MAX) + 7) & ~7u) +
+                 (uint64_t)pool_mib * 2048;
     return n > 0xFFFFFFF8u ? 0xFFFFFFF8u : (uint32_t)n;
 }
 
@@ -216,7 +225,7 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
     want.version = LABEL_VERSION;
     want.capacity = capacity;
     want.kf_slot_sectors = g.slot;
-    want.j_slot_sectors = J_SLOT_SECTORS;
+    want.j_slot_sectors = g.jslot;
     want.kf_base = KF_BASE;
     want.j_base = g.j_base;
     want.pool_base = g.pool_base;
@@ -247,7 +256,7 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
         kprintf("timetravel: keyframe store failed\n");
         return -1;
     }
-    if (journal_capture_init(dev, want.j_base, J_SLOT_SECTORS, capacity, !reuse) != JOURNAL_OK) {
+    if (journal_capture_init(dev, want.j_base, g.jslot, capacity, !reuse) != JOURNAL_OK) {
         kprintf("timetravel: journal ring failed\n");
         return -1;
     }
@@ -256,6 +265,9 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
         return -1;
     }
     checkpoint_set_mark_fn(kfp_mark_space);
+    /* The extended journal (inputs, traces) gets what the slot holds beyond
+     * room for the preemption points and checksums. */
+    kj_set_limit((g.jslot - 1) * 16 - 4096);
     if (!reuse) {
         memset(sector, 0, sizeof(sector));
         memcpy(sector, &want, sizeof(want));
@@ -279,14 +291,15 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
             uint8_t* blob = load_blob(e, KFP_TAG, &len);
             if (!blob || kfp_adopt(e, blob, len) != 0) all = false;
             if (blob) kfree(blob);
+            kio_adopt_journal(e);         /* its input payload pages (#242) */
         }
         if (!all) kprintf("timetravel: a retained keyframe's page manifest is unreadable\n");
         *had_keyframe = all;
     }
-    kprintf("timetravel: store %s: %u keyframes x %u sectors, journal ring at %u, "
-            "page pool of %u slots (%u MiB) at %u\n",
-            reuse ? "reused" : "formatted", capacity, 1 + 2 * g.slot, want.j_base, g.pool_slots,
-            g.pool_slots / 256, g.pool_base);
+    kprintf("timetravel: store %s: %u keyframes x %u sectors, journal ring at %u (%u-sector "
+            "slots), page pool of %u slots (%u MiB) at %u\n",
+            reuse ? "reused" : "formatted", capacity, 1 + 2 * g.slot, want.j_base, g.jslot,
+            g.pool_slots, g.pool_slots / 256, g.pool_base);
     return 0;
 }
 
@@ -303,13 +316,13 @@ static void capture_kstate(uint64_t epoch) {
 
 /* ---- Recording ---- */
 
+#define KIO_EPOCH_BUDGET (256ULL << 20)   /* input payload bytes per epoch */
+
 static bool record_pressure(void) {
     const uint64_t* p64;
-    const uint8_t* p8;
-    if (ktime_values(&p64) >= KTIME_LOG_MAX * 3 / 4) return true;
-    if (kentropy_bytes(&p8) >= KENTROPY_LOG_MAX * 3 / 4) return true;
     if (sched_record_points(machine_sched_record(), &p64) >= 3072) return true;
-    if (kj_count() >= KJ_MAX_EVENTS * 3 / 4) return true;
+    if (kj_count() >= kj_limit() * 3 / 4) return true;
+    if (kio_epoch_bytes() >= KIO_EPOCH_BUDGET) return true;
     return false;
 }
 
@@ -327,6 +340,7 @@ static void do_writeback(void) {
 }
 
 static void close_epoch(uint64_t epoch, uint64_t steps) {
+    kio_close_epoch(epoch);       /* the inputs' last page, and who owns the pages */
     int rc = journal_capture_close_epoch(epoch, steps);
     if (rc != JOURNAL_OK) panic("timetravel: journal for epoch %lu failed (%d)", epoch, rc);
     len_cache_put(epoch, steps);
@@ -350,6 +364,7 @@ static void take_keyframe(void) {
     ktime_begin_epoch(e);
     kentropy_begin_epoch(e);
     kj_begin_epoch(e);
+    kio_begin_epoch(e);
 
     g_wb_pending = true;
     g_wb_tick = g_ticks;
@@ -592,6 +607,7 @@ int tt_resume_live(void) {
      * consumed; switching to RECORD appends the continuation after it. */
     checkpoint_set_epoch(g_end_epoch);
     machine_set_mode(MACHINE_LIVE);
+    kio_continue();
     g_sealed = false;
     return TT_OK;
 }
@@ -637,10 +653,14 @@ typedef struct {
 static void leak_visit(void* c, process_t* p, uint64_t rip) {
     leak_scan_t* ls = (leak_scan_t*)c;
     if (ls->out->leak_found) return;
-    if (ls->budget == 0) return;
+    if (ls->budget == 0) {
+        machine_stop_counting();   /* the window is too long to search: run the rest */
+        return;
+    }
     ls->budget--;
     const char* what = leak_at(p, rip);
     if (!what) return;
+    machine_stop_counting();
     ls->out->leak_found = true;
     ls->out->leak_what = what;
     ls->out->leak_pid = (uint32_t)p->pid;
@@ -683,7 +703,26 @@ int tt_verify(tt_verify_t* out) {
             if (replay_recorded_sums(epoch, ids, sums, DIVERGE_MAX_COMPONENTS, &n) != 0 || n == 0) {
                 return TT_ERR_JOURNAL;
             }
+            kio_clear_mismatch();
             int rc = tt_goto(epoch, len, 0);
+            const kio_mismatch_t* mis = kio_mismatch();
+            if (rc != TT_OK && mis->valid) {
+                /* The replay made an input call the recording does not have
+                 * (#242): diverged at that step, in the inputs. */
+                out->epochs_checked++;
+                out->epochs_diverged++;
+                if (!out->diverged) {
+                    out->diverged = true;
+                    out->first_epoch = epoch;
+                    out->first_component = KDIVERGE_INPUTS;
+                    out->expected = mis->exhausted ? 0 : (mis->rec_kind << 16) | mis->rec_nr;
+                    out->actual = (mis->kind << 16) | mis->nr;
+                    out->diag_step_lo = mis->step;
+                    out->diag_step_hi = mis->step;
+                }
+                kio_clear_mismatch();
+                goto next_epoch;
+            }
             if (rc != TT_OK) return rc;
             kdiverge_reset();
             kdiverge_set_mode(DIVERGE_REPLAY);
@@ -704,6 +743,7 @@ int tt_verify(tt_verify_t* out) {
                 }
             }
         }
+    next_epoch:
         if (epoch == w.newest) break;
         /* Next retained keyframe after `epoch`. */
         uint64_t next = w.newest;
@@ -746,6 +786,7 @@ int tt_resume_from_store(void) {
     ktime_begin_epoch(w.newest);
     kentropy_begin_epoch(w.newest);
     kj_begin_epoch(w.newest);
+    kio_begin_epoch(w.newest);
     g_ticks_since_kf = 0;
     g_sealed = false;
     return TT_OK;

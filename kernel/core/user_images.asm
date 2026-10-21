@@ -23,5 +23,6 @@ USER_IMAGE musl_sysprobe
 USER_IMAGE musl_vmprobe
 USER_IMAGE musl_bigmem
 USER_IMAGE musl_fileprobe
+USER_IMAGE musl_inputprobe
 
 section .note.GNU-stack noalloc noexec nowrite progbits

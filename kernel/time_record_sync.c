@@ -11,6 +11,7 @@
  */
 
 #include "time_record.h"
+#include "core/kio.h"
 
 /* Read the x86 timestamp counter. */
 static uint64_t ktime_rdtsc(void* ctx) {
@@ -28,8 +29,12 @@ void ktime_init(void) {
                      g_ktime_log, KTIME_LOG_MAX);
 }
 
+/* Clock reads are inputs like any other: the generic journal records them
+ * (#242). The time_record module stays for its host tests and the OFF mode. */
+static uint64_t live_rdtsc(void) { return ktime_rdtsc(0); }
+
 uint64_t ktime_read(void) {
-    return time_record_read(&g_ktime);
+    return kio_time(live_rdtsc);
 }
 
 void ktime_set_mode(time_rec_mode_t mode) {

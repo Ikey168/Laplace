@@ -119,6 +119,15 @@ const machine_stop_t* machine_last_stop(void) { return &g_stop; }
 bool machine_started(void) { return g_started; }
 sched_record_t* machine_sched_record(void) { return &g_sr; }
 bool machine_quiet(void) { return g_mode == MACHINE_REPLAY; }
+
+uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len) {
+    if (machine_quiet()) return len;          /* the recording already did it */
+    switch (device) {
+    case MACHINE_DEV_CONSOLE: console_write((const char*)buf, (uint32_t)len); break;
+    default: break;
+    }
+    return len;
+}
 void machine_request_stop(void) { g_stop_request = true; }
 
 void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step) {
@@ -130,6 +139,12 @@ void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step) {
 void machine_clear_target(void) { g_has_target = false; }
 
 void machine_set_count_insns(bool on) { g_count_insns = on; g_counted = 0; }
+
+static bool want_stepping(void);
+void machine_stop_counting(void) {
+    g_count_insns = false;
+    if (!want_stepping()) g_stepping = false;   /* the next #DB does not re-arm TF */
+}
 void machine_set_hit_hook(machine_hit_hook_fn fn, void* ctx) {
     g_hit_hook = fn;
     g_hit_hook_ctx = ctx;
@@ -265,6 +280,12 @@ static void enter(void) {
 
 /* ---- Handling an entry ---- */
 
+void machine_stop_diverged(void) {
+    stop_here(STOP_DIVERGED, 0);
+    machine_exit();
+    for (;;) {}
+}
+
 void machine_terminate(process_t* p, int code) {
     (void)code;
     tt_before_process_exit(p);
@@ -296,7 +317,7 @@ static int64_t sys_write(process_t* p, uint64_t buf, uint64_t len) {
     while (done < len) {
         uint64_t n = len - done < sizeof(tmp) ? len - done : sizeof(tmp);
         if (!uaccess_read(p->address_space, buf + done, tmp, n)) return done ? (int64_t)done : -1;
-        if (!machine_quiet()) console_write(tmp, (uint32_t)n);
+        machine_device_write(MACHINE_DEV_CONSOLE, tmp, n);
         done += n;
     }
     return (int64_t)done;

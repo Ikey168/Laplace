@@ -24,7 +24,11 @@
 #define KJ_EV_TRACE      (JOURNAL_EV_EXTENDED_BASE + 0)
 #define KJ_TRACE_EVERY   16
 
-#define KJ_MAX_EVENTS    8192
+#define KJ_MAX_EVENTS    32768
+
+/* The events an epoch may hold: set from the journal slot size (#242). */
+void     kj_set_limit(uint32_t n);
+uint32_t kj_limit(void);
 
 /* Recording: start epoch `epoch` with an empty buffer. */
 void     kj_begin_epoch(uint64_t epoch);

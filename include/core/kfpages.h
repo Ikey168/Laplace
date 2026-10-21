@@ -87,6 +87,16 @@ typedef struct {
 } kfp_provider_t;
 void kfp_set_provider(const kfp_provider_t* p);
 
+/* Input payload pages (#242): pool slots the epoch's journal names. A slot is
+ * allocated while recording, then owned by the epoch's keyframe and freed
+ * with it; at boot, the retained journals adopt theirs. */
+uint32_t kfp_payload_alloc(void);                 /* 0xFFFFFFFF when the pool is full */
+int      kfp_payload_write(uint32_t id, const void* page);
+int      kfp_payload_read(uint32_t id, void* page);
+void     kfp_payload_own(uint64_t epoch, const uint32_t* ids, uint32_t n);
+void     kfp_payload_adopt(uint64_t epoch, const uint32_t* ids, uint32_t n);
+void     kfp_payload_free(const uint32_t* ids, uint32_t n);   /* never journaled */
+
 /* Mark function for checkpoint_take. */
 int kfp_mark_space(vm_space_t* space, uint64_t epoch);
 

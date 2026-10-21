@@ -11,14 +11,11 @@ void  kfree(void* p);
 #define PAGE 4096ULL
 
 static void zero(void* p, uint64_t n) {
-    uint8_t* b = (uint8_t*)p;
-    for (uint64_t i = 0; i < n; i++) b[i] = 0;
+    __builtin_memset(p, 0, n);
 }
 
 static void copy(void* dst, const void* src, uint64_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+    __builtin_memcpy(dst, src, n);
 }
 
 static bool name_eq(const char* a, uint32_t alen, const char* b, uint32_t blen) {

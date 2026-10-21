@@ -105,6 +105,24 @@ copied into pages at its first change. File times follow the last wall-clock
 time a program read through a journaled call, so they replay too. Programs
 can also be started from the image (`run=/bin/lua`).
 
+**Inputs** (#242, `include/iorec.h`, `include/core/kio.h`). Everything that
+enters the machine from outside is one kind of record: (step, kind, call
+number, argument digest, return value, payload). Clock reads (`ktime_read`)
+and entropy (`kentropy_fill`) go through it now, and console and network
+input will. While recording, the live source runs and its result is
+appended; payload bytes go into one byte stream per epoch whose pages are
+written to the page pool as they fill (owned by the epoch's keyframe and
+freed with it), so a large input costs pool pages and a few journal events
+(two per record, one per run of pages), not a fixed-size journal stream. While
+replaying, the source never runs: the call must be the one recorded at this
+step with the same kind, call number, and argument digest, and it gets the
+recorded result and payload. A call that does not match stops the replay at
+that step, and `verify` reports the epoch as diverged in the `inputs`
+component (15): the leak is caught at its first visible effect. Journal slots
+are sized from the disk (640 to 2560 sectors) and the label records the size.
+Programs reach devices only through `machine_device_write`, which does
+nothing while replaying, so a replay never repeats an external side effect.
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the

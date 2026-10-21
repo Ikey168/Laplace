@@ -43,7 +43,8 @@ typedef enum {
     STOP_BREAKPOINT,    /* a hardware breakpoint or watchpoint hit (#228) */
     STOP_END,           /* replay reached the end of the recording */
     STOP_IDLE,          /* nothing left to run */
-    STOP_ERROR          /* replay could not continue */
+    STOP_ERROR,         /* replay could not continue */
+    STOP_DIVERGED       /* replay: an input call is not the recorded one (#242) */
 } stop_reason_t;
 
 typedef struct {
@@ -81,6 +82,9 @@ uint64_t   machine_insn(void);         /* instructions past the entry (#228) */
 bool       machine_at_entry(void);     /* stopped at an entry, not inside a segment */
 void       machine_set_position(uint64_t epoch, uint64_t step);
 const pending_entry_t* machine_pending(void);
+/* Stop a replay whose program made an input call the recording does not
+ * have at this step (#242). Does not return. */
+void machine_stop_diverged(void);
 void       machine_set_pending(const pending_entry_t* e);
 const machine_stop_t*  machine_last_stop(void);
 bool       machine_started(void);     /* the first entry has happened */
@@ -136,6 +140,9 @@ void machine_set_hit_hook(machine_hit_hook_fn fn, void* ctx);
 
 /* Instruction counting for the current segment during replay (#228). */
 void     machine_set_count_insns(bool on);
+/* From the instruction hook: stop counting, and single-stepping unless a
+ * replay target needs it. */
+void     machine_stop_counting(void);
 uint64_t machine_counted_insns(void);
 
 /* #241: the entry pending now is a real fault (not an emulated RDTSC, RDTSCP,
@@ -158,6 +165,12 @@ void machine_fpu_forget(process_t* p);
 
 /* Console output from user processes is suppressed while replaying. */
 bool machine_quiet(void);
+
+/* Programs reach devices outside the machine (the console now, the network
+ * later) only through here. While replaying, nothing goes out: a replay never
+ * repeats an external side effect (#242). Returns the bytes accepted. */
+uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len);
+#define MACHINE_DEV_CONSOLE 0
 
 /* Give the CPU to the next ready process (a yield). */
 void machine_yield(process_t* p);

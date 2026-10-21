@@ -20,6 +20,8 @@ typedef struct {
     bool          used;
     bool          committed;
     ps_manifest_t m;
+    uint32_t*     pay;           /* the epoch's input payload slots (#242) */
+    uint32_t      npay, paycap;
 } mf_slot_t;
 
 static mf_slot_t           g_mf[MAX_MF];
@@ -75,6 +77,7 @@ static uint32_t pow2_at_least(uint64_t n) {
 int kfp_init(fat_block_device_t* dev, uint32_t base, uint32_t nslots) {
     for (int i = 0; i < MAX_MF; i++) {
         if (g_mf[i].m.runs) kfree(g_mf[i].m.runs);
+        if (g_mf[i].pay) kfree(g_mf[i].pay);
         memset(&g_mf[i], 0, sizeof(g_mf[i]));
     }
     g_ref = g_open = -1;
@@ -128,6 +131,8 @@ int kfp_adopt(uint64_t epoch, const uint8_t* blob, uint32_t len) {
 
 static void drop_mf(int i) {
     ps_mf_release(&g_mf[i].m, &g_pool);
+    for (uint32_t k = 0; k < g_mf[i].npay; k++) ps_unref(&g_pool, g_mf[i].pay[k]);
+    g_mf[i].npay = 0;
     g_mf[i].used = false;
     g_mf[i].committed = false;
     if (g_ref == i) g_ref = -1;
@@ -145,6 +150,50 @@ static void write_slot(uint32_t id, const void* data) {
 static bool read_slot(uint32_t id, void* data) {
     return g_dev->read_sectors(g_dev->private_data, g_base + id * 8, 8, data) == 0;
 }
+
+/* ---- Input payloads (#242) ---- */
+
+uint32_t kfp_payload_alloc(void) { return ps_alloc(&g_pool); }
+
+int kfp_payload_write(uint32_t id, const void* page) {
+    write_slot(id, page);
+    return 0;
+}
+
+int kfp_payload_read(uint32_t id, void* page) { return read_slot(id, page) ? 0 : -1; }
+
+static void own(uint64_t epoch, const uint32_t* ids, uint32_t n, bool ref) {
+    int i = find_mf(epoch);
+    if (i < 0) {
+        /* The keyframe is gone: nothing will name these slots. */
+        for (uint32_t k = 0; !ref && k < n; k++) ps_unref(&g_pool, ids[k]);
+        return;
+    }
+    mf_slot_t* m = &g_mf[i];
+    if (m->npay + n > m->paycap) {
+        uint32_t cap = m->paycap ? m->paycap : 64;
+        while (cap < m->npay + n) cap *= 2;
+        uint32_t* a = (uint32_t*)kmalloc((uint64_t)cap * sizeof(uint32_t));
+        if (!a) panic("timetravel: out of memory listing input pages");
+        if (m->pay) {
+            memcpy(a, m->pay, (uint64_t)m->npay * sizeof(uint32_t));
+            kfree(m->pay);
+        }
+        m->pay = a;
+        m->paycap = cap;
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        if (ref) ps_ref(&g_pool, ids[k]);
+        m->pay[m->npay++] = ids[k];
+    }
+}
+
+void kfp_payload_own(uint64_t epoch, const uint32_t* ids, uint32_t n) { own(epoch, ids, n, false); }
+
+void kfp_payload_free(const uint32_t* ids, uint32_t n) {
+    for (uint32_t k = 0; k < n; k++) ps_unref(&g_pool, ids[k]);
+}
+void kfp_payload_adopt(uint64_t epoch, const uint32_t* ids, uint32_t n) { own(epoch, ids, n, true); }
 
 /* ---- Taking a keyframe ---- */
 

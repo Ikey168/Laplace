@@ -118,8 +118,8 @@ static int64_t sys_time(process_t* p, uint64_t tloc) {
 }
 
 static int64_t sys_getrandom(process_t* p, uint64_t buf, uint64_t len) {
-    uint8_t tmp[256];
-    /* Short reads are allowed; keep each call within the entropy journal. */
+    static uint8_t tmp[65536];
+    /* Short reads are allowed: one journaled input of up to 64 KiB (#242). */
     if (len > sizeof(tmp)) len = sizeof(tmp);
     if (kentropy_fill(tmp, (uint32_t)len) != ENTROPY_REC_OK) return err(LX_EAGAIN);
     return put_user(p, buf, tmp, len) ? (int64_t)len : err(LX_EFAULT);

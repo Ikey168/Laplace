@@ -40,6 +40,10 @@ void monitor_live_stopped(void) {
         ksnprintf(g_stop_text, sizeof(g_stop_text), "exit: pid %u is the last process and is exiting",
                   st->pid);
         break;
+    case STOP_DIVERGED:
+        ksnprintf(g_stop_text, sizeof(g_stop_text), "diverged: pid %u made an input call the "
+                  "recording does not have", st->pid);
+        break;
     case STOP_REQUEST:
         ksnprintf(g_stop_text, sizeof(g_stop_text), "interrupt: a debugger asked to stop");
         sig = 2;

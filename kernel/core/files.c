@@ -225,7 +225,7 @@ static int64_t write_console(process_t* p, uint64_t buf, uint64_t len) {
         if (!uaccess_read(p->address_space, buf + done, tmp, n)) {
             return done ? (int64_t)done : err(LX_EFAULT);
         }
-        if (!machine_quiet()) console_write(tmp, (uint32_t)n);
+        machine_device_write(MACHINE_DEV_CONSOLE, tmp, n);
         done += n;
     }
     return (int64_t)done;
@@ -239,18 +239,22 @@ static int64_t do_read(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, int
     case OF_CONSOLE:
     case OF_NULL:
         return 0;                                 /* console input: #249 */
-    case OF_ZERO:
-    case OF_RANDOM: {
+    case OF_ZERO: {
         uint64_t done = 0;
-        if (o->kind == OF_RANDOM && len > 256) len = 256;   /* keep within the entropy journal */
+        memset(tmp, 0, sizeof(tmp));
         while (done < len) {
             uint64_t n = len - done < sizeof(tmp) ? len - done : sizeof(tmp);
-            if (o->kind == OF_ZERO) memset(tmp, 0, n);
-            else if (kentropy_fill(tmp, (uint32_t)n) != ENTROPY_REC_OK) return done ? (int64_t)done : err(LX_EAGAIN);
             if (!uaccess_write(p->address_space, buf + done, tmp, n)) return done ? (int64_t)done : err(LX_EFAULT);
             done += n;
         }
         return (int64_t)done;
+    }
+    case OF_RANDOM: {
+        /* Journaled entropy (#242): one input record per read, up to 64 KiB. */
+        static uint8_t rnd[65536];
+        if (len > sizeof(rnd)) len = sizeof(rnd);
+        if (kentropy_fill(rnd, (uint32_t)len) != ENTROPY_REC_OK) return err(LX_EAGAIN);
+        return uaccess_write(p->address_space, buf, rnd, len) ? (int64_t)len : err(LX_EFAULT);
     }
     case OF_DIR:
         return err(LX_EISDIR);

@@ -14,6 +14,7 @@
  */
 
 #include "entropy_record.h"
+#include "core/kio.h"
 
 static uint8_t        g_kentropy_log[KENTROPY_LOG_MAX];
 static entropy_record_t g_kentropy;
@@ -30,8 +31,19 @@ void kentropy_set_source(entropy_source_fn source, void* ctx) {
     g_kentropy.ctx = ctx;
 }
 
+/* Entropy is an input like any other: the generic journal records it
+ * (#242). The entropy_record module stays for its host tests. */
+static int live_fill(void* ctx, void* out, uint32_t len) {
+    (void)ctx;
+    if (!g_kentropy.source) {
+        for (uint32_t i = 0; i < len; i++) ((uint8_t*)out)[i] = 0;
+        return 0;
+    }
+    return g_kentropy.source(g_kentropy.ctx, out, len) == 0 ? 0 : ENTROPY_REC_ERR_SOURCE;
+}
+
 int kentropy_fill(void* out, uint32_t len) {
-    return entropy_record_fill(&g_kentropy, out, len);
+    return kio_entropy(out, len, live_fill, 0);
 }
 
 void kentropy_set_mode(entropy_rec_mode_t mode) {
