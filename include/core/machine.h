@@ -1,15 +1,16 @@
 /* Laplace core: the recorded machine's execution engine (#220, #222, #225).
  *
  * Steps. Every kernel entry a user process makes (a system call, or a fault)
- * is one step. A position (epoch, step) is the machine state at the moment the
+ * is one step, and so is a preemption point (#245, include/core/preempt.h). A position (epoch, step) is the machine state at the moment the
  * step-th entry of that epoch has trapped into the kernel and has not been
  * handled yet. Keyframes are taken at entries, so a keyframe is exactly
  * (epoch, 0).
  *
- * Determinism. Timer interrupts never change user-visible state: they only
- * mark the time slice expired. Context switches happen only at entries, through
+ * Determinism. Context switches happen only at entries, through
  * sched_record_decide(), which records the step of every preemption on a live
- * run and forces the same switches on replay. The clock and entropy system calls
+ * run and forces the same switches on replay. A timer interrupt in user mode
+ * either only marks the time slice expired, or becomes an entry whose state
+ * the journal records, so a replay turns the same point into the same entry. The clock and entropy system calls
  * go through ktime_read() and kentropy_fill(). Everything else a process can
  * observe is a pure function of its memory and registers, so replaying the
  * journal from a keyframe re-executes the run exactly.
@@ -107,6 +108,11 @@ void machine_resume(void);
  * the replay: reaching it without hitting the target stops with STOP_END. */
 void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step);
 void machine_clear_target(void);
+
+/* Verify (#245): a preemption point a replay cannot find is noted (as an
+ * input mismatch) and taken just before the entry that arrived instead, so
+ * the epoch still runs to its end. Off: the replay stops there. */
+void machine_set_lenient(bool on);
 
 /* Ask a live machine to stop at its next kernel entry. */
 void machine_request_stop(void);

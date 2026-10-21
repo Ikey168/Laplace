@@ -379,6 +379,12 @@ void tt_on_tick(void) {
     g_ticks_since_kf++;
 }
 
+bool tt_entry_wanted(void) {
+    if (!g_ready) return false;
+    return (g_wb_pending && g_ticks != g_wb_tick) || g_ticks_since_kf >= g_cfg.interval_ticks ||
+           g_force_keyframe;
+}
+
 void tt_on_live_entry(void) {
     if (!g_ready) return;
     /* Writeback runs at a later entry than the take, so the processes write
@@ -689,7 +695,33 @@ static void diagnose(uint64_t epoch, uint64_t len, tt_verify_t* out) {
     machine_set_insn_hook(0, 0);
 }
 
+/* The replay made an input call the recording does not have (#242), or could
+ * not find a preemption point (#245): diverged at that step, in the inputs. */
+static void inputs_diverged(tt_verify_t* out, uint64_t epoch, const kio_mismatch_t* mis) {
+    out->epochs_diverged++;
+    if (out->diverged) return;
+    out->diverged = true;
+    out->first_epoch = epoch;
+    out->first_component = KDIVERGE_INPUTS;
+    out->expected = mis->exhausted ? 0 : (mis->rec_kind << 16) | mis->rec_nr;
+    out->actual = (mis->kind << 16) | mis->nr;
+    out->diag_step_lo = mis->step;
+    out->diag_step_hi = mis->step;
+}
+
+static int verify_window(tt_verify_t* out);
+
 int tt_verify(tt_verify_t* out) {
+    /* A preemption point the replay cannot find is noted and taken at the
+     * next entry, so the epoch still runs to its end and its checksums name
+     * what differs (#245). */
+    machine_set_lenient(true);
+    int rc = verify_window(out);
+    machine_set_lenient(false);
+    return rc;
+}
+
+static int verify_window(tt_verify_t* out) {
     memset(out, 0, sizeof(*out));
     tt_window_t w;
     if (!tt_window(&w)) return TT_ERR_STATE;
@@ -707,19 +739,8 @@ int tt_verify(tt_verify_t* out) {
             int rc = tt_goto(epoch, len, 0);
             const kio_mismatch_t* mis = kio_mismatch();
             if (rc != TT_OK && mis->valid) {
-                /* The replay made an input call the recording does not have
-                 * (#242): diverged at that step, in the inputs. */
                 out->epochs_checked++;
-                out->epochs_diverged++;
-                if (!out->diverged) {
-                    out->diverged = true;
-                    out->first_epoch = epoch;
-                    out->first_component = KDIVERGE_INPUTS;
-                    out->expected = mis->exhausted ? 0 : (mis->rec_kind << 16) | mis->rec_nr;
-                    out->actual = (mis->kind << 16) | mis->nr;
-                    out->diag_step_lo = mis->step;
-                    out->diag_step_hi = mis->step;
-                }
+                inputs_diverged(out, epoch, mis);
                 kio_clear_mismatch();
                 goto next_epoch;
             }
@@ -741,7 +762,10 @@ int tt_verify(tt_verify_t* out) {
                     out->actual = d->diverged_actual;
                     diagnose(epoch, len, out);
                 }
+            } else if (mis->valid) {
+                inputs_diverged(out, epoch, mis);   /* a preemption point, and nothing else differs */
             }
+            kio_clear_mismatch();
         }
     next_epoch:
         if (epoch == w.newest) break;

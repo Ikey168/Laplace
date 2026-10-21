@@ -137,6 +137,46 @@ bool kio_event_next(uint32_t kind, uint64_t step, uint32_t* nr, uint64_t* args) 
     return true;
 }
 
+void kio_record(uint32_t kind, uint64_t step, uint64_t args, const void* payload, uint32_t len) {
+    int rc = iorec_append(&g_log, step, kind, 0, args, 0, payload, len);
+    if (rc != IOREC_OK) panic("kio: cannot record (%d); the page pool may be full", rc);
+    g_stats.records++;
+    g_stats.bytes += len;
+    journal_new();
+}
+
+bool kio_record_next(uint32_t kind, uint64_t step, uint64_t* args, void* buf, uint32_t cap,
+                     uint32_t* len) {
+    iorec_t r;
+    if (iorec_peek(&g_log, &r) != IOREC_OK || r.kind != kind || r.step != step) return false;
+    if (r.len > cap) {
+        *len = r.len;                          /* the caller grows its buffer */
+        return false;
+    }
+    if (iorec_read(&g_log, r.off, buf, r.len) != IOREC_OK) panic("kio: cannot read a recorded input");
+    iorec_skip(&g_log);
+    *args = r.args;
+    *len = r.len;
+    return true;
+}
+
+void kio_diverged(uint32_t kind, uint64_t rec_step) {
+    kio_note_diverged(kind, rec_step);
+    machine_stop_diverged();
+}
+
+void kio_note_diverged(uint32_t kind, uint64_t rec_step) {
+    g_mis.valid = true;
+    g_mis.epoch = g_epoch;
+    g_mis.step = machine_step();
+    g_mis.kind = kind;
+    g_mis.nr = 0;
+    g_mis.rec_kind = kind;
+    g_mis.rec_nr = 0;
+    g_mis.rec_step = rec_step;
+    g_mis.exhausted = false;
+}
+
 /* ---- Epochs ---- */
 
 void kio_begin_epoch(uint64_t epoch) {

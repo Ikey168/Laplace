@@ -50,6 +50,7 @@
 #define PAGE_SNAPSHOT_COW   0x200   /* Page is copy-on-write for a checkpoint snapshot (issue #111) */
 #define PAGE_KF_KNOWN       0x400   /* Content equals the reference keyframe's page (#244) */
 #define PAGE_FORK_COW       0x800   /* Frame shared with a forked space until written (#248) */
+#define PAGE_PM_NEW         (1ULL << 52) /* Mapped on demand since the last preemption record (#245) */
 #define PAGE_NX             0x8000000000000000ULL /* No-execute bit */
 #define PAGE_NO_EXECUTE     0x8000000000000000ULL /* NX bit */
 

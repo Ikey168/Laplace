@@ -38,6 +38,7 @@ extern const uint8_t user_image_musl_inputprobe[], user_image_musl_inputprobe_en
 extern const uint8_t user_image_musl_sleeper[], user_image_musl_sleeper_end[];
 extern const uint8_t user_image_musl_forkexec[], user_image_musl_forkexec_end[];
 extern const uint8_t user_image_musl_sigprobe[], user_image_musl_sigprobe_end[];
+extern const uint8_t user_image_musl_spinner[], user_image_musl_spinner_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -56,6 +57,7 @@ static const lp_image_t g_images[] = {
     { "musl_sleeper", user_image_musl_sleeper, user_image_musl_sleeper_end, true },
     { "musl_forkexec", user_image_musl_forkexec, user_image_musl_forkexec_end, true },
     { "musl_sigprobe", user_image_musl_sigprobe, user_image_musl_sigprobe_end, true },
+    { "musl_spinner", user_image_musl_spinner, user_image_musl_spinner_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {

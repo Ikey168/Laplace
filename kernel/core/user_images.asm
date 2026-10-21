@@ -27,5 +27,6 @@ USER_IMAGE musl_inputprobe
 USER_IMAGE musl_sleeper
 USER_IMAGE musl_forkexec
 USER_IMAGE musl_sigprobe
+USER_IMAGE musl_spinner
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -129,8 +129,10 @@ and between keyframes a CRC-protected **journal** of every nondeterministic
 input the programs can observe:
 
 - preemption: the step (kernel entry) at which every involuntary context switch
-  happened; timer interrupts only mark the slice expired, so switches happen at
-  kernel entries and replay forces the same ones
+  happened, and replay forces the same ones; a timer interrupt in user code
+  becomes an entry of its own, journaled by the program's state at that
+  instruction (registers, extended state, the pages it dirtied), which a replay
+  finds again with a hardware breakpoint
 - clock reads (`SYS_TIME`)
 - entropy (`SYS_RANDOM`)
 
@@ -199,6 +201,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Files: a seed image, then a program's own files, in keyframes and checksums; unmodified Lua 5.4 runs a script from the image, writes a file and reads it back, and replays byte-exact; a recording refuses another seed | `tests/qemu/files_gate.sh` |
 | Inputs (clock reads, entropy, and later console and network) are one journaled record with payloads of any size: 10 MiB read in one epoch replays byte-exact; a replay whose input call differs from the recording stops at that step and is reported | `tests/qemu/input_gate.sh` |
 | Processes: 50 children fork (copy-on-write), exec, exit, and are reaped with their statuses; kill ends a child; rewinding between a fork and its exec shows both processes in gdb and MCP | `tests/qemu/proc_gate.sh` |
+| Preemption at any instruction without a counter: two loops with no system call interleave, a loop where only memory changes and `rep movsb` copies are preempted, a spin gets its timer's signals, and each replays byte-exact | `tests/qemu/preempt_gate.sh` |
 | Signals: SIGALRM from a timer interrupts a loop at journaled points with FPU state saved in the frame; a SIGSEGV handler recovers; masks, pending, sigsuspend, sigaltstack; every run replays byte-exact; an unhandled fault or abort() stops the machine and gdb shows the signal and the faulting line | `tests/qemu/signal_gate.sh` |
 | Blocking: a sleeping process and a working one replay byte-exact with each timer wake at its journaled step; a 10 s idle adds no steps and replays without waiting; a debugger stops the machine while everything waits | `tests/qemu/sleep_gate.sh` |
 | Incremental keyframes: 256 MiB resident records at about 90 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
@@ -209,8 +212,9 @@ Everything in this table runs in the booted kernel and is exercised in CI
 
 Limits, stated plainly:
 
-- One CPU. Preemption is at kernel-entry granularity: a process that never
-  enters the kernel is not preempted while recording.
+- One CPU. A process is preempted at any instruction, but a replay finds each
+  such point by trapping on its instruction: a preempted hot loop replays a
+  trap or two per iteration slower (no branch counter is used yet).
 - The journaled inputs are preemption, clock, and entropy. There is no device
   input (keyboard, network) yet, so there is nothing else to journal.
 - User `rdtsc`/`rdtscp` are trapped and journaled, and user `cpuid` is answered

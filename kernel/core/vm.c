@@ -49,7 +49,12 @@ bool vm_fault_in(vm_space_t* s, uint64_t va, bool write) {
     uint64_t phys = pmm_alloc();
     if (!phys) return false;
     kfp_page_added();
-    return vmm_map_page(s, page, phys, f) == 0;
+    if (vmm_map_page(s, page, phys, f) != 0) return false;
+    /* A page that appears inside a segment is part of the state a
+     * preemption point describes (#245), written to or not. */
+    pte_t* pte = vmm_get_page_table(s, page, PT_LEVEL, false);
+    if (pte) *pte |= PAGE_PM_NEW;
+    return true;
 }
 
 /* ---- Region list surgery ---- */

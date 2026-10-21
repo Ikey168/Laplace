@@ -34,12 +34,13 @@ of that epoch has trapped and not been handled; with an instruction index,
 `(epoch, step, i)` for `i >= 1` is the moment entry `step` has been handled and
 `i - 1` further user instructions have run (`include/core/machine.h`).
 
-**Determinism.** A timer interrupt never changes user-visible state: it only
-marks the time slice expired. Context switches happen only at kernel entries,
-through `sched_record_decide()`, which records the step of every preemption on
-a live run and forces the same switches on replay. This is what makes the
-logical clock execution-derived; the original design counted timer ticks, which
-land at a different instruction on every run. The clock (`SYS_TIME`) and
+**Determinism.** Context switches happen only at kernel entries, through
+`sched_record_decide()`, which records the step of every preemption on a live
+run and forces the same switches on replay. This is what makes the logical
+clock execution-derived; the original design counted timer ticks, which land
+at a different instruction on every run. A timer interrupt that lands in user
+mode becomes an entry of its own when the machine wants one there (#245,
+below); otherwise it only marks the time slice expired. The clock (`SYS_TIME`) and
 entropy (`SYS_RANDOM`) system calls go through `ktime_read()` and
 `kentropy_fill()`. User-mode `rdtsc` and `rdtscp` raise #GP (CR4.TSD) and are
 emulated from `ktime_read()`; with CPUID faulting, user `cpuid` raises #GP too
@@ -166,6 +167,38 @@ process with the signal as its wait status, and an exiting child sends its
 parent SIGCHLD. Timer expiries are inputs: noticed against the clock while
 recording, journaled with the step they are delivered at, and replayed there.
 
+**Preemption at any instruction** (#245, `include/core/preempt.h`,
+`include/pmatch.h`). While recording, a timer interrupt in user mode becomes a
+kernel entry (vector 32, a step like any other) when the slice expired and
+another process is ready, a timer deadline passed, a keyframe is due, or a
+debugger asked to stop. So a program that never makes a system call is
+preempted, signalled, keyframed, and stoppable. No counter says how far it
+got, so the entry's journal record describes the point by state: the
+registers, the FS/GS bases, a checksum of the x87/SSE/AVX state, and a hash
+of every page the CPU marked dirty since the previous such record (which
+clears the marks). Pages outside that set are the same at every point of the
+segment, because only that process ran. A replay arms a hardware breakpoint
+at the recorded rip, for the process that runs the segment, in a slot the
+debugger leaves free; each hit compares the registers, then the extended
+state, then the pages (the one that differed last time first), and the first
+match becomes the entry. A page the record saw present must be present: an
+untouched page is not one that reads as zeros. Since a recording can be
+preempted between a demand-paging fault and the retry of its instruction,
+the point is checked again after every such fault. When the same state
+occurs more than once (a spin),
+every occurrence has the same future, so the first is as good as the
+recorded one. A point inside `rep movs`/`rep stos` (rip on the instruction,
+rcx/rsi/rdi partly advanced) is reached by running the remaining iterations
+in the kernel, exactly as the CPU would; other string instructions are
+single-stepped; one that cannot reach the point runs to its end with the
+breakpoint moved past it. A replay that reaches the segment's next real entry
+first has diverged, and is reported in the "inputs" component. Stepping over
+a breakpoint uses RF together with a single step: QEMU's TCG applies RF to a
+whole translated block, so RF alone would let a loop run past every later
+hit. The cost is a trap or two per execution of the recorded instruction
+before the point; a branch counter, where a CPU has one, can skip most of
+them (#236).
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the
@@ -256,8 +289,9 @@ the recording and continues live, still recording.
 ### Limits
 
 - One CPU. Deterministic replay of SMP is not attempted.
-- Preemption is at kernel-entry granularity: a process that never enters the
-  kernel is not preempted while recording.
+- A recorded preemption point is found again by trapping on its instruction:
+  replaying a preempted hot loop costs a trap or two per iteration before the
+  point (no branch counter is used yet).
 - The journaled inputs are the ones programs can see today: preemption, time,
   and entropy. There is no device input (keyboard, network) to journal yet.
 - `rdrand`, `rdseed`, and `rdpid` cannot be trapped: the CPUID table hides
@@ -279,7 +313,8 @@ the recording and continues live, still recording.
   `user/linux/` (unmodified static musl programs, Linux ABI).
 - KVM works (`make selftest` passes under `-enable-kvm -cpu host`, checked on a
   GitHub-hosted runner on 2026-10-21), but those runners expose no PMU, so
-  instruction-precise preemption can't rely on a hardware branch counter (#245).
+  instruction-precise preemption does not rely on a hardware branch counter
+  (#245).
 
 ## Modules
 

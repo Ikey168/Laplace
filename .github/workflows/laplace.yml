@@ -73,6 +73,7 @@ jobs:
           gcc -I../include -Wall -o /tmp/t_ps     test_page_store.c           ../kernel/page_store.c ../kernel/snapshot_store.c && /tmp/t_ps
           gcc -I../include -Wall -o /tmp/t_memfs  test_memfs.c                ../kernel/memfs.c ../kernel/kstate_format.c ../kernel/snapshot_store.c && /tmp/t_memfs
           gcc -I../include -Wall -o /tmp/t_iorec  test_iorec.c                ../kernel/iorec.c && /tmp/t_iorec
+          gcc -I../include -Wall -o /tmp/t_pm     test_pmatch.c               ../kernel/pmatch.c && /tmp/t_pm
           gcc -I../include -Wall -o /tmp/t_rd     test_replay_driver.c        ../kernel/replay_driver.c ../kernel/replay_engine.c && /tmp/t_rd
           gcc -I../include -Wall -o /tmp/t_ds     test_divergence_scan.c      ../kernel/divergence_scan.c ../kernel/divergence.c && /tmp/t_ds
           gcc -I../include -Wall -o /tmp/t_gsl    test_gdb_serial.c           ../kernel/gdb_serial.c ../kernel/gdbstub.c ../kernel/gdbstub_sync.c && /tmp/t_gsl
@@ -130,6 +131,15 @@ jobs:
         run: bash tests/qemu/proc_gate.sh
       - name: Signals, handlers, timers; a fault stops for gdb (in QEMU)
         run: bash tests/qemu/signal_gate.sh
+      - name: Preemption at any instruction, found again by state (in QEMU, TCG, no PMU)
+        run: bash tests/qemu/preempt_gate.sh
+      - name: The same under KVM (the runner's CPU exposes no PMU)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm
+          QEMU_ACCEL=kvm bash tests/qemu/preempt_gate.sh
       - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
         run: python3 tests/qemu/timetravel_e2e.py
       - name: Power cut and resume on the IDE disk (in QEMU)

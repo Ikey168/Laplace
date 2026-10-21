@@ -27,6 +27,7 @@
 #include "core/files.h"
 #include "core/kio.h"
 #include "core/ksig.h"
+#include "core/preempt.h"
 #include "core/kfpages.h"
 #include "core/monitor.h"
 #include "core/clock.h"
@@ -230,6 +231,12 @@ static bool selftest(void) {
             ps->pages_reused, ps->last_pages, ps->last_written, ps->slots_used, ps->slots_total);
     tt_verify_t v;
     int rc = tt_verify(&v);
+    const preempt_stats_t* pm = preempt_stats();
+    kprintf("selftest: preemption points: %lu recorded in user code (%lu inside string "
+            "instructions, %lu pages hashed); replays found %lu by state (%lu inside string "
+            "instructions, %lu run forward in the kernel) in %lu checks\n", pm->recorded,
+            pm->recorded_rep, pm->record_pages, pm->matched, pm->matched_rep, pm->forwarded,
+            pm->candidates);
     kprintf("selftest: verify rc=%d: %u epochs replayed, %u diverged\n", rc, v.epochs_checked,
             v.epochs_diverged);
     if (v.diverged) {
@@ -440,6 +447,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     files_init(seed ? seed->start : 0, seed ? (uint64_t)(seed->end - seed->start) : 0,
                seed ? seed->name : "");
     ksig_init();
+    preempt_init();
     kdiverge_init();
     kdiverge_register_kernel_sources();
     checkpoint_init();

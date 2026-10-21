@@ -47,6 +47,9 @@ uint32_t tt_required_sectors(uint32_t keyframes, uint32_t pool_mib);
 /* ---- Machine hooks (live recording) ---- */
 void tt_on_tick(void);
 void tt_on_live_entry(void);
+/* An entry is wanted now (a keyframe is due, or a writeback): a timer
+ * interrupt in user mode becomes one (#245). */
+bool tt_entry_wanted(void);
 void tt_before_process_exit(process_t* p);
 /* A space's regions or pages are about to change (#239): finish a pending
  * keyframe writeback, which reads them. */

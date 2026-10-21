@@ -43,6 +43,22 @@ int64_t  kio_input(uint32_t kind, uint32_t nr, uint64_t args,
 void     kio_event(uint32_t kind, uint32_t nr, uint64_t args, uint64_t step);
 bool     kio_event_next(uint32_t kind, uint64_t step, uint32_t* nr, uint64_t* args);
 
+/* Records the machine makes itself, with a payload (#245's preemption
+ * points): recording appends one at `step`, args a digest of the payload;
+ * replaying takes the next record if it is one of `kind` at `step`, copying
+ * up to `cap` payload bytes. */
+void     kio_record(uint32_t kind, uint64_t step, uint64_t args, const void* payload, uint32_t len);
+bool     kio_record_next(uint32_t kind, uint64_t step, uint64_t* args, void* buf, uint32_t cap,
+                         uint32_t* len);
+/* (When the payload is larger than `cap`, false with *len set to its size,
+ * and the record stays next.) */
+/* Replay: the machine did not do what the record of `kind` at `rec_step`
+ * says (a preemption point never reached, a record that does not decode):
+ * stop the replay here, as an input mismatch. Does not return. */
+void     kio_diverged(uint32_t kind, uint64_t rec_step);
+/* The same, only noted: for a caller that stops the machine itself. */
+void     kio_note_diverged(uint32_t kind, uint64_t rec_step);
+
 /* Epochs. */
 void     kio_begin_epoch(uint64_t epoch);   /* recording */
 void     kio_close_epoch(uint64_t epoch);   /* recording: before the journal is written */

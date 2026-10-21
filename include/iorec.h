@@ -61,6 +61,7 @@ typedef struct {
 #define IOREC_ENTROPY  2     /* random bytes: the payload */
 #define IOREC_SYSCALL  3     /* a system call answered from outside */
 #define IOREC_DEVICE   4     /* device input delivered to the machine */
+#define IOREC_PREEMPT  5     /* an asynchronous preemption point (#245): payload pmatch.h */
 
 typedef struct {
     uint64_t step;

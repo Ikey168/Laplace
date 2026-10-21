@@ -32,11 +32,11 @@ boot() {   # boot <initrd> <append>
 }
 
 python3 tools/mkcpio.py rootfs "$W/root.cpio" >/dev/null
-out=$(boot "$W/root.cpio" 'run=musl_fileprobe interval=2 keyframes=64')
+out=$(boot "$W/root.cpio" 'run=musl_fileprobe interval=3 keyframes=64')
 echo "$out" | grep -E "files:|fileprobe:|selftest: (window|verify|perturbed kernel-state section 'fs')" | sed "s/^/  [fileprobe] /"
 check "$out" "fileprobe: /etc/motd: Welcome to Laplace" "a seed file reads from the image"
 check "$out" "fileprobe: all checks passed; sum [0-9a-f]{8}" "the file system calls behave"
-check "$out" "selftest: window epochs 1\.\.[0-9]+ \(([1-9][0-9]) keyframes\)" "keyframes fall between the file operations"
+check "$out" "selftest: window epochs 1\.\.[0-9]+ \(([1-9][0-9]) keyframes\)" "keyframes fall between the file operations, all retained"
 check "$out" "selftest: verify rc=0: [0-9]+ epochs replayed, 0 diverged" "every epoch replays to the same files"
 check "$out" "perturbed kernel-state section 'fs': divergence detected \(epoch [0-9]+ component [0-9]+: fs\)" \
       "a wrong filesystem restore is caught and named"
