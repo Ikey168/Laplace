@@ -73,6 +73,20 @@ uint64_t kfp_dirty(void);
 /* The CRC of a present page (cached for KNOWN pages). */
 uint32_t kfp_page_crc(uint32_t pid, uint64_t va, uint64_t phys, pte_t pte);
 
+/* Pages that belong to the kernel rather than to an address space (file
+ * pages, #247) ride in keyframes too. A provider names them by a pseudo pid
+ * at or above pid_base (above every real pid) and an offset, and holds each
+ * as an entry: frame address | 1 while unchanged since the reference
+ * keyframe (it clears the bit on every write, and calls
+ * tt_before_mapping_change before changing or freeing a page). */
+typedef void (*kfp_page_visit_fn)(void* ctx, uint32_t pid, uint64_t va, uint64_t* entry);
+typedef struct {
+    uint32_t pid_base;
+    void (*pages)(kfp_page_visit_fn fn, void* ctx);          /* ascending (pid, va) */
+    int  (*attach)(uint32_t pid, uint64_t va, uint64_t entry); /* restore */
+} kfp_provider_t;
+void kfp_set_provider(const kfp_provider_t* p);
+
 /* Mark function for checkpoint_take. */
 int kfp_mark_space(vm_space_t* space, uint64_t epoch);
 

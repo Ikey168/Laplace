@@ -37,7 +37,7 @@ CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
             kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
-            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c \
+            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c \
             kernel/core/kfpages.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
@@ -54,7 +54,7 @@ TT_C := kernel/checkpoint.c kernel/snapshot_store.c kernel/checkpoint_extstate.c
         kernel/rewind.c kernel/rewind_sync.c kernel/reverse.c kernel/reverse_sync.c \
         kernel/revbreak.c kernel/revbreak_sync.c kernel/gdbstub.c kernel/gdbstub_sync.c \
         kernel/gdb_serial.c kernel/mcp.c kernel/mcp_sync.c kernel/mcp_server.c \
-        kernel/kstate_format.c kernel/page_store.c
+        kernel/kstate_format.c kernel/page_store.c kernel/memfs.c
 
 KERNEL_C    := $(CORE_C) $(TT_C)
 KERNEL_OBJS := $(patsubst %.asm,$(KBUILD)/%.o,$(CORE_ASM)) \
@@ -67,7 +67,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 
 # Linux programs (#238): plain C built against musl, unmodified.
 MUSL_CC     ?= musl-gcc
-LINUX_PROGS := hello sysprobe vmprobe bigmem
+LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \
@@ -78,7 +78,7 @@ ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -z noexecstack \
 
 .PHONY: all kernel user run selftest test iso clean legacy
 
-all: kernel
+all: kernel $(BUILD)/rootfs.cpio
 
 kernel: $(BUILD)/laplace.elf
 user: $(USER_ELFS)
@@ -123,8 +123,13 @@ $(DISK):
 # Console on stdio; gdb (COM2) and MCP (COM3) on TCP. Attach with
 #   gdb build/user/heisenbug.elf -ex 'target remote :$(GDB_PORT)'
 #   tools/laplace-mcp --port $(MCP_PORT)
-run: kernel $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -kernel $(BUILD)/laplace.elf -append "$(APPEND)" \
+# The filesystem's seed image (#247): rootfs/, packed deterministically.
+$(BUILD)/rootfs.cpio: tools/mkcpio.py $(shell find rootfs)
+	@mkdir -p $(dir $@)
+	python3 tools/mkcpio.py rootfs $@
+
+run: kernel $(DISK) $(BUILD)/rootfs.cpio
+	$(QEMU) $(QEMU_FLAGS) -kernel $(BUILD)/laplace.elf -initrd $(BUILD)/rootfs.cpio -append "$(APPEND)" \
 	    -drive file=$(DISK),format=raw,if=ide,index=0 \
 	    -serial mon:stdio -serial tcp:127.0.0.1:$(GDB_PORT),server,nowait \
 	    -serial tcp:127.0.0.1:$(MCP_PORT),server,nowait
@@ -147,6 +152,7 @@ test: all selftest
 	bash tests/qemu/loader_gate.sh
 	bash tests/qemu/vm_gate.sh
 	bash tests/qemu/scale_gate.sh
+	bash tests/qemu/files_gate.sh
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 

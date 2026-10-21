@@ -90,6 +90,21 @@ maps each saved page with its region's protection (no user bit for
 `PROT_NONE`). The process-table checksum covers the regions and the break, the
 user-page checksum each page's user bit.
 
+**Files** (#247, `include/memfs.h`, `include/core/files.h`). The filesystem
+is inside the recording. It starts from a read-only seed image, a cpio
+"newc" archive passed as a Multiboot module (`tools/mkcpio.py` packs
+`rootfs/` deterministically), which the recording pins by CRC: seed files are
+read straight from the image and need no journal, and a recording refuses to
+resume with a different image. Whatever programs create or change is kernel
+state: the tree (inodes, directories, sizes, times) is the `fs` section of
+the keyframe, file pages go in the page pool next to user memory (as a page
+provider with pseudo pids, tracked unchanged-or-not the same way), and open
+file descriptions, descriptor tables, working directories, and umasks are the
+`files` section. Both are divergence components of their own. A seed file is
+copied into pages at its first change. File times follow the last wall-clock
+time a program read through a journaled call, so they replay too. Programs
+can also be started from the image (`run=/bin/lua`).
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the

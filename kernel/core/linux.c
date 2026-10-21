@@ -7,6 +7,7 @@
 #include "core/mm.h"
 #include "core/clock.h"
 #include "core/vm.h"
+#include "core/files.h"
 #include "core/console.h"
 #include "entropy_record.h"
 #include "time_record.h"
@@ -19,9 +20,6 @@ void* memcpy(void* dst, const void* src, size_t n);
 #define ARCH_GET_FS 0x1003
 #define ARCH_GET_GS 0x1004
 
-#define TCGETS      0x5401
-#define TIOCGWINSZ  0x5413
-
 #define RLIMIT_STACK  3
 #define RLIMIT_NOFILE 7
 #define RLIM_INFINITY (~0ULL)
@@ -30,41 +28,6 @@ static inline int64_t err(int e) { return -(int64_t)e; }
 
 static bool put_user(process_t* p, uint64_t uaddr, const void* src, uint64_t len) {
     return uaccess_write(p->address_space, uaddr, src, len);
-}
-
-/* ---- Console output (fds 1 and 2) ---- */
-
-static int64_t write_console(process_t* p, uint64_t buf, uint64_t len) {
-    char tmp[256];
-    uint64_t done = 0;
-    while (done < len) {
-        uint64_t n = len - done < sizeof(tmp) ? len - done : sizeof(tmp);
-        if (!uaccess_read(p->address_space, buf + done, tmp, n)) {
-            return done ? (int64_t)done : err(LX_EFAULT);
-        }
-        if (!machine_quiet()) console_write(tmp, (uint32_t)n);
-        done += n;
-    }
-    return (int64_t)done;
-}
-
-static int64_t sys_write(process_t* p, int64_t fd, uint64_t buf, uint64_t len) {
-    if (fd != 1 && fd != 2) return err(LX_EBADF);
-    return write_console(p, buf, len);
-}
-
-static int64_t sys_writev(process_t* p, int64_t fd, uint64_t iov, uint64_t cnt) {
-    if (fd != 1 && fd != 2) return err(LX_EBADF);
-    if (cnt > 1024) return err(LX_EINVAL);
-    int64_t total = 0;
-    for (uint64_t i = 0; i < cnt; i++) {
-        uint64_t v[2];
-        if (!uaccess_read(p->address_space, iov + 16 * i, v, sizeof(v))) return err(LX_EFAULT);
-        int64_t n = write_console(p, v[0], v[1]);
-        if (n < 0) return total ? total : n;
-        total += n;
-    }
-    return total;
 }
 
 /* ---- Identity and limits ---- */
@@ -119,6 +82,7 @@ static int64_t sys_clock_gettime(process_t* p, uint64_t clk, uint64_t ts) {
     switch (clk) {
     case 0: case 5: case 8:       /* REALTIME, REALTIME_COARSE, REALTIME_ALARM */
         ns = clock_realtime_ns();
+        files_note_time(ns);
         break;
     case 1: case 4: case 6: case 7: case 9:   /* MONOTONIC*, BOOTTIME* */
     case 2: case 3:               /* PROCESS/THREAD_CPUTIME: one CPU, close enough */
@@ -134,6 +98,7 @@ static int64_t sys_clock_gettime(process_t* p, uint64_t clk, uint64_t ts) {
 static int64_t sys_gettimeofday(process_t* p, uint64_t tv, uint64_t tz) {
     if (tv) {
         uint64_t ns = clock_realtime_ns();
+        files_note_time(ns);
         uint64_t t[2] = { ns / 1000000000ULL, (ns % 1000000000ULL) / 1000 };
         if (!put_user(p, tv, t, sizeof(t))) return err(LX_EFAULT);
     }
@@ -145,7 +110,9 @@ static int64_t sys_gettimeofday(process_t* p, uint64_t tv, uint64_t tz) {
 }
 
 static int64_t sys_time(process_t* p, uint64_t tloc) {
-    int64_t s = (int64_t)(clock_realtime_ns() / 1000000000ULL);
+    uint64_t ns = clock_realtime_ns();
+    files_note_time(ns);
+    int64_t s = (int64_t)(ns / 1000000000ULL);
     if (tloc && !put_user(p, tloc, &s, 8)) return err(LX_EFAULT);
     return s;
 }
@@ -202,6 +169,11 @@ lx_after_t linux_syscall(process_t* p) {
     uint64_t a0 = c->rdi, a1 = c->rsi, a2 = c->rdx, a3 = c->r10;
     int64_t r;
 
+    /* Files and descriptors (#247): read, write, open, stat, ... */
+    if (files_syscall(p, nr, &r)) {
+        c->rax = (uint64_t)r;
+        return LX_CONTINUE;
+    }
     switch (nr) {
     case LX_exit:
     case LX_exit_group:
@@ -211,14 +183,6 @@ lx_after_t linux_syscall(process_t* p) {
         c->rax = 0;
         machine_yield(p);
         return LX_SWITCHED;
-    case LX_write:           r = sys_write(p, (int64_t)a0, a1, a2); break;
-    case LX_writev:          r = sys_writev(p, (int64_t)a0, a1, a2); break;
-    case LX_read:            r = a0 == 0 ? 0 : err(LX_EBADF); break;   /* stdin: #249 */
-    case LX_close:           r = a0 <= 2 ? 0 : err(LX_EBADF); break;
-    case LX_ioctl:
-        r = (a1 == TIOCGWINSZ || a1 == TCGETS) ? err(LX_ENOTTY) : err(LX_EINVAL);
-        if ((int64_t)a0 < 0 || a0 > 2) r = err(LX_EBADF);
-        break;
     case LX_getpid:
     case LX_gettid:          r = p->pid; break;
     case LX_getppid:         r = p->ppid; break;

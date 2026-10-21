@@ -196,6 +196,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Unmodified static Linux programs (musl) run; their clock and random reads replay exactly | `tests/qemu/linux_gate.sh` |
 | Programs load from outside the kernel (Multiboot modules, static and static-PIE) with argv and envp; a recording refuses to resume with changed binaries | `tests/qemu/loader_gate.sh` |
 | malloc, `mmap`/`munmap`/`mprotect`/`mremap`, `brk`, and a demand-paged stack replay exactly with keyframes between the calls, at 512 MiB and 4 GiB of RAM | `tests/qemu/vm_gate.sh` |
+| Files: a seed image, then a program's own files, in keyframes and checksums; unmodified Lua 5.4 runs a script from the image, writes a file and reads it back, and replays byte-exact; a recording refuses another seed | `tests/qemu/files_gate.sh` |
 | Incremental keyframes: 256 MiB resident records at about 90 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
@@ -224,10 +225,14 @@ Limits, stated plainly:
   Linux `syscall` ABI, #238), embedded in the kernel (`user/linux/`) or passed
   as Multiboot modules (`-initrd`, #240). The
   Linux interface so far covers startup, TLS, stdio to the console, the clocks,
-  `getrandom`, and memory (`brk`, anonymous `mmap`, `munmap`, `mprotect`,
-  `mremap`, `madvise`, with pages mapped on first touch, #239); file-backed
-  `mmap` returns ENODEV until files exist (#247). Unimplemented calls return
-  ENOSYS and are logged once.
+  `getrandom`, memory (`brk`, `mmap`, `munmap`, `mprotect`, `mremap`,
+  `madvise`, with pages mapped on first touch, #239), and files (#247): a
+  filesystem inside the machine, seeded from a read-only cpio image
+  (`rootfs/`, passed with `-initrd`) and checkpointed with it, with `openat`,
+  `read`/`write` and their `p`/`v` forms, `lseek`, `stat` and `statx`,
+  `getdents64`, `mkdir`, `unlink`, `rename`, links, `ftruncate`, `fcntl`,
+  `dup`, `getcwd`/`chdir`, private file `mmap`, and `/dev/null`, `/dev/zero`,
+  `/dev/urandom`. Unimplemented calls return ENOSYS and are logged once.
 - Recorded history is read-only from the debuggers.
 
 ## The machine
@@ -264,6 +269,7 @@ Kernel command line (`make run APPEND="..."`):
 | Option | Meaning |
 |--------|---------|
 | `run=a,b,c` | programs to start on a cold boot, each with arguments: an embedded name (`heisenbug`, `noise`, `counter`, `hello`, `musl_hello`, ...) or the path of a module passed with `-initrd`, e.g. `run="/args.elf one two",noise` (default `heisenbug,noise,noise`) |
+| `root=PATH` | the filesystem's seed image: a cpio module (default: the first cpio module; `make run` passes `rootfs/`) |
 | `env="A=1 B=2"` | the environment of every Linux program |
 | `interval=N` | keyframe cadence in timer ticks (1 ms each; default 100) |
 | `keyframes=N` | retained keyframes, the rewind horizon (default 16) |
@@ -303,9 +309,12 @@ Laplace/
                       the legacy IKOS subsystems (not built)
   include/            headers (include/core/ for the kernel core)
   user/laplace/       the recorded programs: heisenbug, noise, counter, hello
-  tests/              host unit tests; tests/qemu/ the booted end-to-end gate
-  tools/              laplace-mcp (MCP stdio bridge), record-cast
+  user/linux/         unmodified Linux programs built with musl (probes, bigmem)
+  rootfs/             the machine filesystem's seed image (packed to build/rootfs.cpio)
+  tests/              host unit tests; tests/qemu/ the booted end-to-end gates
+  tools/              laplace-mcp (MCP stdio bridge), record-cast, mkcpio
   scripts/test/       host harnesses and the QEMU power-cut demo
+  scripts/build/      third-party programs for the gates (Lua)
   docs/               architecture and how-tos
 ```
 

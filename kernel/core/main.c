@@ -2,6 +2,8 @@
  *
  * Kernel command line (Multiboot; QEMU -append):
  *   run=a,b,c      programs to start on a cold boot (default heisenbug,noise,noise)
+ *   root=PATH      the filesystem's seed image: a cpio module (default: the
+ *                  first module that is a cpio archive, #247)
  *   interval=N     keyframe cadence in timer ticks (default 100; 1 tick = 1 ms)
  *   keyframes=N    retained keyframes, the rewind horizon (default 16)
  *   dirty=N        also take a keyframe once an epoch dirties N pages (default
@@ -22,6 +24,7 @@
 #include "core/machine.h"
 #include "core/timetravel.h"
 #include "core/kstate.h"
+#include "core/files.h"
 #include "core/kfpages.h"
 #include "core/monitor.h"
 #include "core/clock.h"
@@ -43,6 +46,7 @@ size_t strlen(const char* s);
 typedef struct {
     char     run[512];
     char     env[256];
+    char     root[64];
     uint32_t interval;
     uint32_t keyframes;
     uint32_t stop_after;
@@ -90,6 +94,8 @@ static void parse_cmdline(const char* cmd) {
         uint32_t len = (uint32_t)(cmd - tok);
         if (len > 4 && strncmp(tok, "run=", 4) == 0) {
             copy_value(g_opts.run, sizeof(g_opts.run), tok + 4, len - 4);
+        } else if (len > 5 && strncmp(tok, "root=", 5) == 0) {
+            copy_value(g_opts.root, sizeof(g_opts.root), tok + 5, len - 5);
         } else if (len > 4 && strncmp(tok, "env=", 4) == 0) {
             copy_value(g_opts.env, sizeof(g_opts.env), tok + 4, len - 4);
         } else if (len > 9 && strncmp(tok, "interval=", 9) == 0) {
@@ -274,6 +280,14 @@ static bool selftest(void) {
             bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
             bad.first_component, who);
     ok = ok && bad.diverged && strcmp(who, "probe") == 0;
+    /* ... and the filesystem (#247), which every machine has. */
+    kstate_perturb_next_restore(KS_ID_FS);
+    rc = tt_verify(&bad);
+    who = bad.diverged ? kstate_component_name(bad.first_component) : "-";
+    kprintf("selftest: perturbed kernel-state section 'fs': %s (epoch %lu component %u: %s)\n",
+            bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
+            bad.first_component, who);
+    ok = ok && bad.diverged && strcmp(who, "fs") == 0;
     tt_verify(&v);   /* back to the end of the recording, clean */
     kprintf("selftest: restored pages: %lu frames kept, %lu from the cache, %lu read from the pool\n",
             kfp_stats()->restore_kept, kfp_stats()->restore_cached, kfp_stats()->restore_read);
@@ -403,6 +417,9 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     kentropy_set_source(entropy_source, 0);
     machine_init();
     kstate_init();
+    const lp_image_t* seed = proc_seed_module(g_opts.root);
+    files_init(seed ? seed->start : 0, seed ? (uint64_t)(seed->end - seed->start) : 0,
+               seed ? seed->name : "");
     kdiverge_init();
     kdiverge_register_kernel_sources();
     checkpoint_init();

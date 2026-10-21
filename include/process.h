@@ -177,6 +177,8 @@ typedef struct process {
     /* The executable (#240): its path and a CRC of its image. */
     char     exe_path[64];
     uint32_t exe_crc;
+    /* Open files, cwd, umask (#247): include/core/files.h. */
+    void*    files;
 } process_t;
 
 /* Process management functions */

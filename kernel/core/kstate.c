@@ -18,6 +18,10 @@ static uint32_t       g_perturb_id;      /* 0: none */
 static uint64_t       g_restored_now_ns;
 static uint64_t       g_epoch;           /* the epoch being saved */
 
+static bool take_perturb(uint32_t id);
+
+bool kstate_take_perturb(uint32_t id) { return take_perturb(id); }
+
 static bool take_perturb(uint32_t id) {
     if (g_perturb_id != id) return false;
     g_perturb_id = 0;

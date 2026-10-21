@@ -63,7 +63,9 @@ const char* kstate_component_name(uint32_t component);
 /* A section id's subsystem name, or "?". */
 const char* kstate_subsys_name(uint32_t id);
 
-/* Test hook: the next restore of subsystem `id` changes its state by one bit. */
+/* Test hook: the next restore of subsystem `id` changes its state by one bit.
+ * A subsystem's restore asks with kstate_take_perturb (true once). */
 void kstate_perturb_next_restore(uint32_t id);
+bool kstate_take_perturb(uint32_t id);
 
 #endif /* CORE_KSTATE_H */

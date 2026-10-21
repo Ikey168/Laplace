@@ -40,6 +40,7 @@ typedef struct {
     uint32_t pid;
     uint32_t id;
     uint64_t va;
+    uint64_t frame;          /* provider pages: the frame; 0 for user pages */
     bool     done;
 } newpage_t;
 static newpage_t* g_new;
@@ -151,7 +152,12 @@ static uint32_t ref_slot(uint32_t pid, uint64_t va) {
     return g_ref >= 0 ? ps_mf_find(&g_mf[g_ref].m, pid, va) : PS_NONE;
 }
 
-static void push_new(uint32_t pid, uint64_t va, uint32_t id) {
+static const kfp_provider_t* g_prov;
+void kfp_set_provider(const kfp_provider_t* p) { g_prov = p; }
+
+#define PROV_KNOWN 1ULL
+
+static void push_new(uint32_t pid, uint64_t va, uint32_t id, uint64_t frame) {
     if (g_nnew == g_newcap) {
         uint32_t cap = g_newcap ? g_newcap * 2 : 1024;
         newpage_t* n = (newpage_t*)kmalloc((size_t)cap * sizeof(newpage_t));
@@ -163,7 +169,7 @@ static void push_new(uint32_t pid, uint64_t va, uint32_t id) {
         g_new = n;
         g_newcap = cap;
     }
-    newpage_t e = { pid, id, va, false };
+    newpage_t e = { pid, id, va, frame, false };
     g_new[g_nnew++] = e;
 }
 
@@ -172,9 +178,8 @@ typedef struct {
     uint32_t       pid;
 } build_ctx_t;
 
-static void build_one(void* c, uint64_t va, pte_t* pte) {
-    build_ctx_t* b = (build_ctx_t*)c;
-    uint32_t id = (*pte & PAGE_KF_KNOWN) ? ref_slot(b->pid, va) : PS_NONE;
+static void add_page(ps_manifest_t* m, uint32_t pid, uint64_t va, bool known, uint64_t frame) {
+    uint32_t id = known ? ref_slot(pid, va) : PS_NONE;
     if (id != PS_NONE) {
         ps_ref(&g_pool, id);
         g_st.pages_reused++;
@@ -184,9 +189,22 @@ static void build_one(void* c, uint64_t va, pte_t* pte) {
             panic("timetravel: the page store is full (%u slots); give the recording a larger disk",
                   g_pool.nslots);
         }
-        push_new(b->pid, va, id);
+        push_new(pid, va, id, frame);
     }
-    if (ps_mf_add(b->m, b->pid, va, id, grow) != PS_OK) panic("timetravel: cannot list keyframe pages");
+    if (ps_mf_add(m, pid, va, id, grow) != PS_OK) panic("timetravel: cannot list keyframe pages");
+}
+
+static void build_one(void* c, uint64_t va, pte_t* pte) {
+    build_ctx_t* b = (build_ctx_t*)c;
+    add_page(b->m, b->pid, va, (*pte & PAGE_KF_KNOWN) != 0, 0);
+}
+
+/* Provider pages: decided and marked unchanged in one pass (no COW: the
+ * provider announces its writes). */
+static void build_prov(void* c, uint32_t pid, uint64_t va, uint64_t* entry) {
+    build_ctx_t* b = (build_ctx_t*)c;
+    add_page(b->m, pid, va, (*entry & PROV_KNOWN) != 0, *entry & ~0xFFFULL);
+    *entry |= PROV_KNOWN;
 }
 
 /* Processes in ascending pid order (manifests are sorted by pid). */
@@ -215,6 +233,10 @@ void kfp_begin_take(void) {
     for (uint32_t k = 0; k < n; k++) {
         build_ctx_t b = { &g_mf[i].m, (uint32_t)procs[k]->pid };
         vmm_for_each_pte(procs[k]->address_space, build_one, &b);
+    }
+    if (g_prov) {
+        build_ctx_t b = { &g_mf[i].m, 0 };
+        g_prov->pages(build_prov, &b);
     }
     g_mf[i].used = true;
     g_mf[i].committed = false;
@@ -315,6 +337,11 @@ int kfp_writeback(void) {
     for (uint32_t i = 0; i < g_nnew; i++) {
         newpage_t* e = &g_new[i];
         if (e->done) continue;
+        if (e->frame) {
+            write_slot(e->id, P2V(e->frame));
+            e->done = true;
+            continue;
+        }
         process_t* p = proc_by_pid(e->pid);
         uint64_t phys = p ? vmm_get_physical_addr(p->address_space, e->va) : 0;
         if (!phys) panic("timetravel: keyframe page %lx of pid %u vanished", e->va, e->pid);
@@ -359,6 +386,25 @@ static void harvest_one(void* c, uint64_t va, pte_t* pte) {
     if (ev) pmm_free(ev);
 }
 
+typedef struct {
+    uint64_t count;
+    bool     take;
+} prov_harv_t;
+
+static void harvest_prov(void* c, uint32_t pid, uint64_t va, uint64_t* entry) {
+    prov_harv_t* h = (prov_harv_t*)c;
+    if (!(*entry & PROV_KNOWN)) return;
+    uint32_t id = ref_slot(pid, va);
+    if (id == PS_NONE) return;
+    if (!h->take) {
+        h->count++;
+        return;
+    }
+    uint64_t ev = 0;
+    if (ps_cache_put(&g_harv, id, *entry & ~0xFFFULL, &ev)) *entry = 0;
+    if (ev) pmm_free(ev);
+}
+
 void kfp_harvest(void) {
     if (g_harv_mem) {
         kfree(g_harv_mem);
@@ -372,6 +418,9 @@ void kfp_harvest(void) {
         vmm_for_each_pte(h.space, harvest_one, &h);
         count += h.count;
     }
+    prov_harv_t ph = { 0, false };
+    if (g_prov) g_prov->pages(harvest_prov, &ph);
+    count += ph.count;
     if (!count) return;
     uint32_t cap = pow2_at_least(count * 2);
     g_harv_mem = kmalloc(ps_cache_bytes(cap));
@@ -381,6 +430,8 @@ void kfp_harvest(void) {
         harv_ctx_t h = { (uint32_t)proc_at(i)->pid, 0, true, proc_at(i)->address_space };
         vmm_for_each_pte(h.space, harvest_one, &h);
     }
+    ph.take = true;
+    if (g_prov) g_prov->pages(harvest_prov, &ph);
 }
 
 static void stash_pristine(uint32_t id, uint64_t frame) {
@@ -398,7 +449,8 @@ int kfp_map(uint64_t epoch) {
     vm_region_t* r = 0;
     for (uint32_t i = 0; m && rc == 0 && i < m->nruns; i++) {
         const ps_run_t* run = &m->runs[i];
-        if (!p || (uint32_t)p->pid != run->pid) {
+        bool prov = g_prov && run->pid >= g_prov->pid_base;
+        if (!prov && (!p || (uint32_t)p->pid != run->pid)) {
             p = proc_by_pid(run->pid);
             if (!p) { rc = -1; break; }
             r = p->address_space->regions;
@@ -406,8 +458,10 @@ int kfp_map(uint64_t epoch) {
         for (uint32_t k = 0; k < run->npages; k++) {
             uint64_t va = run->va + (uint64_t)k * PAGE_SIZE;
             uint32_t id = run->id + k;
-            while (r && r->end_addr <= va) r = r->next;
-            if (!r || va < r->start_addr) { rc = -1; break; }
+            if (!prov) {
+                while (r && r->end_addr <= va) r = r->next;
+                if (!r || va < r->start_addr) { rc = -1; break; }
+            }
             uint64_t phys = g_harv.cap ? ps_cache_take(&g_harv, id) : 0;
             if (phys) {
                 g_st.restore_kept++;
@@ -425,6 +479,14 @@ int kfp_map(uint64_t epoch) {
                     rc = -1;
                     break;
                 }
+            }
+            if (prov) {
+                if (g_prov->attach(run->pid, va, phys | PROV_KNOWN) != 0) {
+                    pmm_free(phys);
+                    rc = -1;
+                    break;
+                }
+                continue;
             }
             uint32_t flags = vm_pte_flags(r);
             if (r->flags & VMM_FLAG_WRITE) flags = (flags & ~PAGE_WRITABLE) | PAGE_SNAPSHOT_COW;

@@ -3,6 +3,7 @@
 #include "core/proc.h"
 #include "core/mm.h"
 #include "core/vm.h"
+#include "core/files.h"
 #include "core/console.h"
 #include "process_manager.h"
 #include "core/machine.h"
@@ -30,6 +31,7 @@ extern const uint8_t user_image_musl_hello[], user_image_musl_hello_end[];
 extern const uint8_t user_image_musl_sysprobe[], user_image_musl_sysprobe_end[];
 extern const uint8_t user_image_musl_vmprobe[], user_image_musl_vmprobe_end[];
 extern const uint8_t user_image_musl_bigmem[], user_image_musl_bigmem_end[];
+extern const uint8_t user_image_musl_fileprobe[], user_image_musl_fileprobe_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -43,6 +45,7 @@ static const lp_image_t g_images[] = {
     { "musl_sysprobe", user_image_musl_sysprobe, user_image_musl_sysprobe_end, true },
     { "musl_vmprobe", user_image_musl_vmprobe, user_image_musl_vmprobe_end, true },
     { "musl_bigmem", user_image_musl_bigmem, user_image_musl_bigmem_end, true },
+    { "musl_fileprobe", user_image_musl_fileprobe, user_image_musl_fileprobe_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {
@@ -99,6 +102,25 @@ const lp_image_t* proc_find_image(const char* name) {
     }
     for (uint32_t i = 0; i < g_nmodules; i++) {
         if (strcmp(basename_of(g_modules[i].name), basename_of(name)) == 0) return &g_modules[i];
+    }
+    /* A program in the machine's filesystem (#247). */
+    return files_find_image(name);
+}
+
+const lp_image_t* proc_seed_module(const char* root) {
+    for (uint32_t i = 0; root && root[0] && i < g_nmodules; i++) {
+        if (strcmp(g_modules[i].name, root) == 0 ||
+            strcmp(basename_of(g_modules[i].name), basename_of(root)) == 0) {
+            return &g_modules[i];
+        }
+    }
+    /* Else the first cpio archive ("newc": "070701"). */
+    for (uint32_t i = 0; i < g_nmodules; i++) {
+        const uint8_t* b = g_modules[i].start;
+        if (g_modules[i].end - b >= 6 && b[0] == '0' && b[1] == '7' && b[2] == '0' && b[3] == '7' &&
+            b[4] == '0' && b[5] == '1') {
+            return &g_modules[i];
+        }
     }
     return 0;
 }
@@ -184,6 +206,7 @@ process_t* proc_alloc(uint32_t pid, const char* name) {
 }
 
 void proc_destroy(process_t* p) {
+    files_proc_gone(p);
     int idx = proc_index(p);
     if (idx >= 0) {
         for (uint32_t i = (uint32_t)idx; i + 1 < g_count; i++) g_table[i] = g_table[i + 1];
@@ -431,6 +454,7 @@ process_t* proc_spawn_args(const lp_image_t* image, uint32_t argc, const char* c
         p->exe_path[i] = image->name[i];
     }
     p->exe_crc = proc_image_crc(image);
+    files_proc_new(p);
     g_next_pid++;
     p->state = PROCESS_STATE_READY;
     proc_append(p);

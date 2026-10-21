@@ -45,6 +45,9 @@ process_t* proc_spawn_args(const lp_image_t* image, uint32_t argc, const char* c
 
 /* Programs passed as Multiboot modules (QEMU -initrd "path args,..."). */
 void     proc_register_modules(const uint32_t* mbi);
+/* The filesystem seed (#247): the module named `root` (path or last
+ * component), else the first that is a cpio archive; NULL if none. */
+const lp_image_t* proc_seed_module(const char* root);
 uint32_t proc_image_crc(const lp_image_t* image);
 
 /* Remove a process from the table and free it (address space included). */
