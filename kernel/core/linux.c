@@ -8,6 +8,7 @@
 #include "core/clock.h"
 #include "core/vm.h"
 #include "core/files.h"
+#include "core/pctl.h"
 #include "core/console.h"
 #include "entropy_record.h"
 #include "time_record.h"
@@ -215,6 +216,9 @@ lx_after_t linux_syscall(process_t* p) {
         c->rax = (uint64_t)r;
         return LX_CONTINUE;
     }
+    /* Processes (#248): fork, execve, wait4, kill, ... */
+    lx_after_t after;
+    if (pctl_syscall(p, nr, &after)) return after;
     switch (nr) {
     case LX_exit:
     case LX_exit_group:

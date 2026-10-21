@@ -175,6 +175,31 @@ void files_proc_gone(process_t* p) {
     p->files = 0;
 }
 
+void files_fork(process_t* parent, process_t* child) {
+    fdt_t* t = fdt_new();
+    if (!t) panic("files: out of memory for a descriptor table");
+    fdt_t* pt = fdt(parent);
+    if (pt) {
+        t->cwd = pt->cwd;
+        t->umask = pt->umask;
+        for (uint32_t fd = 0; fd < MAX_FDS; fd++) {
+            if (pt->of[fd] < 0) continue;
+            t->of[fd] = pt->of[fd];
+            t->cloexec[fd] = pt->cloexec[fd];
+            g_of[pt->of[fd]].refs++;
+        }
+    }
+    child->files = t;
+}
+
+void files_exec(process_t* p) {
+    fdt_t* t = fdt(p);
+    if (!t) return;
+    for (int64_t fd = 0; fd < MAX_FDS; fd++) {
+        if (t->of[fd] >= 0 && t->cloexec[fd]) fd_close(p, fd);
+    }
+}
+
 /* ---- Paths ---- */
 
 static int64_t mfs_err(int rc) { return (int64_t)rc; }   /* memfs errnos are Linux's */

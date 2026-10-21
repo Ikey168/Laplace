@@ -199,5 +199,7 @@ void machine_load_segment_bases(process_t* p);
 
 /* Terminate a process (fault or break handled, or exit). */
 void machine_terminate(process_t* p, int code);
+/* End p by a signal (wait status: the signal number). */
+void       machine_kill(process_t* p, uint32_t sig);
 
 #endif /* CORE_MACHINE_H */

@@ -62,6 +62,18 @@ void vmm_for_each_page(vm_space_t* space, vmm_page_fn fn, void* ctx);
  * hook first, so a pending keyframe keeps the pre-write image. Both fail
  * (return false) if any byte is unmapped or outside user space; copy_to_user
  * also fails on a page that is read-only for the user. */
+/* Frames shared between address spaces by fork (#248). A frame has one owner
+ * unless shared: frame_share adds a reference, frame_put drops one and frees
+ * the frame with the last. */
+void frame_share(uint64_t phys);
+bool frame_shared(uint64_t phys);
+void frame_put(uint64_t phys);
+
+/* A user write to a present page that is not writable: preserve the keyframe
+ * image (snapshot COW, #111/#244) and break fork sharing (#248). True when the
+ * write may now proceed. */
+bool vmm_user_write_fault(vm_space_t* space, uint64_t va);
+
 /* Every present user PTE of `space`, in ascending address order, by pointer
  * (the callback may change it; the caller flushes the TLB). */
 typedef void (*vmm_pte_fn)(void* ctx, uint64_t va, pte_t* pte);

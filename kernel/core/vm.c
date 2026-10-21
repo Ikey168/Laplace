@@ -232,6 +232,8 @@ int64_t vm_mprotect(process_t* p, uint64_t addr, uint64_t len, uint64_t prot) {
             if (!(f & PAGE_WRITABLE)) {
                 /* Nothing can write it now: its content is the keyframe's. */
                 e &= ~(pte_t)PAGE_SNAPSHOT_COW;
+            } else if (e & PAGE_FORK_COW) {
+                /* shared with a fork: the write fault unshares it (#248) */
             } else if (e & PAGE_KF_KNOWN) {
                 e |= PAGE_SNAPSHOT_COW;  /* unchanged since the keyframe: fault on write (#244) */
             } else if (!(e & PAGE_SNAPSHOT_COW)) {

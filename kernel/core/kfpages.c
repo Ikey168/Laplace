@@ -227,7 +227,38 @@ typedef struct {
     uint32_t       pid;
 } build_ctx_t;
 
-static void add_page(ps_manifest_t* m, uint32_t pid, uint64_t va, bool known, uint64_t frame) {
+/* Frames fork shares between spaces (#248) get one slot per keyframe: the
+ * first page that maps one decides its slot, the others take a reference. */
+#define DEDUP_CAP 32768
+static uint64_t g_dd_frame[DEDUP_CAP];
+static uint32_t g_dd_id[DEDUP_CAP];
+static uint32_t g_dd_used[DEDUP_CAP];
+static uint32_t g_dd_n;
+
+static uint32_t dd_slot(uint64_t f) {
+    uint32_t h = (uint32_t)((f >> 12) * 2654435761u) & (DEDUP_CAP - 1);
+    while (g_dd_frame[h] && g_dd_frame[h] != f) h = (h + 1) & (DEDUP_CAP - 1);
+    return h;
+}
+
+static void dd_clear(void) {
+    for (uint32_t i = 0; i < g_dd_n; i++) g_dd_frame[g_dd_used[i]] = 0;
+    g_dd_n = 0;
+}
+
+static void add_page(ps_manifest_t* m, uint32_t pid, uint64_t va, bool known, uint64_t frame,
+                     bool provider) {
+    uint32_t dd = DEDUP_CAP;
+    if (frame && frame_shared(frame)) {
+        dd = dd_slot(frame);
+        if (g_dd_frame[dd]) {
+            ps_ref(&g_pool, g_dd_id[dd]);
+            g_st.pages_reused++;
+            if (ps_mf_add(m, pid, va, g_dd_id[dd], grow) != PS_OK) panic("timetravel: cannot list keyframe pages");
+            return;
+        }
+        if (g_dd_n >= DEDUP_CAP / 2) dd = DEDUP_CAP;   /* full: store it twice */
+    }
     uint32_t id = known ? ref_slot(pid, va) : PS_NONE;
     if (id != PS_NONE) {
         ps_ref(&g_pool, id);
@@ -238,21 +269,33 @@ static void add_page(ps_manifest_t* m, uint32_t pid, uint64_t va, bool known, ui
             panic("timetravel: the page store is full (%u slots); give the recording a larger disk",
                   g_pool.nslots);
         }
-        push_new(pid, va, id, frame);
+        push_new(pid, va, id, provider ? frame : 0);
+    }
+    if (dd < DEDUP_CAP) {
+        g_dd_frame[dd] = frame;
+        g_dd_id[dd] = id;
+        g_dd_used[g_dd_n++] = dd;
     }
     if (ps_mf_add(m, pid, va, id, grow) != PS_OK) panic("timetravel: cannot list keyframe pages");
 }
 
 static void build_one(void* c, uint64_t va, pte_t* pte) {
     build_ctx_t* b = (build_ctx_t*)c;
-    add_page(b->m, b->pid, va, (*pte & PAGE_KF_KNOWN) != 0, 0);
+    uint64_t frame = *pte & LP_PTE_ADDR_MASK;
+    if (frame_shared(frame)) {
+        /* A shared frame's slot is found by the frame; its content is read
+         * through the page that first named it. */
+        add_page(b->m, b->pid, va, (*pte & PAGE_KF_KNOWN) != 0, frame, false);
+        return;
+    }
+    add_page(b->m, b->pid, va, (*pte & PAGE_KF_KNOWN) != 0, 0, false);
 }
 
 /* Provider pages: decided and marked unchanged in one pass (no COW: the
  * provider announces its writes). */
 static void build_prov(void* c, uint32_t pid, uint64_t va, uint64_t* entry) {
     build_ctx_t* b = (build_ctx_t*)c;
-    add_page(b->m, pid, va, (*entry & PROV_KNOWN) != 0, *entry & ~0xFFFULL);
+    add_page(b->m, pid, va, (*entry & PROV_KNOWN) != 0, *entry & ~0xFFFULL, true);
     *entry |= PROV_KNOWN;
 }
 
@@ -287,6 +330,7 @@ void kfp_begin_take(void) {
         build_ctx_t b = { &g_mf[i].m, 0 };
         g_prov->pages(build_prov, &b);
     }
+    dd_clear();
     g_mf[i].used = true;
     g_mf[i].committed = false;
     g_open = i;
@@ -304,7 +348,7 @@ static void mark_one(void* c, uint64_t va, pte_t* pte) {
     while (m->r && m->r->end_addr <= va) m->r = m->r->next;
     bool writable = m->r && va >= m->r->start_addr && (m->r->flags & VMM_FLAG_WRITE);
     pte_t e = *pte;
-    if (writable && (e & PAGE_WRITABLE)) {
+    if (writable && (e & (PAGE_WRITABLE | PAGE_FORK_COW)) && !(e & PAGE_SNAPSHOT_COW)) {
         e = (e & ~(pte_t)PAGE_WRITABLE) | PAGE_SNAPSHOT_COW;
         m->marked++;
     }
@@ -421,6 +465,7 @@ typedef struct {
 static void harvest_one(void* c, uint64_t va, pte_t* pte) {
     harv_ctx_t* h = (harv_ctx_t*)c;
     if (!(*pte & PAGE_KF_KNOWN)) return;
+    if (frame_shared(*pte & LP_PTE_ADDR_MASK)) return;   /* another space maps it too */
     uint32_t id = ref_slot(h->pid, va);
     if (id == PS_NONE) return;
     if (!h->take) {

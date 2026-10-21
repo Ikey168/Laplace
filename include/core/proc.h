@@ -66,6 +66,15 @@ process_t* proc_next_ready(const process_t* p);
 /* pid counter, captured in keyframes so a restored machine keeps numbering. */
 uint32_t proc_next_pid(void);
 void     proc_set_next_pid(uint32_t pid);
+/* Use the next pid (fork). */
+uint32_t proc_take_pid(void);
+/* Processes not yet exited (zombies excluded). */
+uint32_t proc_live_count(void);
+/* Replace p's program with `image` (#248): a fresh address space, registers,
+ * and FPU/TLS state, the arguments and environment on the new stack. On
+ * failure p is unchanged. Returns 0 or -errno. */
+int      proc_exec(process_t* p, const lp_image_t* image, uint32_t argc, const char* const* argv,
+                   uint32_t envc, const char* const* envp);
 
 /* Build an empty process with a given pid (restore path). */
 process_t* proc_alloc(uint32_t pid, const char* name);

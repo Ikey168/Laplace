@@ -16,6 +16,8 @@
 #include "core/vm.h"
 #include "core/kfpages.h"
 #include "core/kio.h"
+#include "core/pctl.h"
+#include "core/files.h"
 #include "core/clock.h"
 #include "iorec.h"
 
@@ -289,13 +291,52 @@ void machine_stop_diverged(void) {
     for (;;) {}
 }
 
-void machine_terminate(process_t* p, int code) {
-    (void)code;
+/* p is gone: with a living parent it waits as a zombie for wait4 (#248);
+ * its own children go to pid 1, or are destroyed if no one can reap them. */
+static void end_process(process_t* p, uint32_t status) {
     tt_before_process_exit(p);
+    process_t* init = proc_by_pid(1);
+    bool init_reaps = init && init != p && init->state != PROCESS_STATE_ZOMBIE;
+    for (uint32_t i = 0; i < proc_count();) {
+        process_t* c = proc_at(i);
+        if (c->ppid != p->pid || c == p) { i++; continue; }
+        c->ppid = init_reaps ? 1 : 0;
+        if (!init_reaps && c->state == PROCESS_STATE_ZOMBIE) {
+            proc_destroy(c);                 /* the table shifted: same index */
+            continue;
+        }
+        if (init_reaps && c->state == PROCESS_STATE_ZOMBIE) pctl_child_exited(c);
+        i++;
+    }
     process_t* next = proc_next_ready(p);
     if (next == p) next = 0;
     if (g_cur == p) g_cur = next;
-    proc_destroy(p);
+    process_t* parent = p->ppid ? proc_by_pid((uint32_t)p->ppid) : 0;
+    if (!parent || parent->state == PROCESS_STATE_ZOMBIE) {
+        proc_destroy(p);
+        return;
+    }
+    /* A zombie keeps its pid and status, and nothing else. */
+    files_proc_gone(p);
+    machine_fpu_forget(p);
+    vm_space_t* empty = vmm_create_address_space((uint32_t)p->pid);
+    vmm_destroy_address_space(p->address_space);
+    p->address_space = empty;
+    p->state = PROCESS_STATE_ZOMBIE;
+    p->wait_status = status;
+    p->wait_reason = 0;
+    p->wait_obj = 0;
+    p->wait_deadline = 0;
+    p->wait_aux = 0;
+    pctl_child_exited(p);
+}
+
+void machine_terminate(process_t* p, int code) {
+    end_process(p, ((uint32_t)code & 0xFF) << 8);
+}
+
+void machine_kill(process_t* p, uint32_t sig) {
+    end_process(p, sig & 0x7F);
 }
 
 /* ---- Blocking and idle (#246) ---- */
@@ -538,8 +579,8 @@ static after_t handle_entry(void) {
             emulate(p, kind, len);
             return AFTER_CONTINUE;
         }
-        /* A fault that was reported (or replayed): the process dies. */
-        machine_terminate(p, -1);
+        /* A fault that was reported (or replayed): the process dies of it. */
+        machine_kill(p, g_pending.vector == VEC_PAGE_FAULT ? 11 /* SIGSEGV */ : 4 /* SIGILL */);
         return AFTER_SWITCHED;
     }
 
@@ -660,7 +701,7 @@ static bool stop_at_entry(void) {
         stop_here(STOP_BREAK, g_cur->context.rdi);
         return true;
     }
-    if (entry_is_exit() && proc_count() == 1) {
+    if (entry_is_exit() && proc_live_count() == 1) {
         stop_here(STOP_EXITED, g_cur->context.rdi);
         return true;
     }
@@ -808,8 +849,7 @@ void trap_dispatch(trap_frame_t* f) {
         /* A user write to a present page: a snapshot-COW capture is invisible
          * to the program and is not a step. */
         uint64_t cr2 = read_cr2();
-        kfp_before_write(g_cur->address_space, cr2);
-        if (checkpoint_handle_write_fault(g_cur->address_space, cr2)) return;
+        if (vmm_user_write_fault(g_cur->address_space, cr2)) return;
     }
     if (f->vector == VEC_PAGE_FAULT && !(f->error & 0x1)) {
         /* First touch of a page in a region that allows the access (#239):

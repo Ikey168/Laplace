@@ -4,6 +4,7 @@
 #include "core/mm.h"
 #include "core/vm.h"
 #include "core/files.h"
+#include "core/timetravel.h"
 #include "core/console.h"
 #include "process_manager.h"
 #include "core/machine.h"
@@ -34,6 +35,7 @@ extern const uint8_t user_image_musl_bigmem[], user_image_musl_bigmem_end[];
 extern const uint8_t user_image_musl_fileprobe[], user_image_musl_fileprobe_end[];
 extern const uint8_t user_image_musl_inputprobe[], user_image_musl_inputprobe_end[];
 extern const uint8_t user_image_musl_sleeper[], user_image_musl_sleeper_end[];
+extern const uint8_t user_image_musl_forkexec[], user_image_musl_forkexec_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -50,6 +52,7 @@ static const lp_image_t g_images[] = {
     { "musl_fileprobe", user_image_musl_fileprobe, user_image_musl_fileprobe_end, true },
     { "musl_inputprobe", user_image_musl_inputprobe, user_image_musl_inputprobe_end, true },
     { "musl_sleeper", user_image_musl_sleeper, user_image_musl_sleeper_end, true },
+    { "musl_forkexec", user_image_musl_forkexec, user_image_musl_forkexec_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {
@@ -138,6 +141,13 @@ uint32_t proc_image_crc(const lp_image_t* img) {
 uint32_t proc_count(void) { return g_count; }
 process_t* proc_at(uint32_t i) { return i < g_count ? g_table[i] : 0; }
 uint32_t proc_next_pid(void) { return g_next_pid; }
+uint32_t proc_take_pid(void) { return g_next_pid++; }
+
+uint32_t proc_live_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_count; i++) n += g_table[i]->state != PROCESS_STATE_ZOMBIE;
+    return n;
+}
 void proc_set_next_pid(uint32_t pid) { g_next_pid = pid; }
 
 process_t* proc_by_pid(uint32_t pid) {
@@ -463,6 +473,50 @@ process_t* proc_spawn_args(const lp_image_t* image, uint32_t argc, const char* c
     p->state = PROCESS_STATE_READY;
     proc_append(p);
     return p;
+}
+
+int proc_exec(process_t* p, const lp_image_t* image, uint32_t argc, const char* const* argv,
+              uint32_t envc, const char* const* envp) {
+    /* A pending keyframe writeback reads the old pages through p. */
+    tt_before_mapping_change();
+    vm_space_t* old = p->address_space;
+    vm_space_t* fresh = vmm_create_address_space((uint32_t)p->pid);
+    if (!fresh) return -12;
+    /* Keep what load_elf overwrites, in case the image does not load. */
+    static process_context_t saved_ctx;
+    static lp_arch_t saved_arch;
+    uint64_t saved_stack[3] = { p->entry_point, p->stack_start, p->stack_end };
+    saved_ctx = p->context;
+    memcpy(&saved_arch, p->arch, sizeof(saved_arch));
+    p->address_space = fresh;
+    proc_args_t args = { argc, argv, envc, envp };
+    if (!load_elf(p, image->start, (uint64_t)(image->end - image->start), image->linux_abi, &args)) {
+        p->address_space = old;
+        vmm_destroy_address_space(fresh);
+        p->context = saved_ctx;
+        memcpy(p->arch, &saved_arch, sizeof(saved_arch));
+        p->entry_point = saved_stack[0];
+        p->stack_start = saved_stack[1];
+        p->stack_end = saved_stack[2];
+        return -8;                                   /* ENOEXEC */
+    }
+    /* New TLS and FPU state; the break load_elf set stays. */
+    lp_arch_t* a = proc_arch(p);
+    uint64_t brk_start = a->brk_start, brk_cur = a->brk_cur;
+    machine_fpu_forget(p);
+    memset(a, 0, sizeof(*a));
+    fpu_area_init(a->fpu);
+    a->brk_start = brk_start;
+    a->brk_cur = brk_cur;
+    vmm_destroy_address_space(old);
+    const char* base = basename_of(image->name);
+    memset(p->name, 0, sizeof(p->name));
+    for (int i = 0; base[i] && i < MAX_PROCESS_NAME - 1; i++) p->name[i] = base[i];
+    memset(p->exe_path, 0, sizeof(p->exe_path));
+    for (uint32_t i = 0; image->name[i] && i < sizeof(p->exe_path) - 1; i++) p->exe_path[i] = image->name[i];
+    p->exe_crc = proc_image_crc(image);
+    machine_load_segment_bases(p);
+    return 0;
 }
 
 process_t* proc_spawn(const lp_image_t* image) {

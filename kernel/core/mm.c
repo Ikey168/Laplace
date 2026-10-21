@@ -323,10 +323,110 @@ int vmm_map_page(vm_space_t* space, uint64_t va, uint64_t pa, uint32_t flags) {
     return 0;
 }
 
+/* ---- Shared frames (#248) ----
+ * Open addressing over (frame, references) for the frames with more than one;
+ * deletion shifts the probe chain back. */
+static uint64_t* g_sh_frame;
+static uint32_t* g_sh_refs;
+static uint32_t  g_sh_cap, g_sh_count;
+
+static uint32_t sh_slot(uint64_t phys) {
+    uint32_t h = (uint32_t)((phys >> 12) * 2654435761u) & (g_sh_cap - 1);
+    while (g_sh_frame[h] && g_sh_frame[h] != phys) h = (h + 1) & (g_sh_cap - 1);
+    return h;
+}
+
+static void sh_grow(void) {
+    uint32_t cap = g_sh_cap ? g_sh_cap * 2 : 4096;
+    uint64_t* of = g_sh_frame;
+    uint32_t* orf = g_sh_refs;
+    uint32_t ocap = g_sh_cap;
+    g_sh_frame = (uint64_t*)kzalloc((uint64_t)cap * sizeof(uint64_t));
+    g_sh_refs = (uint32_t*)kzalloc((uint64_t)cap * sizeof(uint32_t));
+    if (!g_sh_frame || !g_sh_refs) panic("mm: out of memory for shared frames");
+    g_sh_cap = cap;
+    for (uint32_t i = 0; i < ocap; i++) {
+        if (!of[i]) continue;
+        uint32_t s = sh_slot(of[i]);
+        g_sh_frame[s] = of[i];
+        g_sh_refs[s] = orf[i];
+    }
+    if (of) { kfree(of); kfree(orf); }
+}
+
+void frame_share(uint64_t phys) {
+    phys &= LP_PTE_ADDR_MASK;
+    if (g_sh_count + 1 > g_sh_cap / 2) sh_grow();
+    uint32_t s = sh_slot(phys);
+    if (g_sh_frame[s]) {
+        g_sh_refs[s]++;
+    } else {
+        g_sh_frame[s] = phys;
+        g_sh_refs[s] = 2;
+        g_sh_count++;
+    }
+}
+
+bool frame_shared(uint64_t phys) {
+    if (!g_sh_count) return false;
+    return g_sh_frame[sh_slot(phys & LP_PTE_ADDR_MASK)] != 0;
+}
+
+void frame_put(uint64_t phys) {
+    phys &= LP_PTE_ADDR_MASK;
+    if (g_sh_count) {
+        uint32_t s = sh_slot(phys);
+        if (g_sh_frame[s]) {
+            if (--g_sh_refs[s] > 1) return;
+            /* One owner left: forget it, and close the gap in the chain. */
+            g_sh_frame[s] = 0;
+            g_sh_refs[s] = 0;
+            g_sh_count--;
+            uint32_t i = (s + 1) & (g_sh_cap - 1);
+            while (g_sh_frame[i]) {
+                uint64_t f = g_sh_frame[i];
+                uint32_t r = g_sh_refs[i];
+                g_sh_frame[i] = 0;
+                g_sh_refs[i] = 0;
+                uint32_t t = sh_slot(f);
+                g_sh_frame[t] = f;
+                g_sh_refs[t] = r;
+                i = (i + 1) & (g_sh_cap - 1);
+            }
+            return;
+        }
+    }
+    pmm_free(phys);
+}
+
+bool vmm_user_write_fault(vm_space_t* space, uint64_t va) {
+    uint64_t page = va & ~0xFFFULL;
+    pte_t* pte = vmm_get_page_table(space, page, PT_LEVEL, false);
+    if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER)) return false;
+    if (!(*pte & (PAGE_SNAPSHOT_COW | PAGE_FORK_COW))) return false;
+    if (*pte & PAGE_SNAPSHOT_COW) {
+        kfp_before_write(space, page);
+        if (!checkpoint_handle_write_fault(space, page)) return false;
+    }
+    if (*pte & PAGE_FORK_COW) {
+        uint64_t old = *pte & LP_PTE_ADDR_MASK;
+        if (frame_shared(old)) {
+            uint64_t n = pmm_alloc();
+            if (!n) return false;
+            memcpy(P2V(n), P2V(old), PAGE_SIZE);
+            frame_put(old);
+            *pte = (*pte & ~LP_PTE_ADDR_MASK) | n;
+        }
+        *pte = (*pte & ~(pte_t)(PAGE_FORK_COW | PAGE_KF_KNOWN)) | PAGE_WRITABLE;
+    }
+    if (space == g_current) invlpg(page);
+    return true;
+}
+
 int vmm_unmap_page(vm_space_t* space, uint64_t va) {
     pte_t* pte = vmm_get_page_table(space, va & ~0xFFFULL, PT_LEVEL, false);
     if (!pte || !(*pte & PAGE_PRESENT)) return -1;
-    pmm_free(*pte & LP_PTE_ADDR_MASK);
+    frame_put(*pte & LP_PTE_ADDR_MASK);
     *pte = 0;
     if (space == g_current) invlpg(va);
     space->page_count--;
@@ -399,7 +499,7 @@ void vmm_destroy_address_space(vm_space_t* space) {
                 if (!(pd[i2] & PAGE_PRESENT)) continue;
                 pte_t* pt = table_at(pd[i2]);
                 for (int i1 = 0; i1 < 512; i1++) {
-                    if (pt[i1] & PAGE_PRESENT) pmm_free(pt[i1] & LP_PTE_ADDR_MASK);
+                    if (pt[i1] & PAGE_PRESENT) frame_put(pt[i1] & LP_PTE_ADDR_MASK);
                 }
                 pmm_free(pd[i2] & LP_PTE_ADDR_MASK);
             }
@@ -484,10 +584,8 @@ bool uaccess_write(vm_space_t* space, uint64_t uaddr, const void* src, uint64_t 
         }
         if (!(*pte & PAGE_USER)) return false;
         if (!(*pte & PAGE_WRITABLE)) {
-            /* A snapshot-COW page: preserve the pre-write image first. */
-            if (!(*pte & PAGE_SNAPSHOT_COW)) return false;
-            kfp_before_write(space, uaddr);
-            if (!checkpoint_handle_write_fault(space, uaddr)) return false;
+            /* Snapshot or fork COW: preserve the image, unshare the frame. */
+            if (!vmm_user_write_fault(space, uaddr)) return false;
         }
         uint64_t phys = (*pte & LP_PTE_ADDR_MASK) | (uaddr & 0xFFF);
         uint64_t chunk = PAGE_SIZE - (uaddr & 0xFFF);

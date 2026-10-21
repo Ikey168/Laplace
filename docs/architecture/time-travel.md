@@ -135,6 +135,20 @@ the kernel halts with interrupts enabled until a wake is due or a debugger
 asks to stop: idle time adds no steps. `nanosleep` and `clock_nanosleep` use
 this; futexes, `wait4`, `poll`, and console input reuse it.
 
+**Processes** (#248, `include/core/pctl.h`). `fork` (and `vfork`, `clone`
+without `CLONE_VM`) shares every frame read-only between parent and child
+with `PAGE_FORK_COW`; a table of shared frames counts their mappings, and
+the first write copies the frame. Snapshot COW and fork COW meet in one
+write-fault path (`vmm_user_write_fault`): the keyframe image is captured
+first, then the frame is unshared; a keyframe stores a shared frame in one
+pool slot. `execve` loads through the loader into a fresh address space,
+then closes close-on-exec descriptors. An exiting process with a living
+parent stays a zombie (pid and wait status) until `wait4` reaps it, and a
+parent already waiting is woken at once; orphans go to pid 1. `kill` ends
+the target with the signal's status until handlers arrive (#250). The pid
+counter, the parent links, the zombies' statuses, and the wait4 operands are
+kernel state.
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the

@@ -36,6 +36,10 @@ void files_init(const uint8_t* seed, uint64_t len, const char* seed_name);
  * cwd; a destroyed one closes everything. */
 void files_proc_new(process_t* p);
 void files_proc_gone(process_t* p);
+/* fork: the child shares the parent's open descriptions (#248). */
+void files_fork(process_t* parent, process_t* child);
+/* execve: close the close-on-exec descriptors. */
+void files_exec(process_t* p);
 
 /* Handle a Linux file system call. False if `nr` is not one. */
 bool files_syscall(process_t* p, uint64_t nr, int64_t* ret);

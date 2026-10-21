@@ -50,6 +50,8 @@ static void procs_save(ksf_writer_t* w, void* ctx) {
         ksf_put_u32(w, p->wait_reason);          /* v2: the wait (#246) */
         ksf_put_u64(w, p->wait_obj);
         ksf_put_u64(w, p->wait_deadline);
+        ksf_put_u64(w, p->wait_aux);             /* v3: wait4's status pointer, */
+        ksf_put_u32(w, p->wait_status);          /*     a zombie's status (#248) */
         ksf_put_u32(w, p->address_space->region_count);
         for (vm_region_t* r = p->address_space->regions; r; r = r->next) {
             char name[REGION_NAME];
@@ -66,7 +68,7 @@ static void procs_save(ksf_writer_t* w, void* ctx) {
 
 static int procs_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
     (void)ctx;
-    if (version != 1 && version != 2) return -1;
+    if (version < 1 || version > 3) return -1;
     vmm_switch_address_space(0);
     proc_destroy_all();
     uint32_t n = ksf_get_u32(r);
@@ -89,6 +91,10 @@ static int procs_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
             p->wait_reason = ksf_get_u32(r);
             p->wait_obj = ksf_get_u64(r);
             p->wait_deadline = ksf_get_u64(r);
+        }
+        if (version >= 3) {
+            p->wait_aux = ksf_get_u64(r);
+            p->wait_status = ksf_get_u32(r);
         }
         uint32_t nreg = ksf_get_u32(r);
         for (uint32_t k = 0; k < nreg && r->ok; k++) {
@@ -206,7 +212,7 @@ static uint32_t probe_sum(void* ctx) {
 
 void kstate_init(void) {
     static const ksf_subsys_t builtin[] = {
-        { KS_ID_PROCS,   "procs",   2, procs_save,   procs_restore,   0, 0 },
+        { KS_ID_PROCS,   "procs",   3, procs_save,   procs_restore,   0, 0 },
         { KS_ID_CPUID,   "cpuid",   1, cpuid_save,   cpuid_restore,   0, 0 },
         { KS_ID_CLOCK,   "clock",   1, clock_save,   clock_restore,   0, 0 },
         { KS_ID_MACHINE, "machine", 1, machine_save, machine_restore, 0, 0 },
