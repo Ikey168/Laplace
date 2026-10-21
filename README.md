@@ -192,6 +192,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Replay by re-executing the processes to any (epoch, step, instruction) | e2e, `make selftest` |
 | Byte-exact verification of every retained epoch; a perturbed replay is caught | `make selftest`, `verify_replay`, `monitor verify` |
 | Raw `rdtsc`/`rdtscp`/`cpuid` in user code replay exactly; a divergence names the instruction that caused it | `tests/qemu/determinism_gate.sh` |
+| x87/SSE/AVX state survives preemption, is in every keyframe, and is part of what replay verifies | `tests/qemu/fpu_gate.sh`, `make selftest` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
@@ -211,8 +212,8 @@ Limits, stated plainly:
   the instruction and its address (#241).
 - Every keyframe is a full copy of every user page into a 1 MiB slot (at most
   227 pages), so the recorded machine must fit in under 1 MiB (#244).
-- Programs may not use x87/SSE state; user programs build with
-  `-mgeneral-regs-only`.
+- x87, SSE, and AVX state is saved and verified (#237); AVX-512 is not enabled
+  in XCR0, so programs see no AVX-512.
 - Workloads are the programs embedded in the kernel (`user/laplace/`).
 - Recorded history is read-only from the debuggers.
 
@@ -298,7 +299,6 @@ included) is tracked in #235. Its main steps:
 
 - Incremental keyframes that write only dirtied pages, so keyframes scale to
   real memory sizes (#244)
-- x87/SSE state in contexts and keyframes (#237)
 - The Linux system call interface, a loader for programs not embedded in the
   kernel, and `brk`/`mmap` (#238, #240, #239)
 - Journal device input (keyboard, disk completions) so interactive programs

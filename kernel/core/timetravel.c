@@ -321,6 +321,7 @@ static void close_epoch(uint64_t epoch, uint64_t steps) {
 
 static void take_keyframe(void) {
     uint64_t steps = machine_step();
+    machine_fpu_flush();
     do_writeback();
     if (machine_epoch() > 0) close_epoch(machine_epoch(), steps);
 
@@ -390,8 +391,11 @@ bool tt_window(tt_window_t* w) {
 
 typedef struct {
     uint32_t pid;
-    process_context_t ctx;
+    uint8_t  page[PAGE_SIZE];     /* process_context_t + lp_arch_t (#237) */
 } saved_ctx_t;
+
+static bool g_perturb_xmm;
+void tt_perturb_next_restore(bool on) { g_perturb_xmm = on; }
 
 int tt_restore_keyframe(uint64_t epoch) {
     keyframe_store_t* ks = keyframe_store_get();
@@ -422,7 +426,7 @@ int tt_restore_keyframe(uint64_t epoch) {
         } else if (rec.flags & CHECKPOINT_REC_CONTEXT) {
             if (nctx >= LP_MAX_PROCS) return TT_ERR_RESTORE;
             ctxs[nctx].pid = rec.pid;
-            memcpy(&ctxs[nctx].ctx, g_pagebuf, sizeof(process_context_t));
+            memcpy(ctxs[nctx].page, g_pagebuf, PAGE_SIZE);
             nctx++;
         }
     }
@@ -444,7 +448,12 @@ int tt_restore_keyframe(uint64_t epoch) {
                               (vmm_region_type_t)kr->type, kr->name);
         }
         for (uint32_t c = 0; c < nctx; c++) {
-            if (ctxs[c].pid == kp->pid) p->context = ctxs[c].ctx;
+            if (ctxs[c].pid == kp->pid) proc_context_load(p, ctxs[c].page);
+        }
+        if (g_perturb_xmm && i == 0) {
+            /* Test hook: flip a bit of XMM15, which programs rarely touch. */
+            g_perturb_xmm = false;
+            proc_arch(p)->fpu[FPU_XMM_OFFSET + 15 * 16] ^= 0x01;
         }
         proc_append(p);
     }

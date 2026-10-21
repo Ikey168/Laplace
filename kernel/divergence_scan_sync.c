@@ -10,7 +10,7 @@
  * The component sources cover what "byte-exact" means for the recorded machine
  * (#225): the process table, the scheduler (current process, run order, and the
  * pending kernel entry), the contents of every mapped user page, and every
- * process's saved registers. Physical addresses and page-table permission bits
+ * process's saved registers, including its x87/SSE/AVX state (#237). Physical addresses and page-table permission bits
  * are excluded: a restored machine maps the same contents at the same virtual
  * addresses through different frames, and copy-on-write marking changes
  * permissions without changing anything a program can observe.
@@ -104,6 +104,7 @@ static uint32_t sum_user_pages(void* ctx) {
 static uint32_t sum_contexts(void* ctx) {
     (void)ctx;
     uint32_t crc = 0;
+    machine_fpu_flush();
     for (uint32_t i = 0; i < proc_count(); i++) {
         const process_context_t* c = &proc_at(i)->context;
         uint64_t regs[19] = {
@@ -112,6 +113,8 @@ static uint32_t sum_contexts(void* ctx) {
             c->rip, c->rflags & 0xED5ULL, (uint64_t)proc_at(i)->pid,
         };
         crc = divergence_checksum(crc, regs, sizeof(regs));
+        /* x87/SSE/AVX state (#237). */
+        if (proc_at(i)->arch) crc = fpu_checksum(crc, proc_arch(proc_at(i))->fpu);
     }
     return crc;
 }

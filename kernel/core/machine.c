@@ -190,6 +190,26 @@ static void load_hwbps(const process_t* p) {
     write_dr(7, dr7);
 }
 
+/* ---- x87/SSE/AVX ownership (#237) ---- */
+
+/* The process whose state the FPU registers hold (see core/fpu.h). */
+static process_t* g_fpu_owner;
+
+void machine_fpu_flush(void) {
+    if (g_fpu_owner) fpu_save(proc_arch(g_fpu_owner)->fpu);
+}
+
+void machine_fpu_forget(process_t* p) {
+    if (g_fpu_owner == p) g_fpu_owner = 0;
+}
+
+static void fpu_switch_to(process_t* p) {
+    if (g_fpu_owner == p) return;
+    if (g_fpu_owner) fpu_save(proc_arch(g_fpu_owner)->fpu);
+    fpu_restore(proc_arch(p)->fpu);
+    g_fpu_owner = p;
+}
+
 /* ---- Stops ---- */
 
 static void stop_here(stop_reason_t reason, uint64_t code) {
@@ -202,6 +222,7 @@ static void stop_here(stop_reason_t reason, uint64_t code) {
     g_stop.code = code;
     g_stepping = false;
     write_dr(7, 0);
+    machine_fpu_flush();   /* debuggers read the saved areas */
 }
 
 /* ---- Entering user mode ---- */
@@ -213,6 +234,7 @@ static trap_frame_t* frame_slot(void) {
 /* Load the current process's registers into `f` and its address space. */
 static void load_current(trap_frame_t* f) {
     ctx_to_frame(&g_cur->context, f);
+    fpu_switch_to(g_cur);
     if (g_stepping) f->rflags |= RFLAGS_TF;
     vmm_switch_address_space(g_cur->address_space);
     load_hwbps(g_cur);

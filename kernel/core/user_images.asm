@@ -17,5 +17,6 @@ USER_IMAGE counter
 USER_IMAGE hello
 USER_IMAGE tscprobe
 USER_IMAGE rdrandleak
+USER_IMAGE fpuprobe
 
 section .note.GNU-stack noalloc noexec nowrite progbits

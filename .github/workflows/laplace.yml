@@ -106,6 +106,8 @@ jobs:
         run: make selftest
       - name: Raw RDTSC/CPUID replay exactly; an RDRAND leak is located (in QEMU)
         run: bash tests/qemu/determinism_gate.sh
+      - name: x87/SSE/AVX state survives preemption and is verified (in QEMU)
+        run: bash tests/qemu/fpu_gate.sh
       - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
         run: python3 tests/qemu/timetravel_e2e.py
       - name: Power cut and resume on the IDE disk (in QEMU)

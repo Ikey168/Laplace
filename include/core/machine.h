@@ -151,6 +151,11 @@ bool machine_trace_mismatch(uint64_t* step);
 typedef void (*machine_insn_hook_fn)(void* ctx, process_t* p, uint64_t rip);
 void machine_set_insn_hook(machine_insn_hook_fn fn, void* ctx);
 
+/* #237: write the FPU owner's registers into its saved area (before reading
+ * or capturing areas), and drop a process that is going away as the owner. */
+void machine_fpu_flush(void);
+void machine_fpu_forget(process_t* p);
+
 /* Console output from user processes is suppressed while replaying. */
 bool machine_quiet(void);
 

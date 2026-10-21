@@ -31,6 +31,7 @@ static journal_reader_t g_reader;
 static bool             g_reader_ok;
 static uint64_t         g_insn_target;
 static bool             g_perturb;
+static bool             g_perturb_applied;
 
 static int src_begin_epoch(void* ctx, uint64_t epoch) {
     (void)ctx;
@@ -72,6 +73,11 @@ static int drv_load_subsystems(uint64_t epoch,
         if (n_entropy == 0) {
             for (uint32_t i = 0; i < n_times; i++) g_driver.times[i] += 1000000;
         }
+        if (n_entropy == 0 && n_times == 0 && n_pts > 0) {
+            /* No clock or entropy: move the first preemption one step later. */
+            g_driver.pts[0] += 1;
+        }
+        g_perturb_applied = n_entropy || n_times || n_pts;
     }
     return replay_load_subsystems(epoch, pts, n_pts, times, n_times, entropy, n_entropy);
 }
@@ -103,6 +109,11 @@ void replay_set_insn_target(uint64_t insn) {
 
 void replay_perturb_next(bool on) {
     g_perturb = on;
+    if (on) g_perturb_applied = false;
+}
+
+bool replay_perturb_applied(void) {
+    return g_perturb_applied;
 }
 
 /* Load `epoch`'s journal into the wrappers without restoring or running. */

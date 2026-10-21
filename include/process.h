@@ -169,6 +169,11 @@ typedef struct process {
     /* Process arguments */
     char** argv;                        /* Command line arguments */
     char** envp;                        /* Environment variables */
+
+    /* Laplace core (#237): FS/GS base and the x87/SSE/AVX area (lp_arch_t,
+     * include/core/proc.h), and the allocation it lives in. */
+    void* arch;
+    void* arch_block;
 } process_t;
 
 /* Process management functions */

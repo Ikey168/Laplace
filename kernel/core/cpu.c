@@ -2,6 +2,7 @@
 
 #include "core/cpu.h"
 #include "core/console.h"
+#include "core/fpu.h"
 
 /* ---- GDT + TSS ---- */
 
@@ -109,6 +110,7 @@ void cpu_init(void) {
     idt_init();
     /* User RDTSC/RDTSCP fault and are emulated from the journaled clock. */
     write_cr4(read_cr4() | CR4_TSD);
+    fpu_init();
 }
 
 /* ---- MSRs that may not exist ---- */
@@ -174,7 +176,9 @@ static void mask_leaf(cpuid_entry_t* e) {
          * hypervisor bit. No RDRAND (untrappable), no XSAVE/AVX/FMA/F16C until
          * their state is saved (#237). */
         r[2] &= (1u << 0) | (1u << 1) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) |
-                (1u << 22) | (1u << 23) | (1u << 25) | (1u << 31);
+                (1u << 22) | (1u << 23) | (1u << 25) | (1u << 31) |
+                (fpu_has_xsave() ? (1u << 26) | (1u << 27) : 0) |              /* XSAVE OSXSAVE */
+                ((fpu_xcr0() & XCR0_AVX) ? (1u << 12) | (1u << 28) | (1u << 29) : 0);  /* FMA AVX F16C */
         /* No PSN, DS, ACPI, SS, TM, PBE. */
         r[3] &= ~((1u << 18) | (1u << 21) | (1u << 22) | (1u << 27) | (1u << 29) | (1u << 31));
         break;
@@ -186,13 +190,27 @@ static void mask_leaf(cpuid_entry_t* e) {
         r[0] = 0;                      /* no further subleaves */
         /* BMI1 BMI2 ERMS ADX CLFLUSHOPT SHA. No RDSEED (untrappable), no TSX
          * (aborts are nondeterministic), no AVX2/AVX-512 (#237). */
-        r[1] &= (1u << 3) | (1u << 8) | (1u << 9) | (1u << 19) | (1u << 23) | (1u << 29);
+        r[1] &= (1u << 3) | (1u << 8) | (1u << 9) | (1u << 19) | (1u << 23) | (1u << 29) |
+                ((fpu_xcr0() & XCR0_AVX) ? (1u << 5) : 0);                      /* AVX2 */
         r[2] = 0;                      /* no RDPID, WAITPKG, PKU */
         r[3] &= (1u << 4);             /* FSRM */
         break;
     case 0xB:
     case 0x1F:
         r[3] = 0;                      /* x2APIC id 0 */
+        break;
+    case 0xD:
+        /* XSAVE as the kernel enabled it: no XSAVEOPT/XSAVEC/XGETBV1/XSAVES
+         * (subleaf 1), whose optimizations expose the processor's in-use
+         * tracking. */
+        if (!fpu_has_xsave() || (e->sub != 0 && e->sub != 2) ||
+            (e->sub == 2 && !(fpu_xcr0() & XCR0_AVX))) {
+            r[0] = r[1] = r[2] = r[3] = 0;
+        } else if (e->sub == 0) {
+            r[0] = (uint32_t)fpu_xcr0();
+            r[1] = r[2] = fpu_area_size();
+            r[3] = 0;
+        }
         break;
     case 0x80000000:
         if (r[0] > 0x80000008) r[0] = 0x80000008;

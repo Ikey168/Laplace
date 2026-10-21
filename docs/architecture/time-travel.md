@@ -50,6 +50,17 @@ from a keyframe with the journal reproduces the run exactly, unless it
 executes an instruction nothing can trap (`rdrand`, `rdseed`, `rdpid`), which
 the table hides and verification reports.
 
+**Extended state** (#237). The kernel never touches x87/XMM/YMM registers
+(`-mgeneral-regs-only`), so between entries the register file holds the state
+of the last process that ran. Switching to another process saves that state
+and restores the next one's (`kernel/core/fpu.c`); nothing traps, so the steps
+are the same in recording and replay. Saved areas are made canonical
+(components the CPU left in their initial state are written out as such), live
+in a keyframe's context record next to the general registers, and are part of
+the register checksum (control words, MXCSR, ST0-7, XMM0-15, the upper YMM
+halves; the last-instruction pointers are not, as CPUs differ in storing
+them).
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the
@@ -111,8 +122,9 @@ the recording and continues live, still recording.
 - A keyframe is a full copy of every mapped user page, written into one region
   slot of `KF_SLOT_SECTORS` (2048 sectors, at most 227 page records), so the
   recorded machine must fit in under 1 MiB (#244).
-- Programs may not use x87/SSE state (the context switch saves the general
-  registers only); user programs are built with `-mgeneral-regs-only`.
+- x87, SSE, and AVX are saved (XSAVE with XCR0 = x87|SSE|AVX, or FXSAVE);
+  AVX-512 and the XSAVE optimizations (XSAVEOPT, XSAVEC, XGETBV1) are not
+  offered to programs.
 - Recorded history is read-only: gdb memory and register writes are refused.
 - The workloads are the embedded programs in `user/laplace/`.
 - KVM works (`make selftest` passes under `-enable-kvm -cpu host`, checked on a

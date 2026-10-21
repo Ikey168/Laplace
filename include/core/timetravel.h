@@ -159,6 +159,9 @@ int tt_verify(tt_verify_t* out);
 /* Deliberately perturb the next replay (for testing the detector): flip one
  * entropy byte of the loaded journal. */
 void tt_perturb_next_replay(bool on);
+/* Flip one bit of the first process's XMM15 in the next restored keyframe
+ * (#237): the extended state must be part of what verification compares. */
+void tt_perturb_next_restore(bool on);
 
 /* ---- Boot resume (#231) ---- */
 

@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include "process.h"
 #include "core/cpu.h"
+#include "core/fpu.h"
 
 #define LP_MAX_PROCS     16
 #define LP_STACK_TOP     0x80000000ULL
@@ -56,6 +57,22 @@ void     proc_set_next_pid(uint32_t pid);
 /* Build an empty process with a given pid (restore path). */
 process_t* proc_alloc(uint32_t pid, const char* name);
 void       proc_append(process_t* p);
+
+/* Per-process architectural state beyond the general registers (#237). */
+typedef struct {
+    uint64_t fs_base;
+    uint64_t gs_base;
+    uint8_t  reserved[48];
+    uint8_t  fpu[FPU_AREA_MAX];      /* 64-byte aligned: lp_arch_t is */
+} __attribute__((aligned(64))) lp_arch_t;
+
+static inline lp_arch_t* proc_arch(const process_t* p) { return (lp_arch_t*)p->arch; }
+
+/* A keyframe context record (one page): the process_context_t at 0, the
+ * lp_arch_t at LP_CTX_ARCH_OFFSET. */
+#define LP_CTX_ARCH_OFFSET 256
+uint32_t proc_context_record(process_t* p, uint8_t* page);
+void     proc_context_load(process_t* p, const uint8_t* page);
 
 /* Frame <-> saved context. */
 void ctx_from_frame(process_context_t* c, const trap_frame_t* f);

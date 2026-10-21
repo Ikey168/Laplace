@@ -4,6 +4,7 @@
 #include "core/mm.h"
 #include "core/console.h"
 #include "process_manager.h"
+#include "core/machine.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -21,6 +22,7 @@ extern const uint8_t user_image_counter[], user_image_counter_end[];
 extern const uint8_t user_image_hello[], user_image_hello_end[];
 extern const uint8_t user_image_tscprobe[], user_image_tscprobe_end[];
 extern const uint8_t user_image_rdrandleak[], user_image_rdrandleak_end[];
+extern const uint8_t user_image_fpuprobe[], user_image_fpuprobe_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end },
@@ -29,6 +31,7 @@ static const lp_image_t g_images[] = {
     { "hello",     user_image_hello,     user_image_hello_end },
     { "tscprobe",  user_image_tscprobe,  user_image_tscprobe_end },
     { "rdrandleak", user_image_rdrandleak, user_image_rdrandleak_end },
+    { "fpuprobe",  user_image_fpuprobe,  user_image_fpuprobe_end },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {
@@ -79,14 +82,40 @@ void proc_append(process_t* p) {
     g_table[g_count++] = p;
 }
 
+static bool arch_alloc(process_t* p) {
+    p->arch_block = kzalloc(sizeof(lp_arch_t) + 64);
+    if (!p->arch_block) return false;
+    p->arch = (void*)(((uint64_t)p->arch_block + 63) & ~63ULL);
+    fpu_area_init(proc_arch(p)->fpu);
+    return true;
+}
+
+uint32_t proc_context_record(process_t* p, uint8_t* page) {
+    memset(page, 0, PAGE_SIZE);
+    memcpy(page, &p->context, sizeof(p->context));
+    memcpy(page + LP_CTX_ARCH_OFFSET, p->arch, sizeof(lp_arch_t));
+    return LP_CTX_ARCH_OFFSET + sizeof(lp_arch_t);
+}
+
+void proc_context_load(process_t* p, const uint8_t* page) {
+    memcpy(&p->context, page, sizeof(p->context));
+    memcpy(p->arch, page + LP_CTX_ARCH_OFFSET, sizeof(lp_arch_t));
+    fpu_sanitize(proc_arch(p)->fpu);
+}
+
 process_t* proc_alloc(uint32_t pid, const char* name) {
     process_t* p = (process_t*)kzalloc(sizeof(process_t));
     if (!p) return 0;
+    if (!arch_alloc(p)) {
+        kfree(p);
+        return 0;
+    }
     p->pid = (pid_t)pid;
     for (int i = 0; name && name[i] && i < MAX_PROCESS_NAME - 1; i++) p->name[i] = name[i];
     p->state = PROCESS_STATE_NEW;
     p->address_space = vmm_create_address_space(pid);
     if (!p->address_space) {
+        kfree(p->arch_block);
         kfree(p);
         return 0;
     }
@@ -99,7 +128,9 @@ void proc_destroy(process_t* p) {
         for (uint32_t i = (uint32_t)idx; i + 1 < g_count; i++) g_table[i] = g_table[i + 1];
         g_count--;
     }
+    machine_fpu_forget(p);
     vmm_destroy_address_space(p->address_space);
+    kfree(p->arch_block);
     kfree(p);
 }
 
@@ -197,6 +228,7 @@ process_t* proc_spawn(const lp_image_t* image) {
     if (!p) return 0;
     if (!load_elf(p, image->start, (uint64_t)(image->end - image->start))) {
         vmm_destroy_address_space(p->address_space);
+        kfree(p->arch_block);
         kfree(p);
         return 0;
     }

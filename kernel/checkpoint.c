@@ -664,6 +664,12 @@ int checkpoint_persistence_init(snapshot_store_t* store, fat_block_device_t* dev
 
 /* ----- Take ----- */
 
+static checkpoint_context_fn g_context_fn;
+
+void checkpoint_set_context_fn(checkpoint_context_fn fn) {
+    g_context_fn = fn;
+}
+
 uint64_t checkpoint_take(void) {
     uint64_t epoch = g_checkpoint.current_epoch + 1;
     uint64_t spaces = 0;
@@ -692,7 +698,13 @@ uint64_t checkpoint_take(void) {
         /* Snapshot the process's CPU context now, at the consistent checkpoint
          * point. Unlike pages it is not copy-on-write, so it is captured eagerly
          * (it is tiny); the writeback pass streams it to disk with the pages. */
-        checkpoint_capture_context(proc->pid, &proc->context, sizeof(proc->context));
+        if (g_context_fn) {
+            static uint8_t page[PAGE_SIZE];
+            uint32_t n = g_context_fn(proc, page);
+            checkpoint_capture_context(proc->pid, page, n);
+        } else {
+            checkpoint_capture_context(proc->pid, &proc->context, sizeof(proc->context));
+        }
     }
 
     g_checkpoint.current_epoch = epoch;

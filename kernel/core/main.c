@@ -25,6 +25,7 @@
 #include "divergence.h"
 #include "divergence_scan.h"
 #include "revbreak.h"
+#include "replay_driver.h"
 
 int strncmp(const char* a, const char* b, size_t n);
 size_t strlen(const char* s);
@@ -172,14 +173,34 @@ static bool selftest(void) {
     }
     bool ok = rc == TT_OK && !v.diverged && v.epochs_checked > 0;
 
-    /* The detector must notice a corrupted replay. */
+    process_t* hb = 0;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        if (strncmp(proc_at(i)->name, "heisenbug", 9) == 0) hb = proc_at(i);
+    }
+    /* The detector must notice a corrupted replay. Only the heisenbug's
+     * recording is sure to show it: programs that do not interact end in the
+     * same state under another schedule, and a process that exits takes its
+     * corrupted registers with it. Elsewhere the results are reported. */
+    bool strict = hb != 0;
     tt_verify_t bad;
     tt_perturb_next_replay(true);
     rc = tt_verify(&bad);
-    kprintf("selftest: perturbed replay: %s (epoch %lu component %u)\n",
+    if (!replay_perturb_applied()) {
+        kprintf("selftest: perturbed replay: the oldest epoch has no inputs to perturb (skipped)\n");
+    } else {
+        kprintf("selftest: perturbed replay: %s (epoch %lu component %u)\n",
+                bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
+                bad.first_component);
+        ok = ok && (bad.diverged || !strict);
+    }
+
+    /* ... and a corrupted register in a keyframe's extended state (#237). */
+    tt_perturb_next_restore(true);
+    rc = tt_verify(&bad);
+    kprintf("selftest: perturbed XMM15 in a keyframe: %s (epoch %lu component %u)\n",
             bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
             bad.first_component);
-    ok = ok && bad.diverged;
+    ok = ok && (bad.diverged || !strict);
     tt_verify(&v);   /* back to the end of the recording, clean */
 
     /* A scan of the newest epoch visits every position through the stop
@@ -194,10 +215,6 @@ static bool selftest(void) {
 
     /* Who last wrote the heisenbug's batch_limit? Found by value, to the
      * exact instruction (#228). */
-    process_t* hb = 0;
-    for (uint32_t i = 0; i < proc_count(); i++) {
-        if (strncmp(proc_at(i)->name, "heisenbug", 9) == 0) hb = proc_at(i);
-    }
     if (hb) {
         uint32_t pid = (uint32_t)hb->pid;
         g_watch_pid = pid;
@@ -295,6 +312,9 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     pic_init();
     pit_init(MACHINE_TIMER_HZ);
     kprintf("boot: %lu MiB free, timer %u Hz\n", pmm_free_frames() / 256, MACHINE_TIMER_HZ);
+    kprintf("boot: user FPU state: %s (%u bytes)\n",
+            !fpu_has_xsave() ? "x87+SSE (FXSAVE)" :
+            (fpu_xcr0() & XCR0_AVX) ? "x87+SSE+AVX (XSAVE)" : "x87+SSE (XSAVE)", fpu_area_size());
     kprintf("boot: user rdtsc/rdtscp emulated; user cpuid %s\n",
             cpu_cpuid_faulting() ? "answered from the recorded table (CPUID faulting)"
                                  : "native (no CPUID faulting on this CPU)");
@@ -307,6 +327,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     kdiverge_init();
     kdiverge_register_kernel_sources();
     checkpoint_init();
+    checkpoint_set_context_fn(proc_context_record);
 
     /* Durable store: the first IDE drive, else a volatile RAM disk. */
     fat_block_device_t* dev = checkpoint_ide_boot_bind();
