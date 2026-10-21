@@ -137,7 +137,7 @@ static int ram_read(void* d, uint32_t s, uint32_t n, void* buf) {
     for (uint32_t i = 0; i < n; i++) {
         uint32_t sec = s + i;
         memcpy((uint8_t*)buf + (uint64_t)i * 512,
-               (const void*)(g_ram_frames[sec / 8] + (sec % 8) * 512), 512);
+               P2V(g_ram_frames[sec / 8] + (sec % 8) * 512), 512);
     }
     return 0;
 }
@@ -147,7 +147,7 @@ static int ram_write(void* d, uint32_t s, uint32_t n, const void* buf) {
     if ((uint64_t)s + n > g_ram_sectors) return -1;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t sec = s + i;
-        memcpy((void*)(g_ram_frames[sec / 8] + (sec % 8) * 512),
+        memcpy(P2V(g_ram_frames[sec / 8] + (sec % 8) * 512),
                (const uint8_t*)buf + (uint64_t)i * 512, 512);
     }
     return 0;
@@ -475,7 +475,7 @@ int tt_restore_keyframe(uint64_t epoch) {
                 return TT_ERR_RESTORE;
             }
         }
-        memcpy((void*)(phys & ~0xFFFULL), g_pagebuf, PAGE_SIZE);
+        memcpy(P2V(phys & ~0xFFFULL), g_pagebuf, PAGE_SIZE);
     }
 
     pending_entry_t pe = { kst.pending_vector, kst.pending_error, kst.pending_cr2 };

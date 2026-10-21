@@ -305,10 +305,15 @@ bool checkpoint_handle_write_fault(vm_space_t* space, uint64_t fault_addr) {
         return true;
     }
 
-    /* The faulting page is mapped at page_addr in the current address space,
-     * so its current contents are readable there. */
-    int rc = checkpoint_capture_page(space->owner_pid, page_addr,
-                                     (const void*)page_addr, pte);
+    /* Read the page's current contents. In the booted kernel, through the
+     * direct map (the space need not be the current one); in the host tests,
+     * at page_addr, where the mock space maps it. */
+#ifdef LAPLACE_KERNEL
+    const void* contents = PHYS_TO_VIRT(*pte & 0x000FFFFFFFFFF000ULL);
+#else
+    const void* contents = (const void*)page_addr;
+#endif
+    int rc = checkpoint_capture_page(space->owner_pid, page_addr, contents, pte);
     if (rc != CHECKPOINT_OK) {
         return false;
     }
@@ -361,7 +366,7 @@ static int writeback_clean_pages(snapshot_writer_t* writer) {
                 }
                 /* Physical frames are directly addressable in the kernel, the
                  * same convention vmm.c uses to walk page tables. */
-                memcpy(buf, (const void*)phys, PAGE_SIZE);
+                memcpy(buf, PHYS_TO_VIRT(phys), PAGE_SIZE);
                 uint32_t flags = (action == CHECKPOINT_PAGE_PERSIST_RO)
                                      ? CHECKPOINT_REC_READONLY : 0;
                 if (snapshot_writer_add_page(writer, space->owner_pid, addr, flags,
@@ -553,7 +558,7 @@ static int checkpoint_restore_apply_kernel(void* ctx, const snapshot_page_record
 
     /* Physical frames are directly addressable in the kernel (same convention
      * vmm.c uses); load the checkpointed page contents into the new frame. */
-    memcpy((void*)phys, rec->page_data, PAGE_SIZE);
+    memcpy(PHYS_TO_VIRT(phys), rec->page_data, PAGE_SIZE);
 
     /* Read-only pages (code) are re-mapped without write permission so they keep
      * their original protection; writable pages get PAGE_WRITABLE. */

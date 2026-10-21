@@ -195,7 +195,7 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size) {
             uint64_t va = ph->vaddr + off;
             uint64_t chunk = PAGE_SIZE - (va & 0xFFF);
             if (chunk > ph->filesz - off) chunk = ph->filesz - off;
-            memcpy((void*)vmm_get_physical_addr(s, va), img + ph->offset + off, chunk);
+            memcpy(P2V(vmm_get_physical_addr(s, va)), img + ph->offset + off, chunk);
             off += chunk;
         }
     }

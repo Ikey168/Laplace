@@ -23,7 +23,8 @@ UBUILD  := $(BUILD)/user
 
 # Kernel: freestanding, no SSE/x87 state (the context switch saves only the
 # general registers), -Werror so the bootable build stays green.
-KCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
+KCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie -mcmodel=kernel \
+           -DLAPLACE_KERNEL \
            -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone \
            -mgeneral-regs-only -fno-tree-loop-distribute-patterns \
            -Wall -Wextra -Werror -Iinclude

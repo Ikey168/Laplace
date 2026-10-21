@@ -84,7 +84,7 @@ static void sum_one_page(void* c, uint64_t virt, uint64_t phys, pte_t pte) {
     (void)pte;
     page_sum_t* s = (page_sum_t*)c;
     s->crc = divergence_checksum(s->crc, &virt, sizeof(virt));
-    s->crc = divergence_checksum(s->crc, (const void*)phys, PAGE_SIZE);
+    s->crc = divergence_checksum(s->crc, P2V(phys), PAGE_SIZE);
 }
 static uint32_t sum_user_pages(void* ctx) {
     (void)ctx;

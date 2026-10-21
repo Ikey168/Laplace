@@ -303,12 +303,12 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     kprintf("\nLaplace: a time-traveling debugger built as an operating system\n");
     if (mb_magic != 0x2BADB002) panic("not booted by a Multiboot loader (magic %x)", mb_magic);
 
-    const uint32_t* mbi = (const uint32_t*)(uint64_t)mb_info;
-    parse_cmdline((mbi[0] & MB_FLAG_CMDLINE) ? (const char*)(uint64_t)mbi[4] : 0);
+    const uint32_t* mbi = (const uint32_t*)P2V(mb_info);
+    parse_cmdline((mbi[0] & MB_FLAG_CMDLINE) ? (const char*)P2V(mbi[4]) : 0);
 
     cpu_init();
     cpu_cpuid_init();
-    mm_init(mb_info);
+    mm_init(mbi);
     pic_init();
     pit_init(MACHINE_TIMER_HZ);
     kprintf("boot: %lu MiB free, timer %u Hz\n", pmm_free_frames() / 256, MACHINE_TIMER_HZ);

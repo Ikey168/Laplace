@@ -10,6 +10,15 @@
 
 /* Page size and alignment */
 #define PAGE_SIZE           4096
+
+/* A physical frame as the code reading it sees it (#238): through the
+ * kernel's direct map in the booted kernel, the address itself in the host
+ * tests (whose mock frames are ordinary host memory). */
+#ifdef LAPLACE_KERNEL
+#define PHYS_TO_VIRT(p) ((void*)((uint64_t)(p) + 0xFFFF800000000000ULL))
+#else
+#define PHYS_TO_VIRT(p) ((void*)(uintptr_t)(p))
+#endif
 #define PAGE_ALIGN(addr)    (((addr) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 #define PAGE_FRAME(addr)    ((addr) >> 12)
 #define FRAME_ADDR(frame)   ((frame) << 12)
