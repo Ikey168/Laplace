@@ -1,0 +1,32 @@
+name: PMU probe (throwaway)
+
+# One-off check for #245/#236: do GitHub-hosted runners expose /dev/kvm and an
+# exact retired-branch counter, and does the kernel pass its self-test under KVM?
+on:
+  push:
+    branches: [claude/festive-keller-m5xkmf]
+    paths: [.github/workflows/pmu-probe.yml, scripts/probe/**]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host
+        run: |
+          lscpu | grep -E 'Model name|Hypervisor|Virtualization' || true
+          grep -o -w -E 'arch_perfmon|perfctr_core|vmx|svm' /proc/cpuinfo | sort | uniq -c || true
+          sudo dmesg | grep -i -E 'perf|pmu' | head -20 || true
+          ls -la /dev/kvm || echo "no /dev/kvm"
+      - name: Branch counter exactness
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          gcc -O1 -o /tmp/pmu_probe scripts/probe/pmu_probe.c
+          /tmp/pmu_probe
+      - name: Self-test under KVM
+        run: |
+          sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          make
+          make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
