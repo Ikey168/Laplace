@@ -21,6 +21,7 @@
 #include "sched_record.h"
 #include "core/kjournal.h"
 #include "core/clock.h"
+#include "core/vm.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -32,7 +33,8 @@ void* memcpy(void* dst, const void* src, size_t n);
  *   [J_BASE, J_BASE + j)          journal ring: N regions
  */
 #define LABEL_MAGIC       0x3145434150414C4CULL   /* "LLAPACE1" */
-#define LABEL_VERSION     4   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240) */
+#define LABEL_VERSION     5   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240);
+                                 5: region list (#239) */
 #define KF_BASE           8
 #define KF_INDEX_SECTORS  4
 #define KF_SLOT_SECTORS   2048   /* per region slot: up to 227 page records */
@@ -52,7 +54,7 @@ typedef struct {
 /* Kernel-state blob captured with every keyframe (#224). */
 #define KSTATE_TAG        0x4C50u               /* "LP" */
 #define KSTATE_MAGIC      0x3145544154534B4CULL /* "LKSTATE1" */
-#define KSTATE_MAX_REGIONS 8
+#define KSTATE_MAX_REGIONS 1024             /* all processes together */
 
 typedef struct {
     uint64_t start, end;
@@ -64,10 +66,10 @@ typedef struct {
     uint32_t pid;
     uint32_t state;
     char     name[MAX_PROCESS_NAME];
+    uint32_t first_region;        /* its regions: kstate_t.regions[first, first + n) */
     uint32_t nregions;
     uint32_t exe_crc;             /* the executable's image (#240) */
     char     exe[64];
-    kstate_region_t regions[KSTATE_MAX_REGIONS];
 } kstate_proc_t;
 
 typedef struct {
@@ -84,6 +86,9 @@ typedef struct {
     clock_base_t clock;           /* how TSC reads became times (#238) */
     uint64_t     clock_now_ns;    /* monotonic time at the keyframe, for a resume */
     kstate_proc_t procs[LP_MAX_PROCS];
+    uint32_t nregions;            /* the address spaces' layouts (#239) */
+    uint32_t reserved2;
+    kstate_region_t regions[KSTATE_MAX_REGIONS];   /* captured up to nregions */
 } kstate_t;
 
 /* ---- State ---- */
@@ -281,9 +286,11 @@ static void capture_kstate(uint64_t epoch) {
         memcpy(kp->name, p->name, sizeof(kp->name));
         memcpy(kp->exe, p->exe_path, sizeof(kp->exe));
         kp->exe_crc = p->exe_crc;
-        for (vm_region_t* r = p->address_space->regions; r && kp->nregions < KSTATE_MAX_REGIONS;
-             r = r->next) {
-            kstate_region_t* kr = &kp->regions[kp->nregions++];
+        kp->first_region = ks.nregions;
+        for (vm_region_t* r = p->address_space->regions; r; r = r->next) {
+            if (ks.nregions >= KSTATE_MAX_REGIONS) panic("timetravel: more than %u regions", KSTATE_MAX_REGIONS);
+            kstate_region_t* kr = &ks.regions[ks.nregions++];
+            kp->nregions++;
             kr->start = r->start_addr;
             kr->end = r->end_addr;
             kr->flags = r->flags;
@@ -291,7 +298,7 @@ static void capture_kstate(uint64_t epoch) {
             memcpy(kr->name, r->name, sizeof(kr->name) - 1);
         }
     }
-    uint32_t size = (uint32_t)((uint8_t*)&ks.procs[ks.nproc] - (uint8_t*)&ks);
+    uint32_t size = (uint32_t)((uint8_t*)&ks.regions[ks.nregions] - (uint8_t*)&ks);
     if (checkpoint_capture_kernel_blob(KSTATE_TAG, &ks, size) != CHECKPOINT_OK) {
         panic("timetravel: cannot capture kernel state");
     }
@@ -377,6 +384,10 @@ void tt_before_process_exit(process_t* p) {
     if (machine_mode() == MACHINE_LIVE) do_writeback();
 }
 
+void tt_before_mapping_change(void) {
+    if (machine_mode() == MACHINE_LIVE) do_writeback();
+}
+
 int tt_seal(void) {
     if (!g_ready || !machine_started() || machine_mode() != MACHINE_LIVE) return TT_ERR_STATE;
     do_writeback();
@@ -442,7 +453,8 @@ int tt_restore_keyframe(uint64_t epoch) {
             nctx++;
         }
     }
-    if (!blob_size || kst.magic != KSTATE_MAGIC || kst.epoch != epoch || kst.nproc > LP_MAX_PROCS) {
+    if (!blob_size || kst.magic != KSTATE_MAGIC || kst.epoch != epoch || kst.nproc > LP_MAX_PROCS ||
+        kst.nregions > KSTATE_MAX_REGIONS) {
         return TT_ERR_RESTORE;
     }
 
@@ -456,8 +468,9 @@ int tt_restore_keyframe(uint64_t epoch) {
         p->state = (process_state_t)kp->state;
         memcpy(p->exe_path, kp->exe, sizeof(p->exe_path));
         p->exe_crc = kp->exe_crc;
-        for (uint32_t r = 0; r < kp->nregions && r < KSTATE_MAX_REGIONS; r++) {
-            kstate_region_t* kr = &kp->regions[r];
+        if (kp->first_region + kp->nregions > kst.nregions) return TT_ERR_RESTORE;
+        for (uint32_t r = 0; r < kp->nregions; r++) {
+            kstate_region_t* kr = &kst.regions[kp->first_region + r];
             vmm_create_region(p->address_space, kr->start, kr->end - kr->start, kr->flags,
                               (vmm_region_type_t)kr->type, kr->name);
         }
@@ -486,7 +499,10 @@ int tt_restore_keyframe(uint64_t epoch) {
         uint64_t phys = vmm_get_physical_addr(p->address_space, rec.virt_addr);
         if (!phys) {
             phys = pmm_alloc();
-            uint32_t flags = PAGE_USER | ((rec.flags & CHECKPOINT_REC_READONLY) ? 0 : PAGE_WRITABLE);
+            /* The region's protection, as mprotect left it (#239). */
+            vm_region_t* r = vmm_find_region(p->address_space, rec.virt_addr);
+            uint32_t flags = r ? vm_pte_flags(r)
+                               : PAGE_USER | ((rec.flags & CHECKPOINT_REC_READONLY) ? 0 : PAGE_WRITABLE);
             if (!phys || vmm_map_page(p->address_space, rec.virt_addr, phys, flags) != 0) {
                 return TT_ERR_RESTORE;
             }

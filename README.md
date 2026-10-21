@@ -195,6 +195,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | x87/SSE/AVX state survives preemption, is in every keyframe, and is part of what replay verifies | `tests/qemu/fpu_gate.sh`, `make selftest` |
 | Unmodified static Linux programs (musl) run; their clock and random reads replay exactly | `tests/qemu/linux_gate.sh` |
 | Programs load from outside the kernel (Multiboot modules, static and static-PIE) with argv and envp; a recording refuses to resume with changed binaries | `tests/qemu/loader_gate.sh` |
+| malloc, `mmap`/`munmap`/`mprotect`/`mremap`, `brk`, and a demand-paged stack replay exactly with keyframes between the calls, at 512 MiB and 4 GiB of RAM | `tests/qemu/vm_gate.sh` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
@@ -221,7 +222,10 @@ Limits, stated plainly:
   Linux `syscall` ABI, #238), embedded in the kernel (`user/linux/`) or passed
   as Multiboot modules (`-initrd`, #240). The
   Linux interface so far covers startup, TLS, stdio to the console, the clocks,
-  and `getrandom`; unimplemented calls return ENOSYS and are logged once.
+  `getrandom`, and memory (`brk`, anonymous `mmap`, `munmap`, `mprotect`,
+  `mremap`, `madvise`, with pages mapped on first touch, #239); file-backed
+  `mmap` returns ENODEV until files exist (#247). Unimplemented calls return
+  ENOSYS and are logged once.
 - Recorded history is read-only from the debuggers.
 
 ## The machine
@@ -308,8 +312,6 @@ included) is tracked in #235. Its main steps:
 
 - Incremental keyframes that write only dirtied pages, so keyframes scale to
   real memory sizes (#244)
-- The Linux system call interface, a loader for programs not embedded in the
-  kernel, and `brk`/`mmap` (#238, #240, #239)
 - Journal device input (keyboard, disk completions) so interactive programs
   can be recorded (#242, #249)
 - Preemption at any instruction, recorded as a register-and-memory state that

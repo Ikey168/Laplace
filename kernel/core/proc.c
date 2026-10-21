@@ -2,6 +2,7 @@
 
 #include "core/proc.h"
 #include "core/mm.h"
+#include "core/vm.h"
 #include "core/console.h"
 #include "process_manager.h"
 #include "core/machine.h"
@@ -27,6 +28,7 @@ extern const uint8_t user_image_rdrandleak[], user_image_rdrandleak_end[];
 extern const uint8_t user_image_fpuprobe[], user_image_fpuprobe_end[];
 extern const uint8_t user_image_musl_hello[], user_image_musl_hello_end[];
 extern const uint8_t user_image_musl_sysprobe[], user_image_musl_sysprobe_end[];
+extern const uint8_t user_image_musl_vmprobe[], user_image_musl_vmprobe_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -38,6 +40,7 @@ static const lp_image_t g_images[] = {
     { "fpuprobe",  user_image_fpuprobe,  user_image_fpuprobe_end, false },
     { "musl_hello", user_image_musl_hello, user_image_musl_hello_end, true },
     { "musl_sysprobe", user_image_musl_sysprobe, user_image_musl_sysprobe_end, true },
+    { "musl_vmprobe", user_image_musl_vmprobe, user_image_musl_vmprobe_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {
@@ -333,6 +336,7 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
     }
     vm_space_t* s = p->address_space;
     uint64_t phdr_va = 0;
+    uint64_t brk = 0;             /* the page after the highest segment */
     /* A static PIE is loaded at a fixed base; a program that needs a dynamic
      * loader is not supported yet (#254). */
     uint64_t base = eh->type == ET_DYN ? PIE_BASE : 0;
@@ -356,6 +360,7 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
         }
         uint64_t start = vaddr & ~0xFFFULL;
         uint64_t end = PAGE_ALIGN(vaddr + ph->memsz);
+        if (end > brk) brk = end;
         bool writable = (ph->flags & PF_W) != 0;
         uint32_t rflags = VMM_FLAG_READ | VMM_FLAG_USER |
                           (writable ? VMM_FLAG_WRITE : 0) | ((ph->flags & PF_X) ? VMM_FLAG_EXEC : 0);
@@ -377,29 +382,32 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
             off += chunk;
         }
     }
-    /* Stack. */
-    uint64_t pages = linux_abi ? LP_LINUX_STACK_PAGES : LP_STACK_PAGES;
-    uint64_t stack_lo = LP_STACK_TOP - pages * PAGE_SIZE;
-    if (!vmm_create_region(s, stack_lo, pages * PAGE_SIZE,
+    /* Stack. A Linux program's is 8 MiB at the top of the lower half, its
+     * pages mapped as they are touched (#239); an embedded program's is a few
+     * pages, all mapped. */
+    uint64_t stack_top = linux_abi ? LP_LINUX_STACK_TOP : LP_STACK_TOP;
+    uint64_t stack_lo = stack_top - (linux_abi ? LP_LINUX_STACK_SIZE : LP_STACK_PAGES * PAGE_SIZE);
+    if (!vmm_create_region(s, stack_lo, stack_top - stack_lo,
                            VMM_FLAG_READ | VMM_FLAG_WRITE | VMM_FLAG_USER,
                            VMM_REGION_STACK, "stack")) {
         return false;
     }
-    for (uint64_t va = stack_lo; va < LP_STACK_TOP; va += PAGE_SIZE) {
+    for (uint64_t va = stack_lo; !linux_abi && va < stack_top; va += PAGE_SIZE) {
         if (!map_zeroed(s, va, PAGE_USER | PAGE_WRITABLE)) return false;
     }
+    if (linux_abi) vm_set_brk(p, brk);
 
     memset(&p->context, 0, sizeof(p->context));
     p->context.rip = base + eh->entry;
-    p->context.rsp = LP_STACK_TOP - 8;     /* as if _start had been called */
+    p->context.rsp = stack_top - 8;        /* as if _start had been called */
     p->context.rflags = RFLAGS_IF | 0x2;
     p->context.cs = SEL_UCODE;
     p->context.ss = SEL_UDATA;
     p->context.ds = p->context.es = SEL_UDATA;
     p->entry_point = base + eh->entry;
     p->stack_start = stack_lo;
-    p->stack_end = LP_STACK_TOP;
-    if (linux_abi) return linux_initial_stack(p, eh, phdr_va, base, LP_STACK_TOP, args);
+    p->stack_end = stack_top;
+    if (linux_abi) return linux_initial_stack(p, eh, phdr_va, base, stack_top, args);
     return true;
 }
 

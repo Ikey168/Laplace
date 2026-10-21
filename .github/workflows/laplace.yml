@@ -112,6 +112,8 @@ jobs:
         run: bash tests/qemu/linux_gate.sh
       - name: Programs load from outside the kernel with argv/envp (in QEMU)
         run: bash tests/qemu/loader_gate.sh
+      - name: brk, mmap, mprotect, and demand paging replay exactly (in QEMU)
+        run: bash tests/qemu/vm_gate.sh
       - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
         run: python3 tests/qemu/timetravel_e2e.py
       - name: Power cut and resume on the IDE disk (in QEMU)

@@ -73,6 +73,23 @@ state; resuming after a power cut re-anchors it to the new boot's TSC and takes
 a keyframe at once. There is no vDSO, so libc reads the time through a system
 call.
 
+**Process memory** (#239, `kernel/core/vm.c`). An address space is a sorted
+list of regions and the pages present in them, at fixed places (no
+randomization): ELF segments, the `brk` heap after the highest one, `mmap`
+top-down from 0x7FFF00000000, and for Linux programs an 8 MiB stack below
+0x7FFFFFFF0000. Pages appear on first touch: a not-present fault inside a
+region that allows the access maps a zeroed page and resumes the instruction.
+Which pages are present is part of every keyframe, so a replay takes the same
+faults at the same instructions, and like snapshot-COW captures they are not
+steps. A system call reading an untouched page sees zeros without mapping it,
+and so does a debugger, so inspecting memory never changes the machine. Before
+any change to regions or pages while recording, a pending keyframe writeback
+is finished, since it reads them. The kernel-state blob holds every region
+(start, end, protection, kind) in one flat list; restore re-creates them and
+maps each saved page with its region's protection (no user bit for
+`PROT_NONE`). The process-table checksum covers the regions and the break, the
+user-page checksum each page's user bit.
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the

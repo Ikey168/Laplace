@@ -108,6 +108,7 @@
 #define LX_EACCES  13
 #define LX_EFAULT  14
 #define LX_EEXIST  17
+#define LX_ENODEV  19
 #define LX_ENOTDIR 20
 #define LX_EISDIR  21
 #define LX_EINVAL  22

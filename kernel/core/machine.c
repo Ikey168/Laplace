@@ -13,6 +13,7 @@
 #include "laplace/syscalls.h"
 #include "core/kjournal.h"
 #include "core/linux.h"
+#include "core/vm.h"
 
 void* memset(void* dst, int c, size_t n);
 
@@ -659,6 +660,12 @@ void trap_dispatch(trap_frame_t* f) {
          * to the program and is not a step. */
         uint64_t cr2 = read_cr2();
         if (checkpoint_handle_write_fault(g_cur->address_space, cr2)) return;
+    }
+    if (f->vector == VEC_PAGE_FAULT && !(f->error & 0x1)) {
+        /* First touch of a page in a region that allows the access (#239):
+         * a function of the program and of which pages are present, so like
+         * a capture it is not a step. */
+        if (vm_fault_in(g_cur->address_space, read_cr2(), (f->error & 0x2) != 0)) return;
     }
     if (f->vector == VEC_DEBUG && g_mode == MACHINE_REPLAY) {
         on_debug(f);

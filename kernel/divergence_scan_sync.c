@@ -59,6 +59,12 @@ static uint32_t sum_proctable(void* ctx) {
         crc = divergence_checksum(crc, &pid, sizeof(pid));
         crc = divergence_checksum(crc, &alive, sizeof(alive));
         crc = divergence_checksum(crc, p->name, sizeof(p->name));
+        /* The address space's layout (#239): regions and the break. */
+        for (vm_region_t* r = p->address_space ? p->address_space->regions : 0; r; r = r->next) {
+            uint64_t reg[3] = { r->start_addr, r->end_addr, r->flags };
+            crc = divergence_checksum(crc, reg, sizeof(reg));
+        }
+        if (p->arch) crc = divergence_checksum(crc, &proc_arch(p)->brk_start, 2 * sizeof(uint64_t));
     }
     return crc;
 }
@@ -78,12 +84,14 @@ static uint32_t sum_scheduler(void* ctx) {
     return divergence_checksum(crc, &vec, sizeof(vec));
 }
 
-/* User memory: every mapped page's address and contents, per process. */
+/* User memory: every mapped page's address, user bit, and contents, per process. */
 typedef struct { uint32_t crc; } page_sum_t;
 static void sum_one_page(void* c, uint64_t virt, uint64_t phys, pte_t pte) {
-    (void)pte;
     page_sum_t* s = (page_sum_t*)c;
-    s->crc = divergence_checksum(s->crc, &virt, sizeof(virt));
+    /* The user bit is the page's protection as mprotect left it (#239); the
+     * write bit is not, since snapshot-COW clears it until the first write. */
+    uint64_t key = virt | ((pte & PAGE_USER) ? 1 : 0);
+    s->crc = divergence_checksum(s->crc, &key, sizeof(key));
     s->crc = divergence_checksum(s->crc, P2V(phys), PAGE_SIZE);
 }
 static uint32_t sum_user_pages(void* ctx) {

@@ -6,6 +6,7 @@
 #include "core/proc.h"
 #include "core/mm.h"
 #include "core/clock.h"
+#include "core/vm.h"
 #include "core/console.h"
 #include "entropy_record.h"
 #include "time_record.h"
@@ -199,7 +200,6 @@ lx_after_t linux_syscall(process_t* p) {
     process_context_t* c = &p->context;
     uint64_t nr = c->rax;
     uint64_t a0 = c->rdi, a1 = c->rsi, a2 = c->rdx, a3 = c->r10;
-    (void)a3;
     int64_t r;
 
     switch (nr) {
@@ -238,7 +238,12 @@ lx_after_t linux_syscall(process_t* p) {
     case LX_rt_sigaction:    r = sys_rt_sigaction(p, a2); break;
     case LX_rt_sigprocmask:  r = sys_rt_sigprocmask(p, a2); break;
     case LX_sigaltstack:     r = 0; break;
-    case LX_madvise:         r = 0; break;
+    case LX_brk:             r = vm_brk(p, a0); break;
+    case LX_mmap:            r = vm_mmap(p, a0, a1, a2, a3, (int64_t)c->r8, c->r9); break;
+    case LX_munmap:          r = vm_munmap(p, a0, a1); break;
+    case LX_mprotect:        r = vm_mprotect(p, a0, a1, a2); break;
+    case LX_mremap:          r = vm_mremap(p, a0, a1, a2, a3, c->r8); break;
+    case LX_madvise:         r = vm_madvise(p, a0, a1, a2); break;
     default:                 r = enosys(p, nr); break;
     }
     c->rax = (uint64_t)r;

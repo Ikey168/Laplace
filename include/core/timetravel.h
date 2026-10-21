@@ -47,6 +47,9 @@ uint32_t tt_required_sectors(uint32_t keyframes);
 void tt_on_tick(void);
 void tt_on_live_entry(void);
 void tt_before_process_exit(process_t* p);
+/* A space's regions or pages are about to change (#239): finish a pending
+ * keyframe writeback, which reads them. */
+void tt_before_mapping_change(void);
 
 /* ---- Stopping and resuming ---- */
 

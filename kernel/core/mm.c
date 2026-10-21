@@ -3,6 +3,7 @@
 
 #include "core/mm.h"
 #include "core/cpu.h"
+#include "core/vm.h"
 #include "core/console.h"
 #include "checkpoint.h"   /* checkpoint_handle_write_fault (copy_to_user) */
 
@@ -431,11 +432,18 @@ bool uaccess_read(vm_space_t* space, uint64_t uaddr, void* dst, uint64_t len) {
     uint8_t* d = (uint8_t*)dst;
     while (len) {
         if (uaddr < LP_USER_BASE || uaddr >= LP_USER_END) return false;
-        uint64_t phys = vmm_get_physical_addr(space, uaddr);
-        if (!phys) return false;
+        pte_t* pte = vmm_get_page_table(space, uaddr & ~0xFFFULL, PT_LEVEL, false);
         uint64_t chunk = PAGE_SIZE - (uaddr & 0xFFF);
         if (chunk > len) chunk = len;
-        memcpy(d, P2V(phys), chunk);
+        if (!pte || !(*pte & PAGE_PRESENT)) {
+            /* Not touched yet: it reads as zeros, and reading it (a system
+             * call's argument, a debugger) leaves it untouched (#239). */
+            if (!vm_zero_backed(space, uaddr)) return false;
+            memset(d, 0, chunk);
+        } else {
+            if (!(*pte & PAGE_USER)) return false;
+            memcpy(d, P2V((*pte & LP_PTE_ADDR_MASK) | (uaddr & 0xFFF)), chunk);
+        }
         d += chunk;
         uaddr += chunk;
         len -= chunk;
@@ -448,7 +456,11 @@ bool uaccess_write(vm_space_t* space, uint64_t uaddr, const void* src, uint64_t 
     while (len) {
         if (uaddr < LP_USER_BASE || uaddr >= LP_USER_END) return false;
         pte_t* pte = vmm_get_page_table(space, uaddr & ~0xFFFULL, PT_LEVEL, false);
-        if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER)) return false;
+        if (!pte || !(*pte & PAGE_PRESENT)) {
+            if (!vm_fault_in(space, uaddr, true)) return false;
+            pte = vmm_get_page_table(space, uaddr & ~0xFFFULL, PT_LEVEL, false);
+        }
+        if (!(*pte & PAGE_USER)) return false;
         if (!(*pte & PAGE_WRITABLE)) {
             /* A snapshot-COW page: preserve the pre-write image first. */
             if (!(*pte & PAGE_SNAPSHOT_COW) || !checkpoint_handle_write_fault(space, uaddr)) {

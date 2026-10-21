@@ -37,7 +37,7 @@ CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
             kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
-            kernel/core/clock.c kernel/core/linux.c
+            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
 # kernel adapters.
@@ -65,7 +65,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 
 # Linux programs (#238): plain C built against musl, unmodified.
 MUSL_CC     ?= musl-gcc
-LINUX_PROGS := hello sysprobe
+LINUX_PROGS := hello sysprobe vmprobe
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \
@@ -141,6 +141,7 @@ test: all selftest
 	bash tests/qemu/fpu_gate.sh
 	bash tests/qemu/linux_gate.sh
 	bash tests/qemu/loader_gate.sh
+	bash tests/qemu/vm_gate.sh
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 
