@@ -46,10 +46,11 @@ else
     echo "[FAIL] keyframes taken: '${taken}'"; fail=1
 fi
 check "$out" "selftest: verify rc=0: [0-9]+ epochs replayed, 0 diverged" "the idle recording replays byte-exact"
-if [ "$took" -lt 25 ]; then
-    echo "[ok] record and verify took ${took}s: the replay did not wait out the idle"
+vms=$(echo "$out" | sed -nE 's/selftest: verify took ([0-9]+) ms/\1/p')
+if [ -n "$vms" ] && [ "$vms" -lt 8000 ]; then
+    echo "[ok] verifying took ${vms} ms (the whole run ${took}s): the replay did not wait out the idle"
 else
-    echo "[FAIL] took ${took}s"; fail=1
+    echo "[FAIL] verifying took '${vms}' ms"; fail=1
 fi
 
 python3 - <<'PY' || fail=1

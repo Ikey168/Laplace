@@ -230,7 +230,9 @@ static bool selftest(void) {
             "%lu pages and wrote %lu; pool %u of %u slots in use\n", ps->pages_written,
             ps->pages_reused, ps->last_pages, ps->last_written, ps->slots_used, ps->slots_total);
     tt_verify_t v;
+    uint64_t t0 = clock_now_unrecorded();
     int rc = tt_verify(&v);
+    uint64_t verify_ms = (clock_now_unrecorded() - t0) / 1000000;
     const preempt_stats_t* pm = preempt_stats();
     kprintf("selftest: preemption points: %lu recorded in user code (%lu inside string "
             "instructions, %lu pages hashed); replays found %lu by state (%lu inside string "
@@ -239,6 +241,7 @@ static bool selftest(void) {
             pm->candidates);
     kprintf("selftest: verify rc=%d: %u epochs replayed, %u diverged\n", rc, v.epochs_checked,
             v.epochs_diverged);
+    kprintf("selftest: verify took %lu ms\n", verify_ms);
     if (v.diverged) {
         kprintf("selftest: first divergence epoch %lu component %u (%s) expected %x actual %x, "
                 "between steps %lu..%lu\n", v.first_epoch, v.first_component,

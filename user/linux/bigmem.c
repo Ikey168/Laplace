@@ -52,7 +52,8 @@ static int resident(uint32_t mib, uint32_t rounds) {
     for (size_t off = 0; off < len; off += 509) h = (h ^ m[off]) * 16777619u;
     g_sum = h;
     printf("bigmem: %u rounds over a 64-page working set: sum %08x\n", rounds, h);
-    free(m);
+    /* Not freed: the memory stays resident until exit, so the last keyframe
+     * (taken whenever the machine wants one, #245) holds all of it. */
     return 0;
 }
 
