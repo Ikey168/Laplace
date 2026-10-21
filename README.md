@@ -198,6 +198,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | malloc, `mmap`/`munmap`/`mprotect`/`mremap`, `brk`, and a demand-paged stack replay exactly with keyframes between the calls, at 512 MiB and 4 GiB of RAM | `tests/qemu/vm_gate.sh` |
 | Files: a seed image, then a program's own files, in keyframes and checksums; unmodified Lua 5.4 runs a script from the image, writes a file and reads it back, and replays byte-exact; a recording refuses another seed | `tests/qemu/files_gate.sh` |
 | Inputs (clock reads, entropy, and later console and network) are one journaled record with payloads of any size: 10 MiB read in one epoch replays byte-exact; a replay whose input call differs from the recording stops at that step and is reported | `tests/qemu/input_gate.sh` |
+| Blocking: a sleeping process and a working one replay byte-exact with each timer wake at its journaled step; a 10 s idle adds no steps and replays without waiting; a debugger stops the machine while everything waits | `tests/qemu/sleep_gate.sh` |
 | Incremental keyframes: 256 MiB resident records at about 90 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
@@ -242,8 +243,7 @@ The system being recorded is Laplace's own small kernel (`kernel/core/`): a
 Multiboot entry into long mode, a higher-half kernel with a direct map of all
 RAM, per-process 4-level page tables over the whole lower half, ring-3
 processes loaded from embedded ELF images, Laplace (`int 0x80`) and Linux
-(`syscall`) system calls, and a round-robin scheduler. The kernel runs with interrupts disabled and
-never blocks, so a kernel entry is an atomic, deterministic step; the whole
+(`syscall`) system calls, and a round-robin scheduler. The kernel runs with interrupts disabled, so a kernel entry is an atomic, deterministic step; a process that waits (`nanosleep`, and later children, futexes, input) blocks, and when nothing can run the kernel idles with `hlt` (#246); the whole
 time-travel stack (`kernel/*.c`, host-tested under `tests/`) sits on top of it.
 
 The project was formerly named IKOS, and the tree carries a broad scaffold of a

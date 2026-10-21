@@ -36,6 +36,13 @@ int64_t  kio_input(uint32_t kind, uint32_t nr, uint64_t args,
                    int64_t (*live)(void* ctx, void* buf, uint32_t cap), void* ctx,
                    void* buf, uint32_t cap);
 
+/* Events delivered to the machine (a timer expiry waking a process, device
+ * input arriving) rather than asked for by a call (#246): recording appends
+ * one at `step`; replaying takes the next record if it is one of `kind` at
+ * `step`. */
+void     kio_event(uint32_t kind, uint32_t nr, uint64_t args, uint64_t step);
+bool     kio_event_next(uint32_t kind, uint64_t step, uint32_t* nr, uint64_t* args);
+
 /* Epochs. */
 void     kio_begin_epoch(uint64_t epoch);   /* recording */
 void     kio_close_epoch(uint64_t epoch);   /* recording: before the journal is written */

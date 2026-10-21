@@ -179,6 +179,11 @@ typedef struct process {
     uint32_t exe_crc;
     /* Open files, cwd, umask (#247): include/core/files.h. */
     void*    files;
+    /* Blocked (#246): why, on what, and until when (monotonic ns; 0: no
+     * deadline). See include/core/machine.h. */
+    uint32_t wait_reason;
+    uint64_t wait_obj;
+    uint64_t wait_deadline;
 } process_t;
 
 /* Process management functions */

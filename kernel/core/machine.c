@@ -15,6 +15,9 @@
 #include "core/linux.h"
 #include "core/vm.h"
 #include "core/kfpages.h"
+#include "core/kio.h"
+#include "core/clock.h"
+#include "iorec.h"
 
 void* memset(void* dst, int c, size_t n);
 
@@ -295,6 +298,118 @@ void machine_terminate(process_t* p, int code) {
     proc_destroy(p);
 }
 
+/* ---- Blocking and idle (#246) ---- */
+
+#define WAKE_TIMER 1                  /* kio_event nr: a deadline passed */
+
+void machine_block(process_t* p, uint32_t reason, uint64_t obj, uint64_t deadline_ns) {
+    p->state = PROCESS_STATE_BLOCKED;
+    p->wait_reason = reason;
+    p->wait_obj = obj;
+    p->wait_deadline = deadline_ns;
+    if (g_cur == p) {
+        process_t* next = proc_next_ready(p);
+        g_cur = next != p ? next : 0;
+    }
+}
+
+void machine_wake(process_t* p, int64_t ret) {
+    if (p->state != PROCESS_STATE_BLOCKED) return;
+    p->context.rax = (uint64_t)ret;
+    p->state = PROCESS_STATE_READY;
+    p->wait_reason = 0;
+    p->wait_obj = 0;
+    p->wait_deadline = 0;
+}
+
+int64_t machine_timeout_result(uint32_t reason) {
+    return reason == WAIT_SLEEP ? 0 : -110;   /* ETIMEDOUT */
+}
+
+static bool any_deadline(void) {
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        if (p->state == PROCESS_STATE_BLOCKED && p->wait_deadline) return true;
+    }
+    return false;
+}
+
+static bool any_blocked(void) {
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        if (proc_at(i)->state == PROCESS_STATE_BLOCKED) return true;
+    }
+    return false;
+}
+
+/* Wakes due at `step`. Recording: deadlines that passed, by the clock, each
+ * journaled. Replaying: the journaled ones for this step. */
+static void deliver_wakes(uint64_t step) {
+    if (g_mode == MACHINE_LIVE) {
+        if (!any_deadline()) return;
+        uint64_t now = clock_now_unrecorded();
+        for (uint32_t i = 0; i < proc_count(); i++) {
+            process_t* p = proc_at(i);
+            if (p->state != PROCESS_STATE_BLOCKED || !p->wait_deadline || p->wait_deadline > now) continue;
+            kio_event(IOREC_DEVICE, WAKE_TIMER, (uint64_t)p->pid, step);
+            machine_wake(p, machine_timeout_result(p->wait_reason));
+        }
+        return;
+    }
+    uint32_t nr;
+    uint64_t pid;
+    while (kio_event_next(IOREC_DEVICE, step, &nr, &pid)) {
+        process_t* p = proc_by_pid((uint32_t)pid);
+        if (nr != WAKE_TIMER || !p || p->state != PROCESS_STATE_BLOCKED) machine_stop_diverged();
+        machine_wake(p, machine_timeout_result(p->wait_reason));
+    }
+}
+
+static stop_reason_t g_pick_stop = STOP_IDLE;
+
+/* Recording, nothing runnable: halt until a wake (or a debugger's request).
+ * No steps pass. */
+static bool idle_until_wake(void) {
+    for (;;) {
+        if (g_stop_request) {
+            g_stop_request = false;
+            g_pick_stop = STOP_REQUEST;
+            return false;
+        }
+        if (!any_deadline()) {
+            g_pick_stop = STOP_IDLE;          /* nothing can ever wake them */
+            return false;
+        }
+        deliver_wakes(g_step);
+        if (proc_next_ready(0)) return true;
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+    }
+}
+
+/* Choose the process to run next, idling if they all wait. False (with
+ * g_pick_stop) when the machine must stop instead. */
+static bool pick_next(void) {
+    if (!g_cur) g_cur = proc_next_ready(0);
+    while (!g_cur) {
+        if (!any_blocked()) {
+            g_pick_stop = STOP_IDLE;
+            return false;
+        }
+        if (g_mode == MACHINE_LIVE) {
+            if (!idle_until_wake()) return false;
+        } else {
+            deliver_wakes(g_step);
+            if (!proc_next_ready(0)) {
+                /* The recording stopped here, everything waiting. */
+                g_pick_stop = g_has_target && g_step == g_target_step && g_target_insn == 0
+                                  ? STOP_TARGET : STOP_END;
+                return false;
+            }
+        }
+        g_cur = proc_next_ready(0);
+    }
+    return true;
+}
+
 void machine_yield(process_t* p) {
     process_t* next = proc_next_ready(p);
     if (next && next != p) {
@@ -485,21 +600,23 @@ static bool want_stepping(void) {
 
 /* Complete the pending entry: handle it, decide preemption, advance the clock.
  * Returns false when no process is left to run. */
+static void start_segment(void) {
+    g_cur->state = PROCESS_STATE_RUNNING;
+    g_at_entry = false;
+    g_stepping = want_stepping();
+    if (g_stepping && g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, g_cur->context.rip);
+}
+
 static bool complete_entry(void) {
     uint64_t step = g_step;
+    deliver_wakes(step);                  /* before the entry: same order in a replay */
     trace_entry(step);
     if (handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
     g_step = step + 1;
     g_insn = 1;
     g_seg_hits = 0;
-    if (!g_cur) {
-        g_cur = proc_next_ready(0);
-    }
-    if (!g_cur) return false;
-    g_cur->state = PROCESS_STATE_RUNNING;
-    g_at_entry = false;
-    g_stepping = want_stepping();
-    if (g_stepping && g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, g_cur->context.rip);
+    if (!pick_next()) return false;
+    start_segment();
     return true;
 }
 
@@ -565,7 +682,17 @@ void machine_start(void) {
 
 void machine_resume(void) {
     if (!g_cur) {
-        stop_here(STOP_IDLE, 0);
+        /* Stopped while everything waited: wait again, then run. */
+        if (!pick_next()) {
+            stop_here(g_pick_stop, 0);
+            return;
+        }
+        start_segment();
+        if (target_at_segment_start()) {
+            stop_here(STOP_TARGET, 0);
+            return;
+        }
+        enter();
         return;
     }
     if (!g_at_entry) {
@@ -582,7 +709,7 @@ void machine_resume(void) {
         return;
     }
     if (!complete_entry()) {
-        stop_here(STOP_IDLE, 0);
+        stop_here(g_pick_stop, 0);
         return;
     }
     if (target_at_segment_start()) {
@@ -713,7 +840,7 @@ void trap_dispatch(trap_frame_t* f) {
     }
     if (stop_at_entry()) machine_exit();
     if (!complete_entry()) {
-        stop_here(STOP_IDLE, 0);
+        stop_here(g_pick_stop, 0);
         machine_exit();
     }
     if (target_at_segment_start()) {

@@ -47,6 +47,9 @@ static void procs_save(ksf_writer_t* w, void* ctx) {
         ksf_put(w, p->name, MAX_PROCESS_NAME);
         ksf_put(w, p->exe_path, sizeof(p->exe_path));
         ksf_put_u32(w, p->exe_crc);
+        ksf_put_u32(w, p->wait_reason);          /* v2: the wait (#246) */
+        ksf_put_u64(w, p->wait_obj);
+        ksf_put_u64(w, p->wait_deadline);
         ksf_put_u32(w, p->address_space->region_count);
         for (vm_region_t* r = p->address_space->regions; r; r = r->next) {
             char name[REGION_NAME];
@@ -63,7 +66,7 @@ static void procs_save(ksf_writer_t* w, void* ctx) {
 
 static int procs_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
     (void)ctx;
-    if (version != 1) return -1;
+    if (version != 1 && version != 2) return -1;
     vmm_switch_address_space(0);
     proc_destroy_all();
     uint32_t n = ksf_get_u32(r);
@@ -82,6 +85,11 @@ static int procs_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
         ksf_get(r, p->exe_path, sizeof(p->exe_path));
         p->exe_path[sizeof(p->exe_path) - 1] = 0;
         p->exe_crc = ksf_get_u32(r);
+        if (version >= 2) {
+            p->wait_reason = ksf_get_u32(r);
+            p->wait_obj = ksf_get_u64(r);
+            p->wait_deadline = ksf_get_u64(r);
+        }
         uint32_t nreg = ksf_get_u32(r);
         for (uint32_t k = 0; k < nreg && r->ok; k++) {
             uint64_t start = ksf_get_u64(r), end = ksf_get_u64(r);
@@ -198,7 +206,7 @@ static uint32_t probe_sum(void* ctx) {
 
 void kstate_init(void) {
     static const ksf_subsys_t builtin[] = {
-        { KS_ID_PROCS,   "procs",   1, procs_save,   procs_restore,   0, 0 },
+        { KS_ID_PROCS,   "procs",   2, procs_save,   procs_restore,   0, 0 },
         { KS_ID_CPUID,   "cpuid",   1, cpuid_save,   cpuid_restore,   0, 0 },
         { KS_ID_CLOCK,   "clock",   1, clock_save,   clock_restore,   0, 0 },
         { KS_ID_MACHINE, "machine", 1, machine_save, machine_restore, 0, 0 },

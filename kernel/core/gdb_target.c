@@ -91,7 +91,9 @@ static int op_cont(void* c) {
 
 static process_t* thread_proc(uint32_t tid) {
     if (tid) return proc_by_pid(tid);
-    return machine_current();
+    /* Stopped while every process waits (#246): no current one. */
+    if (machine_current()) return machine_current();
+    return proc_count() ? proc_at(0) : 0;
 }
 
 static void put_le(uint8_t* buf, uint32_t off, uint64_t v, uint32_t size) {

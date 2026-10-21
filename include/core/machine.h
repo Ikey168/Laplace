@@ -172,6 +172,25 @@ bool machine_quiet(void);
 uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len);
 #define MACHINE_DEV_CONSOLE 0
 
+/* Blocking (#246). A process that waits leaves the run queue with a reason,
+ * the object it waits on, and an optional deadline (monotonic ns, 0: none).
+ * Another process's call wakes it deterministically; a deadline passing is an
+ * input: the kernel notices it at an entry or while idle, journals the wake
+ * with the step it is delivered at (kio_event), and a replay delivers it at
+ * that step without waiting. When nothing can run, the machine idles with
+ * hlt: idle time adds no steps. */
+#define WAIT_SLEEP  1         /* nanosleep: a timeout returns 0 */
+#define WAIT_CHILD  2         /* wait4 (#248) */
+#define WAIT_FUTEX  3         /* futex (#251) */
+#define WAIT_INPUT  4         /* console read (#249) */
+#define WAIT_POLL   5         /* poll, select (#249) */
+#define WAIT_SIGNAL 6         /* pause, sigsuspend (#250) */
+void machine_block(process_t* p, uint32_t reason, uint64_t obj, uint64_t deadline_ns);
+/* Make a blocked process runnable; its system call returns `ret`. */
+void machine_wake(process_t* p, int64_t ret);
+/* What a wait returns when its deadline passes. */
+int64_t machine_timeout_result(uint32_t reason);
+
 /* Give the CPU to the next ready process (a yield). */
 void machine_yield(process_t* p);
 

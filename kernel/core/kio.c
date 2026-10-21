@@ -121,6 +121,22 @@ int64_t kio_input(uint32_t kind, uint32_t nr, uint64_t args,
     return r.ret;
 }
 
+void kio_event(uint32_t kind, uint32_t nr, uint64_t args, uint64_t step) {
+    int rc = iorec_append(&g_log, step, kind, nr, args, 0, 0, 0);
+    if (rc != IOREC_OK) panic("kio: cannot record an event (%d)", rc);
+    g_stats.records++;
+    journal_new();
+}
+
+bool kio_event_next(uint32_t kind, uint64_t step, uint32_t* nr, uint64_t* args) {
+    iorec_t r;
+    if (iorec_peek(&g_log, &r) != IOREC_OK || r.kind != kind || r.step != step) return false;
+    iorec_skip(&g_log);
+    *nr = r.nr;
+    *args = r.args;
+    return true;
+}
+
 /* ---- Epochs ---- */
 
 void kio_begin_epoch(uint64_t epoch) {

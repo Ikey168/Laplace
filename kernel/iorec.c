@@ -157,6 +157,16 @@ int iorec_next(iorec_log_t* l, uint64_t step, uint32_t kind, uint32_t nr, uint64
     return IOREC_OK;
 }
 
+int iorec_peek(const iorec_log_t* l, iorec_t* out) {
+    if (l->cursor >= l->nrecs) return IOREC_EXHAUSTED;
+    *out = l->recs[l->cursor];
+    return IOREC_OK;
+}
+
+void iorec_skip(iorec_log_t* l) {
+    if (l->cursor < l->nrecs) l->cursor++;
+}
+
 int iorec_read(iorec_log_t* l, uint64_t off, void* buf, uint32_t len) {
     uint8_t* out = (uint8_t*)buf;
     uint32_t done = 0;

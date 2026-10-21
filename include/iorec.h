@@ -115,6 +115,10 @@ int  iorec_load_event(iorec_log_t* l, uint32_t type, uint32_t len, uint64_t lclo
 /* Replay: the next record, which must match. */
 int  iorec_next(iorec_log_t* l, uint64_t step, uint32_t kind, uint32_t nr, uint64_t args,
                 iorec_t* out);
+/* Replay: the next record without taking it (IOREC_EXHAUSTED if none), and
+ * taking it. For inputs that arrive rather than being asked for. */
+int  iorec_peek(const iorec_log_t* l, iorec_t* out);
+void iorec_skip(iorec_log_t* l);
 /* Replay: payload bytes [off, off + len) of the stream. */
 int  iorec_read(iorec_log_t* l, uint64_t off, void* buf, uint32_t len);
 /* Replay -> recording: continue the loaded epoch. The stream resumes at the

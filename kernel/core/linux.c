@@ -125,6 +125,47 @@ static int64_t sys_getrandom(process_t* p, uint64_t buf, uint64_t len) {
     return put_user(p, buf, tmp, len) ? (int64_t)len : err(LX_EFAULT);
 }
 
+/* ---- Sleeping (#246) ---- */
+
+static int64_t read_timespec(process_t* p, uint64_t uts, uint64_t* ns) {
+    int64_t t[2];
+    if (!uaccess_read(p->address_space, uts, t, sizeof(t))) return err(LX_EFAULT);
+    if (t[0] < 0 || t[1] < 0 || t[1] >= 1000000000) return err(LX_EINVAL);
+    *ns = (uint64_t)t[0] * 1000000000ULL + (uint64_t)t[1];
+    return 0;
+}
+
+/* Block until the monotonic clock reaches `deadline`. */
+static lx_after_t sleep_until(process_t* p, uint64_t deadline) {
+    p->context.rax = 0;
+    machine_block(p, WAIT_SLEEP, 0, deadline ? deadline : 1);
+    return LX_SWITCHED;
+}
+
+static lx_after_t sys_nanosleep(process_t* p, uint64_t req, int64_t* r) {
+    uint64_t ns;
+    if ((*r = read_timespec(p, req, &ns)) < 0) return LX_CONTINUE;
+    return sleep_until(p, clock_monotonic_ns() + ns);
+}
+
+static lx_after_t sys_clock_nanosleep(process_t* p, uint64_t clk, uint64_t flags, uint64_t req,
+                                      int64_t* r) {
+    uint64_t ns;
+    if ((*r = read_timespec(p, req, &ns)) < 0) return LX_CONTINUE;
+    bool realtime = clk == 0;
+    if (!realtime && clk != 1 && clk != 7) { *r = err(LX_EINVAL); return LX_CONTINUE; }
+    uint64_t now = clock_monotonic_ns();
+    if (!(flags & 1)) return sleep_until(p, now + ns);          /* relative */
+    if (realtime) {
+        /* An absolute wall time: the same distance from now on the
+         * monotonic clock. */
+        uint64_t wall = clock_realtime_ns();
+        files_note_time(wall);
+        return sleep_until(p, ns > wall ? now + (ns - wall) : now);
+    }
+    return sleep_until(p, ns);
+}
+
 /* ---- Signals (no delivery yet, #250) ---- */
 
 static int64_t sys_rt_sigaction(process_t* p, uint64_t oact) {
@@ -183,6 +224,12 @@ lx_after_t linux_syscall(process_t* p) {
         c->rax = 0;
         machine_yield(p);
         return LX_SWITCHED;
+    case LX_nanosleep:
+        if (sys_nanosleep(p, a0, &r) == LX_SWITCHED) return LX_SWITCHED;
+        break;
+    case LX_clock_nanosleep:
+        if (sys_clock_nanosleep(p, a0, a1, a2, &r) == LX_SWITCHED) return LX_SWITCHED;
+        break;
     case LX_getpid:
     case LX_gettid:          r = p->pid; break;
     case LX_getppid:         r = p->ppid; break;

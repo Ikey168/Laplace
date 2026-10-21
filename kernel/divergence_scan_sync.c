@@ -61,6 +61,9 @@ static uint32_t sum_proctable(void* ctx) {
         crc = divergence_checksum(crc, &pid, sizeof(pid));
         crc = divergence_checksum(crc, &alive, sizeof(alive));
         crc = divergence_checksum(crc, p->name, sizeof(p->name));
+        /* Scheduling state and the wait (#246). */
+        uint64_t wait[4] = { (uint64_t)p->state, p->wait_reason, p->wait_obj, p->wait_deadline };
+        crc = divergence_checksum(crc, wait, sizeof(wait));
         /* The address space's layout (#239): regions and the break. */
         for (vm_region_t* r = p->address_space ? p->address_space->regions : 0; r; r = r->next) {
             uint64_t reg[3] = { r->start_addr, r->end_addr, r->flags };

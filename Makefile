@@ -67,7 +67,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 
 # Linux programs (#238): plain C built against musl, unmodified.
 MUSL_CC     ?= musl-gcc
-LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe
+LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \
@@ -154,6 +154,7 @@ test: all selftest
 	bash tests/qemu/scale_gate.sh
 	bash tests/qemu/files_gate.sh
 	bash tests/qemu/input_gate.sh
+	bash tests/qemu/sleep_gate.sh
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 

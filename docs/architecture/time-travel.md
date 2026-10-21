@@ -123,6 +123,18 @@ are sized from the disk (640 to 2560 sectors) and the label records the size.
 Programs reach devices only through `machine_device_write`, which does
 nothing while replaying, so a replay never repeats an external side effect.
 
+**Blocking and idle** (#246, `include/core/machine.h`). A process that
+waits leaves the run queue with a reason, the object it waits on, and an
+optional deadline; the wait is part of the `procs` section and of the
+process-table checksum. A wake caused by another process's call is
+deterministic. A deadline passing is an input: while recording, the kernel
+compares deadlines with the clock at every entry and while idle, wakes the
+process, and journals the wake (a `kio_event`) with the step it was delivered
+at; a replay delivers it at that step and never waits. When nothing can run,
+the kernel halts with interrupts enabled until a wake is due or a debugger
+asks to stop: idle time adds no steps. `nanosleep` and `clock_nanosleep` use
+this; futexes, `wait4`, `poll`, and console input reuse it.
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the
