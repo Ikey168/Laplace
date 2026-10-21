@@ -4,6 +4,7 @@
 #include "core/mm.h"
 #include "core/cpu.h"
 #include "core/vm.h"
+#include "core/kfpages.h"
 #include "core/console.h"
 #include "checkpoint.h"   /* checkpoint_handle_write_fault (copy_to_user) */
 
@@ -363,6 +364,27 @@ void vmm_for_each_page(vm_space_t* space, vmm_page_fn fn, void* ctx) {
     }
 }
 
+void vmm_for_each_pte(vm_space_t* space, vmm_pte_fn fn, void* ctx) {
+    pte_t* pml4 = space->pml4_virt;
+    for (int i4 = 0; i4 < 256; i4++) {
+        if (!(pml4[i4] & PAGE_PRESENT)) continue;
+        pte_t* pdpt = table_at(pml4[i4]);
+        for (int i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt[i3] & PAGE_PRESENT)) continue;
+            pte_t* pd = table_at(pdpt[i3]);
+            for (int i2 = 0; i2 < 512; i2++) {
+                if (!(pd[i2] & PAGE_PRESENT)) continue;
+                pte_t* pt = table_at(pd[i2]);
+                for (int i1 = 0; i1 < 512; i1++) {
+                    if (!(pt[i1] & PAGE_PRESENT)) continue;
+                    fn(ctx, ((uint64_t)i4 << 39) | ((uint64_t)i3 << 30) | ((uint64_t)i2 << 21) |
+                            ((uint64_t)i1 << 12), &pt[i1]);
+                }
+            }
+        }
+    }
+}
+
 void vmm_destroy_address_space(vm_space_t* space) {
     if (!space || space == &g_kernel_space) return;
     if (g_current == space) vmm_switch_address_space(0);
@@ -463,9 +485,9 @@ bool uaccess_write(vm_space_t* space, uint64_t uaddr, const void* src, uint64_t 
         if (!(*pte & PAGE_USER)) return false;
         if (!(*pte & PAGE_WRITABLE)) {
             /* A snapshot-COW page: preserve the pre-write image first. */
-            if (!(*pte & PAGE_SNAPSHOT_COW) || !checkpoint_handle_write_fault(space, uaddr)) {
-                return false;
-            }
+            if (!(*pte & PAGE_SNAPSHOT_COW)) return false;
+            kfp_before_write(space, uaddr);
+            if (!checkpoint_handle_write_fault(space, uaddr)) return false;
         }
         uint64_t phys = (*pte & LP_PTE_ADDR_MASK) | (uaddr & 0xFFF);
         uint64_t chunk = PAGE_SIZE - (uaddr & 0xFFF);

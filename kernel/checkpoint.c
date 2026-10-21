@@ -115,7 +115,7 @@ bool checkpoint_resolve_pte(pte_t* pte) {
     }
     /* Restore write permission and drop the snapshot tag: the pre-write image
      * has been captured, so the page may be written normally again. */
-    entry &= ~(pte_t)PAGE_SNAPSHOT_COW;
+    entry &= ~(pte_t)(PAGE_SNAPSHOT_COW | PAGE_KF_KNOWN);   /* about to change (#244) */
     entry |= PAGE_WRITABLE;
     *pte = entry;
     return true;
@@ -670,6 +670,11 @@ int checkpoint_persistence_init(snapshot_store_t* store, fat_block_device_t* dev
 /* ----- Take ----- */
 
 static checkpoint_context_fn g_context_fn;
+static checkpoint_mark_fn    g_mark_fn;
+
+void checkpoint_set_mark_fn(checkpoint_mark_fn fn) {
+    g_mark_fn = fn;
+}
 
 void checkpoint_set_context_fn(checkpoint_context_fn fn) {
     g_context_fn = fn;
@@ -693,7 +698,8 @@ uint64_t checkpoint_take(void) {
         if (!proc || !proc->address_space) {
             continue;
         }
-        int marked = checkpoint_mark_space(proc->address_space, epoch);
+        int marked = g_mark_fn ? g_mark_fn(proc->address_space, epoch)
+                               : checkpoint_mark_space(proc->address_space, epoch);
         if (marked < 0) {
             continue;
         }

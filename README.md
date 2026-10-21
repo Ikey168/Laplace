@@ -196,6 +196,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Unmodified static Linux programs (musl) run; their clock and random reads replay exactly | `tests/qemu/linux_gate.sh` |
 | Programs load from outside the kernel (Multiboot modules, static and static-PIE) with argv and envp; a recording refuses to resume with changed binaries | `tests/qemu/loader_gate.sh` |
 | malloc, `mmap`/`munmap`/`mprotect`/`mremap`, `brk`, and a demand-paged stack replay exactly with keyframes between the calls, at 512 MiB and 4 GiB of RAM | `tests/qemu/vm_gate.sh` |
+| Incremental keyframes: 256 MiB resident records at about 90 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
@@ -213,8 +214,9 @@ Limits, stated plainly:
   `rdrand`, `rdseed`, and `rdpid` cannot be trapped: they are hidden from the
   table, and a program that executes them anyway diverges; `verify` then names
   the instruction and its address (#241).
-- Every keyframe is a full copy of every user page into a 1 MiB slot (at most
-  227 pages), so the recorded machine must fit in under 1 MiB (#244).
+- Keyframes are incremental (#244): each writes only the pages dirtied since
+  the previous one into a reference-counted page pool on the disk, so memory
+  is limited by the pool (the disk's size, or `pool=` for the RAM disk).
 - x87, SSE, and AVX state is saved and verified (#237); AVX-512 is not enabled
   in XCR0, so programs see no AVX-512.
 - Workloads are Laplace's own programs (`user/laplace/`, `int 0x80`) and
@@ -267,6 +269,8 @@ Kernel command line (`make run APPEND="..."`):
 | `keyframes=N` | retained keyframes, the rewind horizon (default 16) |
 | `fresh` | ignore a recording on the disk and cold-boot |
 | `stop_after=N` | stop for the debugger after N keyframes |
+| `dirty=N` | also take a keyframe once an epoch dirties N pages (default 8192) |
+| `pool=N` | without an IDE disk: the RAM disk's page pool in MiB (default 64) |
 
 | Target | Description |
 |--------|-------------|

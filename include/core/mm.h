@@ -62,6 +62,11 @@ void vmm_for_each_page(vm_space_t* space, vmm_page_fn fn, void* ctx);
  * hook first, so a pending keyframe keeps the pre-write image. Both fail
  * (return false) if any byte is unmapped or outside user space; copy_to_user
  * also fails on a page that is read-only for the user. */
+/* Every present user PTE of `space`, in ascending address order, by pointer
+ * (the callback may change it; the caller flushes the TLB). */
+typedef void (*vmm_pte_fn)(void* ctx, uint64_t va, pte_t* pte);
+void vmm_for_each_pte(vm_space_t* space, vmm_pte_fn fn, void* ctx);
+
 bool uaccess_read(vm_space_t* space, uint64_t uaddr, void* dst, uint64_t len);
 bool uaccess_write(vm_space_t* space, uint64_t uaddr, const void* src, uint64_t len);
 

@@ -30,6 +30,7 @@ typedef struct {
     uint32_t interval_ticks;     /* keyframe cadence */
     uint32_t keyframes;          /* retained keyframes (rewind horizon) */
     uint32_t stop_after;         /* stop for the debugger after N keyframes (0: never) */
+    uint32_t dirty_pages;        /* also take one when an epoch dirties this many (0: never) */
 } tt_config_t;
 
 /* Arm the stores on `dev` (formatting it if it holds none). Returns 0. Sets
@@ -41,7 +42,7 @@ bool tt_ready(void);
 void tt_bind_verbs(void);
 /* A RAM-backed block device for when no disk is attached (volatile). */
 fat_block_device_t* tt_ram_device(uint32_t sectors);
-uint32_t tt_required_sectors(uint32_t keyframes);
+uint32_t tt_required_sectors(uint32_t keyframes, uint32_t pool_mib);
 
 /* ---- Machine hooks (live recording) ---- */
 void tt_on_tick(void);

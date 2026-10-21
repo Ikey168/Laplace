@@ -135,6 +135,11 @@ struct process;
 typedef uint32_t (*checkpoint_context_fn)(struct process* proc, uint8_t* page);
 void checkpoint_set_context_fn(checkpoint_context_fn fn);
 
+/* Replace the per-space COW marking checkpoint_take does (default:
+ * checkpoint_mark_space). Returns the pages marked, or < 0. (#244) */
+typedef int (*checkpoint_mark_fn)(vm_space_t* space, uint64_t epoch);
+void checkpoint_set_mark_fn(checkpoint_mark_fn fn);
+
 /* Persist an arbitrary-size kernel-state blob (v2, #139) as one or more
  * CHECKPOINT_REC_KERNEL records, chunked into pages and tagged with `tag` (which
  * kernel structure it is). Each record encodes the total size and chunk index in

@@ -23,6 +23,7 @@
 #include "core/mm.h"             /* vmm_for_each_page */
 #include "core/machine.h"        /* machine_current, machine_pending */
 #include "core/kstate.h"         /* kstate_register_checksums */
+#include "core/kfpages.h"        /* kfp_page_crc */
 #include <stddef.h>
 
 /* ---- Source registry ---- */
@@ -86,21 +87,25 @@ static uint32_t sum_scheduler(void* ctx) {
 }
 
 /* User memory: every mapped page's address, user bit, and contents, per process. */
-typedef struct { uint32_t crc; } page_sum_t;
+typedef struct { uint32_t crc; uint32_t pid; } page_sum_t;
 static void sum_one_page(void* c, uint64_t virt, uint64_t phys, pte_t pte) {
     page_sum_t* s = (page_sum_t*)c;
     /* The user bit is the page's protection as mprotect left it (#239); the
-     * write bit is not, since snapshot-COW clears it until the first write. */
+     * write bit is not, since snapshot-COW clears it until the first write.
+     * The contents enter as the page's CRC, cached for pages unchanged since
+     * the reference keyframe (#244), so a boundary hashes only dirty pages. */
     uint64_t key = virt | ((pte & PAGE_USER) ? 1 : 0);
+    uint32_t pc = kfp_page_crc(s->pid, virt, phys, pte);
     s->crc = divergence_checksum(s->crc, &key, sizeof(key));
-    s->crc = divergence_checksum(s->crc, P2V(phys), PAGE_SIZE);
+    s->crc = divergence_checksum(s->crc, &pc, sizeof(pc));
 }
 static uint32_t sum_user_pages(void* ctx) {
     (void)ctx;
-    page_sum_t s = { 0 };
+    page_sum_t s = { 0, 0 };
     for (uint32_t i = 0; i < proc_count(); i++) {
         process_t* p = proc_at(i);
         uint32_t pid = (uint32_t)p->pid;
+        s.pid = pid;
         s.crc = divergence_checksum(s.crc, &pid, sizeof(pid));
         vmm_for_each_page(p->address_space, sum_one_page, &s);
     }

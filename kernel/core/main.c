@@ -4,6 +4,10 @@
  *   run=a,b,c      programs to start on a cold boot (default heisenbug,noise,noise)
  *   interval=N     keyframe cadence in timer ticks (default 100; 1 tick = 1 ms)
  *   keyframes=N    retained keyframes, the rewind horizon (default 16)
+ *   dirty=N        also take a keyframe once an epoch dirties N pages (default
+ *                  8192, 32 MiB; 0: never)
+ *   pool=N         without an IDE disk: the RAM disk's page pool in MiB
+ *                  (default 64; it takes memory only as keyframes fill it)
  *   fresh          ignore a recording on the disk and cold-boot
  *   stop_after=N   stop the machine for the debugger after N keyframes
  *   selftest       after the machine stops, verify the recording and halt
@@ -18,6 +22,7 @@
 #include "core/machine.h"
 #include "core/timetravel.h"
 #include "core/kstate.h"
+#include "core/kfpages.h"
 #include "core/monitor.h"
 #include "core/clock.h"
 #include "checkpoint.h"
@@ -41,6 +46,8 @@ typedef struct {
     uint32_t interval;
     uint32_t keyframes;
     uint32_t stop_after;
+    uint32_t dirty;
+    uint32_t pool_mib;
     bool     fresh;
     bool     selftest;
     bool     exit;
@@ -69,6 +76,8 @@ static void parse_cmdline(const char* cmd) {
     for (uint32_t i = 0; dflt[i]; i++) g_opts.run[i] = dflt[i];
     g_opts.interval = 100;
     g_opts.keyframes = 16;
+    g_opts.dirty = 8192;
+    g_opts.pool_mib = 64;
     if (!cmd) return;
     while (*cmd) {
         while (*cmd == ' ') cmd++;
@@ -89,6 +98,10 @@ static void parse_cmdline(const char* cmd) {
             g_opts.keyframes = parse_u32(tok + 10, len - 10);
         } else if (len > 11 && strncmp(tok, "stop_after=", 11) == 0) {
             g_opts.stop_after = parse_u32(tok + 11, len - 11);
+        } else if (len > 6 && strncmp(tok, "dirty=", 6) == 0) {
+            g_opts.dirty = parse_u32(tok + 6, len - 6);
+        } else if (len > 5 && strncmp(tok, "pool=", 5) == 0) {
+            g_opts.pool_mib = parse_u32(tok + 5, len - 5);
         } else if (len == 5 && strncmp(tok, "fresh", 5) == 0) {
             g_opts.fresh = true;
         } else if (len == 8 && strncmp(tok, "selftest", 8) == 0) {
@@ -100,6 +113,7 @@ static void parse_cmdline(const char* cmd) {
     if (g_opts.interval == 0) g_opts.interval = 1;
     if (g_opts.keyframes < 2) g_opts.keyframes = 2;
     if (g_opts.keyframes > 64) g_opts.keyframes = 64;
+    if (g_opts.pool_mib < 8) g_opts.pool_mib = 8;
 }
 
 /* Live entropy: RDRAND when the CPU has it, else a cycle-counter mix. Either
@@ -200,6 +214,10 @@ static bool selftest(void) {
             "%lu COW captures, %lu journals\n",
             w.oldest, w.newest, w.count, w.end_step, s->keyframes_taken, s->cow_captures,
             s->journals_written);
+    const kfp_stats_t* ps = kfp_stats();
+    kprintf("selftest: keyframe pages: %lu written, %lu kept their slot; the newest keyframe has "
+            "%lu pages and wrote %lu; pool %u of %u slots in use\n", ps->pages_written,
+            ps->pages_reused, ps->last_pages, ps->last_written, ps->slots_used, ps->slots_total);
     tt_verify_t v;
     int rc = tt_verify(&v);
     kprintf("selftest: verify rc=%d: %u epochs replayed, %u diverged\n", rc, v.epochs_checked,
@@ -257,6 +275,8 @@ static bool selftest(void) {
             bad.first_component, who);
     ok = ok && bad.diverged && strcmp(who, "probe") == 0;
     tt_verify(&v);   /* back to the end of the recording, clean */
+    kprintf("selftest: restored pages: %lu frames kept, %lu from the cache, %lu read from the pool\n",
+            kfp_stats()->restore_kept, kfp_stats()->restore_cached, kfp_stats()->restore_read);
 
     /* A scan of the newest epoch visits every position through the stop
      * point, and nothing else. */
@@ -393,11 +413,11 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     if (dev) {
         kprintf("boot: recording to the IDE disk (%u sectors)\n", dev->total_sectors);
     } else {
-        dev = tt_ram_device(tt_required_sectors(g_opts.keyframes));
+        dev = tt_ram_device(tt_required_sectors(g_opts.keyframes, g_opts.pool_mib));
         if (!dev) panic("no disk and no memory for a RAM disk");
         kprintf("boot: no IDE disk; recording to a RAM disk (lost at power-off)\n");
     }
-    tt_config_t cfg = { g_opts.interval, g_opts.keyframes, g_opts.stop_after };
+    tt_config_t cfg = { g_opts.interval, g_opts.keyframes, g_opts.stop_after, g_opts.dirty };
     bool had_keyframe = false;
     if (tt_init(dev, &cfg, &had_keyframe) != 0) panic("cannot arm the recording store");
     tt_bind_verbs();

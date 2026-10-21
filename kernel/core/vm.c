@@ -6,6 +6,7 @@
 #include "core/linux.h"
 #include "core/timetravel.h"
 #include "core/console.h"
+#include "core/kfpages.h"
 
 void* memcpy(void* dst, const void* src, size_t n);
 
@@ -47,6 +48,7 @@ bool vm_fault_in(vm_space_t* s, uint64_t va, bool write) {
     tt_before_mapping_change();
     uint64_t phys = pmm_alloc();
     if (!phys) return false;
+    kfp_page_added();
     return vmm_map_page(s, page, phys, f) == 0;
 }
 
@@ -230,6 +232,8 @@ int64_t vm_mprotect(process_t* p, uint64_t addr, uint64_t len, uint64_t prot) {
             if (!(f & PAGE_WRITABLE)) {
                 /* Nothing can write it now: its content is the keyframe's. */
                 e &= ~(pte_t)PAGE_SNAPSHOT_COW;
+            } else if (e & PAGE_KF_KNOWN) {
+                e |= PAGE_SNAPSHOT_COW;  /* unchanged since the keyframe: fault on write (#244) */
             } else if (!(e & PAGE_SNAPSHOT_COW)) {
                 e |= PAGE_WRITABLE;   /* a snapshot-COW page becomes writable on its fault */
             }
@@ -271,7 +275,7 @@ int64_t vm_mremap(process_t* p, uint64_t old, uint64_t old_len, uint64_t new_len
         if (!from || !(*from & PAGE_PRESENT)) continue;
         pte_t* to = vmm_get_page_table(s, at + off, PT_LEVEL, true);
         if (!to) return err(LX_ENOMEM);
-        *to = *from;
+        *to = *from & ~(pte_t)PAGE_KF_KNOWN;   /* the keyframe had it elsewhere (#244) */
         *from = 0;
         vmm_flush_tlb_page(old + off);
     }

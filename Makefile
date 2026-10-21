@@ -37,7 +37,8 @@ CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
             kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
-            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c
+            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c \
+            kernel/core/kfpages.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
 # kernel adapters.
@@ -53,7 +54,7 @@ TT_C := kernel/checkpoint.c kernel/snapshot_store.c kernel/checkpoint_extstate.c
         kernel/rewind.c kernel/rewind_sync.c kernel/reverse.c kernel/reverse_sync.c \
         kernel/revbreak.c kernel/revbreak_sync.c kernel/gdbstub.c kernel/gdbstub_sync.c \
         kernel/gdb_serial.c kernel/mcp.c kernel/mcp_sync.c kernel/mcp_server.c \
-        kernel/kstate_format.c
+        kernel/kstate_format.c kernel/page_store.c
 
 KERNEL_C    := $(CORE_C) $(TT_C)
 KERNEL_OBJS := $(patsubst %.asm,$(KBUILD)/%.o,$(CORE_ASM)) \
@@ -66,7 +67,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 
 # Linux programs (#238): plain C built against musl, unmodified.
 MUSL_CC     ?= musl-gcc
-LINUX_PROGS := hello sysprobe vmprobe
+LINUX_PROGS := hello sysprobe vmprobe bigmem
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \
@@ -108,6 +109,8 @@ $(KBUILD)/%.o: %.asm
 
 # The machine's disk: keyframes and journals live here and survive reboots.
 DISK       ?= $(BUILD)/disk.img
+# Sparse; the page pool gets what the keyframe regions leave (#244).
+DISK_SIZE  ?= 1G
 GDB_PORT   ?= 1235
 MCP_PORT   ?= 1236
 APPEND     ?=
@@ -115,7 +118,7 @@ QEMU_FLAGS ?= -m 256M -display none -no-reboot
 
 $(DISK):
 	@mkdir -p $(dir $@)
-	truncate -s 64M $@
+	truncate -s $(DISK_SIZE) $@
 
 # Console on stdio; gdb (COM2) and MCP (COM3) on TCP. Attach with
 #   gdb build/user/heisenbug.elf -ex 'target remote :$(GDB_PORT)'
@@ -143,6 +146,7 @@ test: all selftest
 	bash tests/qemu/linux_gate.sh
 	bash tests/qemu/loader_gate.sh
 	bash tests/qemu/vm_gate.sh
+	bash tests/qemu/scale_gate.sh
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 

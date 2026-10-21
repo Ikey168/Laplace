@@ -14,6 +14,7 @@
 #include "core/kjournal.h"
 #include "core/linux.h"
 #include "core/vm.h"
+#include "core/kfpages.h"
 
 void* memset(void* dst, int c, size_t n);
 
@@ -659,6 +660,7 @@ void trap_dispatch(trap_frame_t* f) {
         /* A user write to a present page: a snapshot-COW capture is invisible
          * to the program and is not a step. */
         uint64_t cr2 = read_cr2();
+        kfp_before_write(g_cur->address_space, cr2);
         if (checkpoint_handle_write_fault(g_cur->address_space, cr2)) return;
     }
     if (f->vector == VEC_PAGE_FAULT && !(f->error & 0x1)) {

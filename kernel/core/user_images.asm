@@ -21,5 +21,6 @@ USER_IMAGE fpuprobe
 USER_IMAGE musl_hello
 USER_IMAGE musl_sysprobe
 USER_IMAGE musl_vmprobe
+USER_IMAGE musl_bigmem
 
 section .note.GNU-stack noalloc noexec nowrite progbits

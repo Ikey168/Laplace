@@ -122,8 +122,34 @@ divergence component (6 and up), and every report names the component:
 restore and requires that name.
 
 **Storage.** The first IDE disk (or a RAM disk) holds a label, the keyframe
-store (a ring index plus N double-buffered regions), and the journal ring: one
-journal per retained keyframe (`kernel/journal_ring.c`). Journal E holds the
+store (a ring index plus N double-buffered regions), the journal ring (one
+journal per retained keyframe, `kernel/journal_ring.c`), and the page pool.
+Region sizes follow the disk size at format time: a keyframe region gets
+1/16 of the disk's share per keyframe (512 to 4096 sectors), the pool the
+rest.
+
+**Incremental keyframes** (#244, `include/page_store.h`,
+`include/core/kfpages.h`). A keyframe region holds the kernel state, the
+registers, and a page manifest: runs of (pid, address, count, first slot)
+into the pool, where each slot holds one page. The kernel knows which pages
+are unchanged since a reference keyframe (the newest one taken, or the one
+last restored) from a software PTE bit, `PAGE_KF_KNOWN`: taking or restoring
+a keyframe sets it on every page, and the snapshot-COW write fault (or an
+mremap move) clears it. A keyframe reuses the slots of the pages still KNOWN
+and writes only the others, so its cost follows the pages its epoch dirtied,
+not resident memory: with 256 MiB resident and a 64-page working set, about
+90 pages per keyframe (`tests/qemu/scale_gate.sh`). Slots are
+reference-counted by the retained manifests; evicting a keyframe frees only
+slots no other keyframe names, so the full keyframe written while memory
+filled can go while the ones after it still restore. Counts live in memory
+and are rebuilt at boot from the manifests on the disk. A keyframe is also
+taken early when its epoch has dirtied `dirty=` pages (default 8192).
+
+The same bit makes the epoch-boundary checksum of user memory cheap: a KNOWN
+page's CRC is its slot's, computed once when the slot was written. And it
+makes restore cheap: the frames of KNOWN pages whose slot the target
+keyframe also names are kept, replay saves a pristine copy of a page at its
+first write, and only the rest is read from the pool. Journal E holds the
 inputs from keyframe E to keyframe E+1 (or to the stop point, for the newest
 epoch): preemption steps, time reads, entropy, the divergence checksums of the
 state at its end, and its length in steps.
@@ -162,9 +188,13 @@ the recording and continues live, still recording.
   them, and executing them anyway is a divergence that `verify` names. Without
   CPUID faulting (QEMU TCG), user `cpuid` runs natively: deterministic on one
   host, but a recording moved to another CPU may diverge (#241).
-- A keyframe is a full copy of every mapped user page, written into one region
-  slot of `KF_SLOT_SECTORS` (2048 sectors, at most 227 page records), so the
-  recorded machine must fit in under 1 MiB (#244).
+- The page pool must hold every distinct page the retained keyframes need:
+  resident memory plus what the window's epochs dirtied. A full pool stops the
+  recording with a message naming its size; give it a larger disk (or `pool=`
+  for the RAM disk).
+- An epoch that maps a lot of new memory (a program filling its heap) has a
+  keyframe at each end that differ in most pages, so replaying across it
+  rereads those pages from the pool.
 - x87, SSE, and AVX are saved (XSAVE with XCR0 = x87|SSE|AVX, or FXSAVE);
   AVX-512 and the XSAVE optimizations (XSAVEOPT, XSAVEC, XGETBV1) are not
   offered to programs.

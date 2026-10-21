@@ -29,6 +29,7 @@ extern const uint8_t user_image_fpuprobe[], user_image_fpuprobe_end[];
 extern const uint8_t user_image_musl_hello[], user_image_musl_hello_end[];
 extern const uint8_t user_image_musl_sysprobe[], user_image_musl_sysprobe_end[];
 extern const uint8_t user_image_musl_vmprobe[], user_image_musl_vmprobe_end[];
+extern const uint8_t user_image_musl_bigmem[], user_image_musl_bigmem_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -41,6 +42,7 @@ static const lp_image_t g_images[] = {
     { "musl_hello", user_image_musl_hello, user_image_musl_hello_end, true },
     { "musl_sysprobe", user_image_musl_sysprobe, user_image_musl_sysprobe_end, true },
     { "musl_vmprobe", user_image_musl_vmprobe, user_image_musl_vmprobe_end, true },
+    { "musl_bigmem", user_image_musl_bigmem, user_image_musl_bigmem_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {

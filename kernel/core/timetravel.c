@@ -23,6 +23,7 @@
 #include "core/clock.h"
 #include "core/vm.h"
 #include "core/kstate.h"
+#include "core/kfpages.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -30,16 +31,27 @@ void* memcpy(void* dst, const void* src, size_t n);
 /* ---- On-disk layout ----
  *
  *   sector 0                      label (geometry + magic)
- *   [KF_BASE, KF_BASE + kf)       keyframe store: ring index + N regions
+ *   [KF_BASE, KF_BASE + kf)       keyframe store: ring index + N regions, each
+ *                                 a keyframe's kernel state, registers, and
+ *                                 page manifest
  *   [J_BASE, J_BASE + j)          journal ring: N regions
+ *   [POOL_BASE, end)              page pool: one slot (8 sectors) per distinct
+ *                                 page the retained keyframes hold (#244)
+ *
+ * Region sizes follow the disk's: a keyframe region gets 1/16 of the disk's
+ * share per keyframe (512..4096 sectors), the pool the rest.
  */
 #define LABEL_MAGIC       0x3145434150414C4CULL   /* "LLAPACE1" */
-#define LABEL_VERSION     6   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240);
-                                 5: region list (#239); 6: sectioned kernel state (#243) */
+#define LABEL_VERSION     7   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240);
+                                 5: region list (#239); 6: sectioned kernel state (#243);
+                                 7: page pool (#244) */
 #define KF_BASE           8
 #define KF_INDEX_SECTORS  4
-#define KF_SLOT_SECTORS   2048   /* per region slot: up to 227 page records */
+#define KF_SLOT_MIN       512    /* per keyframe region (x2, double-buffered) */
+#define KF_SLOT_MAX       4096
 #define J_SLOT_SECTORS    640    /* per journal slot: up to 10224 events */
+#define POOL_MIN_SLOTS    1024
+#define KFP_TAG           0x4D50u   /* "PM": the page manifest blob */
 
 typedef struct {
     uint64_t magic;
@@ -49,8 +61,36 @@ typedef struct {
     uint32_t j_slot_sectors;
     uint32_t kf_base;
     uint32_t j_base;
+    uint32_t pool_base;
+    uint32_t pool_slots;
     uint32_t crc;
 } tt_label_t;
+
+typedef struct {
+    uint32_t slot;          /* keyframe region sectors */
+    uint32_t j_base;
+    uint32_t pool_base;
+    uint32_t pool_slots;
+} geom_t;
+
+static uint32_t meta_sectors(uint32_t keyframes, uint32_t slot) {
+    return KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, slot)
+         + journal_ring_total_sectors(keyframes, J_SLOT_SECTORS);
+}
+
+static bool geometry(uint32_t total, uint32_t keyframes, geom_t* g) {
+    uint32_t slot = total / (keyframes * 16);
+    if (slot < KF_SLOT_MIN) slot = KF_SLOT_MIN;
+    if (slot > KF_SLOT_MAX) slot = KF_SLOT_MAX;
+    slot &= ~7u;
+    uint32_t base = (meta_sectors(keyframes, slot) + 7) & ~7u;
+    if (base > total || (total - base) / 8 < POOL_MIN_SLOTS) return false;
+    g->slot = slot;
+    g->j_base = KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, slot);
+    g->pool_base = base;
+    g->pool_slots = (total - base) / 8;
+    return true;
+}
 
 /* Kernel-state blob captured with every keyframe (#224, #243): one section per
  * kernel subsystem, see include/core/kstate.h. */
@@ -106,13 +146,15 @@ static uint64_t* g_ram_frames;
 static uint32_t  g_ram_sectors;
 static fat_block_device_t g_ram_dev;
 
+/* Frames are allocated on first write; an unwritten sector reads as zeros. */
 static int ram_read(void* d, uint32_t s, uint32_t n, void* buf) {
     (void)d;
     if ((uint64_t)s + n > g_ram_sectors) return -1;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t sec = s + i;
-        memcpy((uint8_t*)buf + (uint64_t)i * 512,
-               P2V(g_ram_frames[sec / 8] + (sec % 8) * 512), 512);
+        uint64_t f = g_ram_frames[sec / 8];
+        if (f) memcpy((uint8_t*)buf + (uint64_t)i * 512, P2V(f + (sec % 8) * 512), 512);
+        else memset((uint8_t*)buf + (uint64_t)i * 512, 0, 512);
     }
     return 0;
 }
@@ -122,6 +164,7 @@ static int ram_write(void* d, uint32_t s, uint32_t n, const void* buf) {
     if ((uint64_t)s + n > g_ram_sectors) return -1;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t sec = s + i;
+        if (!g_ram_frames[sec / 8] && !(g_ram_frames[sec / 8] = pmm_alloc())) return -1;
         memcpy(P2V(g_ram_frames[sec / 8] + (sec % 8) * 512),
                (const uint8_t*)buf + (uint64_t)i * 512, 512);
     }
@@ -130,12 +173,8 @@ static int ram_write(void* d, uint32_t s, uint32_t n, const void* buf) {
 
 fat_block_device_t* tt_ram_device(uint32_t sectors) {
     uint32_t pages = (sectors + 7) / 8;
-    g_ram_frames = (uint64_t*)kmalloc(pages * sizeof(uint64_t));
+    g_ram_frames = (uint64_t*)kzalloc((uint64_t)pages * sizeof(uint64_t));
     if (!g_ram_frames) return 0;
-    for (uint32_t i = 0; i < pages; i++) {
-        g_ram_frames[i] = pmm_alloc();
-        if (!g_ram_frames[i]) return 0;
-    }
     g_ram_sectors = pages * 8;
     g_ram_dev.read_sectors = ram_read;
     g_ram_dev.write_sectors = ram_write;
@@ -145,9 +184,10 @@ fat_block_device_t* tt_ram_device(uint32_t sectors) {
     return &g_ram_dev;
 }
 
-uint32_t tt_required_sectors(uint32_t keyframes) {
-    return KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, KF_SLOT_SECTORS)
-         + journal_ring_total_sectors(keyframes, J_SLOT_SECTORS);
+uint32_t tt_required_sectors(uint32_t keyframes, uint32_t pool_mib) {
+    /* Enough for the largest keyframe regions plus the pool asked for. */
+    uint64_t n = ((meta_sectors(keyframes, KF_SLOT_MAX) + 7) & ~7u) + (uint64_t)pool_mib * 2048;
+    return n > 0xFFFFFFF8u ? 0xFFFFFFF8u : (uint32_t)n;
 }
 
 /* ---- Setup ---- */
@@ -156,14 +196,16 @@ static uint32_t label_crc(const tt_label_t* l) {
     return snapshot_crc32(0, l, (uint32_t)__builtin_offsetof(tt_label_t, crc));
 }
 
+static uint8_t* load_blob(uint64_t epoch, uint32_t tag, uint32_t* len);
+
 int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe) {
     *had_keyframe = false;
     g_cfg = *cfg;
     uint32_t capacity = cfg->keyframes;
-    while (capacity > 2 && tt_required_sectors(capacity) > dev->total_sectors) capacity--;
-    if (tt_required_sectors(capacity) > dev->total_sectors) {
-        kprintf("timetravel: disk too small (%u sectors, need %u)\n",
-                dev->total_sectors, tt_required_sectors(capacity));
+    geom_t g;
+    while (capacity > 2 && !geometry(dev->total_sectors, capacity, &g)) capacity--;
+    if (!geometry(dev->total_sectors, capacity, &g)) {
+        kprintf("timetravel: disk too small (%u sectors)\n", dev->total_sectors);
         return -1;
     }
     g_cfg.keyframes = capacity;
@@ -173,10 +215,12 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
     want.magic = LABEL_MAGIC;
     want.version = LABEL_VERSION;
     want.capacity = capacity;
-    want.kf_slot_sectors = KF_SLOT_SECTORS;
+    want.kf_slot_sectors = g.slot;
     want.j_slot_sectors = J_SLOT_SECTORS;
     want.kf_base = KF_BASE;
-    want.j_base = KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, capacity, KF_SLOT_SECTORS);
+    want.j_base = g.j_base;
+    want.pool_base = g.pool_base;
+    want.pool_slots = g.pool_slots;
     want.crc = label_crc(&want);
 
     static uint8_t sector[512];
@@ -187,19 +231,19 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
         reuse = have.crc == label_crc(&have) && have.magic == want.magic &&
                 have.version == want.version && have.capacity == want.capacity &&
                 have.kf_slot_sectors == want.kf_slot_sectors &&
-                have.j_slot_sectors == want.j_slot_sectors;
+                have.j_slot_sectors == want.j_slot_sectors && have.pool_base == want.pool_base &&
+                have.pool_slots == want.pool_slots;
     }
 
     if (!reuse) {
         /* A blank or foreign disk: invalidate any stale keyframe index first,
-         * then provision both stores and write the label last. */
+         * then provision the stores and write the label last. */
         memset(sector, 0, sizeof(sector));
         for (uint32_t s = 0; s < KF_BASE + KF_INDEX_SECTORS; s++) {
             dev->write_sectors(dev->private_data, s, 1, sector);
         }
     }
-    if (keyframe_store_arm(dev, KF_BASE, KF_INDEX_SECTORS, capacity, KF_SLOT_SECTORS)
-            != KEYFRAME_STORE_OK) {
+    if (keyframe_store_arm(dev, KF_BASE, KF_INDEX_SECTORS, capacity, g.slot) != KEYFRAME_STORE_OK) {
         kprintf("timetravel: keyframe store failed\n");
         return -1;
     }
@@ -207,6 +251,11 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
         kprintf("timetravel: journal ring failed\n");
         return -1;
     }
+    if (kfp_init(dev, g.pool_base, g.pool_slots) != 0) {
+        kprintf("timetravel: no memory for the page pool's counts\n");
+        return -1;
+    }
+    checkpoint_set_mark_fn(kfp_mark_space);
     if (!reuse) {
         memset(sector, 0, sizeof(sector));
         memcpy(sector, &want, sizeof(want));
@@ -217,11 +266,27 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
     }
 
     const keyframe_ring_t* ring = keyframe_store_ring(keyframe_store_get());
-    *had_keyframe = reuse && keyframe_ring_count(ring) > 0;
     g_ready = true;
-    kprintf("timetravel: store %s: %u keyframes x %u sectors, journal ring at %u, %u sectors total\n",
-            reuse ? "reused" : "formatted", capacity, 1 + 2 * KF_SLOT_SECTORS, want.j_base,
-            tt_required_sectors(capacity));
+    if (reuse && keyframe_ring_count(ring) > 0) {
+        /* The retained keyframes' manifests say which pool slots are in use. */
+        tt_window_t w;
+        bool all = tt_window(&w);
+        for (uint64_t e = w.oldest; all && e <= w.newest; e++) {
+            uint32_t slot;
+            uint64_t found;
+            if (!keyframe_ring_find(ring, e, &slot, &found) || found != e) continue;
+            uint32_t len = 0;
+            uint8_t* blob = load_blob(e, KFP_TAG, &len);
+            if (!blob || kfp_adopt(e, blob, len) != 0) all = false;
+            if (blob) kfree(blob);
+        }
+        if (!all) kprintf("timetravel: a retained keyframe's page manifest is unreadable\n");
+        *had_keyframe = all;
+    }
+    kprintf("timetravel: store %s: %u keyframes x %u sectors, journal ring at %u, "
+            "page pool of %u slots (%u MiB) at %u\n",
+            reuse ? "reused" : "formatted", capacity, 1 + 2 * g.slot, want.j_base, g.pool_slots,
+            g.pool_slots / 256, g.pool_base);
     return 0;
 }
 
@@ -254,7 +319,7 @@ static void do_writeback(void) {
     for (checkpoint_capture_t* c = checkpoint_captures(); c; c = c->next) {
         if (c->flags == 0) pages++;
     }
-    int rc = checkpoint_writeback_keyframe();
+    int rc = kfp_writeback();
     if (rc != CHECKPOINT_OK) panic("timetravel: keyframe writeback failed (%d)", rc);
     g_wb_pending = false;
     g_stats.writebacks++;
@@ -274,8 +339,10 @@ static void take_keyframe(void) {
     do_writeback();
     if (machine_epoch() > 0) close_epoch(machine_epoch(), steps);
 
+    kfp_begin_take();             /* which pages changed since the last keyframe */
     uint64_t e = checkpoint_take();
     if (e == 0) panic("timetravel: checkpoint_take failed");
+    kfp_end_take(e, KFP_TAG);
     machine_set_position(e, 0);
     capture_kstate(e);
 
@@ -302,8 +369,10 @@ void tt_on_live_entry(void) {
     /* Writeback runs at a later entry than the take, so the processes write
      * pages in between and the COW hook preserves their keyframe images. */
     if (g_wb_pending && g_ticks != g_wb_tick) do_writeback();
+    /* A keyframe when the interval elapses, or early when the epoch has
+     * dirtied enough pages that a restore would replay a lot of writes (#244). */
     if (machine_epoch() == 0 || g_ticks_since_kf >= g_cfg.interval_ticks || record_pressure() ||
-        g_force_keyframe) {
+        g_force_keyframe || (g_cfg.dirty_pages && kfp_dirty() >= g_cfg.dirty_pages)) {
         g_force_keyframe = false;
         take_keyframe();
     }
@@ -347,42 +416,54 @@ bool tt_window(tt_window_t* w) {
 static bool g_perturb_xmm;
 void tt_perturb_next_restore(bool on) { g_perturb_xmm = on; }
 
-int tt_restore_keyframe(uint64_t epoch) {
+/* A kernel blob of the keyframe for `epoch`, reassembled; kmalloc'd. */
+static uint8_t* load_blob(uint64_t epoch, uint32_t tag, uint32_t* len) {
     keyframe_store_t* ks = keyframe_store_get();
-    if (!ks) return TT_ERR_STATE;
     snapshot_reader_t rd;
     snapshot_page_record_t rec;
     uint64_t sel = 0;
-    if (keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK || sel != epoch) {
-        return TT_ERR_RANGE;
+    if (!ks || keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK || sel != epoch) {
+        return 0;
     }
-
-    /* Pass 1: the kernel-state blob. */
     uint8_t* blob = 0;
     uint32_t blob_size = 0;
     rec.page_data = g_pagebuf;
     while (snapshot_reader_next(&rd, &rec) == SNAPSHOT_OK) {
-        if (!(rec.flags & CHECKPOINT_REC_KERNEL) || rec.pid != KSTATE_TAG) continue;
+        if (!(rec.flags & CHECKPOINT_REC_KERNEL) || rec.pid != tag) continue;
         uint32_t size = (uint32_t)(rec.virt_addr >> 32);
         uint32_t off = (uint32_t)rec.virt_addr * PAGE_SIZE;
         if (!blob) {
             blob = (uint8_t*)kmalloc(size);
-            if (!blob) return TT_ERR_RESTORE;
+            if (!blob) return 0;
             blob_size = size;
         }
         if (size != blob_size || off >= size) {
             kfree(blob);
-            return TT_ERR_RESTORE;
+            return 0;
         }
         memcpy(blob + off, g_pagebuf, size - off < PAGE_SIZE ? size - off : PAGE_SIZE);
     }
+    *len = blob_size;
+    return blob;
+}
+
+int tt_restore_keyframe(uint64_t epoch) {
+    keyframe_store_t* ks = keyframe_store_get();
+    if (!ks) return TT_ERR_STATE;
+    if (!kfp_has(epoch)) return TT_ERR_RANGE;
+
+    /* The kernel-state blob. */
+    uint32_t blob_size = 0;
+    uint8_t* blob = load_blob(epoch, KSTATE_TAG, &blob_size);
     uint64_t blob_epoch = 0;
     if (!blob || !kstate_blob_epoch(blob, blob_size, &blob_epoch) || blob_epoch != epoch) {
         if (blob) kfree(blob);
         return TT_ERR_RESTORE;
     }
 
-    /* Discard the live machine and rebuild it from the keyframe. */
+    /* Keep the frames of unchanged pages, then discard the live machine and
+     * rebuild it from the keyframe. */
+    kfp_harvest();
     uint32_t failed = 0;
     int krc = kstate_restore(blob, blob_size, &failed);
     kfree(blob);
@@ -392,34 +473,26 @@ int tt_restore_keyframe(uint64_t epoch) {
         return TT_ERR_RESTORE;
     }
 
-    /* Pass 2: the registers and the pages. */
+    /* The registers, then the pages. */
+    snapshot_reader_t rd;
+    snapshot_page_record_t rec;
+    uint64_t sel = 0;
     if (keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK) return TT_ERR_RESTORE;
     rec.page_data = g_pagebuf;
     while (snapshot_reader_next(&rd, &rec) == SNAPSHOT_OK) {
-        if (rec.flags & CHECKPOINT_REC_KERNEL) continue;
+        if (!(rec.flags & CHECKPOINT_REC_CONTEXT)) continue;
         process_t* p = proc_by_pid(rec.pid);
         if (!p) return TT_ERR_RESTORE;
-        if (rec.flags & CHECKPOINT_REC_CONTEXT) {
-            proc_context_load(p, g_pagebuf);
-            if (g_perturb_xmm && p == proc_at(0)) {
-                /* Test hook: flip a bit of XMM15, which programs rarely touch. */
-                g_perturb_xmm = false;
-                proc_arch(p)->fpu[FPU_XMM_OFFSET + 15 * 16] ^= 0x01;
-            }
-            continue;
+        proc_context_load(p, g_pagebuf);
+        if (g_perturb_xmm && p == proc_at(0)) {
+            /* Test hook: flip a bit of XMM15, which programs rarely touch. */
+            g_perturb_xmm = false;
+            proc_arch(p)->fpu[FPU_XMM_OFFSET + 15 * 16] ^= 0x01;
         }
-        uint64_t phys = vmm_get_physical_addr(p->address_space, rec.virt_addr);
-        if (!phys) {
-            phys = pmm_alloc();
-            /* The region's protection, as mprotect left it (#239). */
-            vm_region_t* r = vmm_find_region(p->address_space, rec.virt_addr);
-            uint32_t flags = r ? vm_pte_flags(r)
-                               : PAGE_USER | ((rec.flags & CHECKPOINT_REC_READONLY) ? 0 : PAGE_WRITABLE);
-            if (!phys || vmm_map_page(p->address_space, rec.virt_addr, phys, flags) != 0) {
-                return TT_ERR_RESTORE;
-            }
-        }
-        memcpy(P2V(phys & ~0xFFFULL), g_pagebuf, PAGE_SIZE);
+    }
+    if (kfp_map(epoch) != 0) {
+        kprintf("timetravel: keyframe %lu: its pages did not restore\n", epoch);
+        return TT_ERR_RESTORE;
     }
 
     machine_set_position(epoch, 0);
