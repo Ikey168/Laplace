@@ -61,6 +61,18 @@ the register checksum (control words, MXCSR, ST0-7, XMM0-15, the upper YMM
 halves; the last-instruction pointers are not, as CPUs differ in storing
 them).
 
+**Linux programs** (#238). The kernel runs in the top 2 GiB and reaches RAM
+through a direct map, so the lower half of every address space is free for
+programs linked at 0x400000. `syscall` enters through a stub that builds the
+same trap frame `int 0x80` does (vector 129, `VEC_LINUX_SYSCALL`), so a Linux
+system call is a step like any other. `kernel/core/linux.c` implements the
+calls; FS/GS base (TLS) is per process, loaded on switch, kept in keyframes,
+and checksummed. Times are a journaled TSC read converted through a clock base
+(TSC frequency, wall clock at boot) that is part of every keyframe's kernel
+state; resuming after a power cut re-anchors it to the new boot's TSC and takes
+a keyframe at once. There is no vDSO, so libc reads the time through a system
+call.
+
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
 journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the
@@ -126,7 +138,8 @@ the recording and continues live, still recording.
   AVX-512 and the XSAVE optimizations (XSAVEOPT, XSAVEC, XGETBV1) are not
   offered to programs.
 - Recorded history is read-only: gdb memory and register writes are refused.
-- The workloads are the embedded programs in `user/laplace/`.
+- The workloads are the embedded programs in `user/laplace/` (Laplace ABI) and
+  `user/linux/` (unmodified static musl programs, Linux ABI).
 - KVM works (`make selftest` passes under `-enable-kvm -cpu host`, checked on a
   GitHub-hosted runner on 2026-10-21), but those runners expose no PMU, so
   instruction-precise preemption can't rely on a hardware branch counter (#245).

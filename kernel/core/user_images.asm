@@ -18,5 +18,7 @@ USER_IMAGE hello
 USER_IMAGE tscprobe
 USER_IMAGE rdrandleak
 USER_IMAGE fpuprobe
+USER_IMAGE musl_hello
+USER_IMAGE musl_sysprobe
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -21,7 +21,7 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm
+          sudo apt-get install -y nasm musl-tools
           gcc --version | head -1
           nasm -v
 
@@ -99,7 +99,7 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm qemu-system-x86 gdb grub-pc-bin xorriso mtools
+          sudo apt-get install -y nasm musl-tools qemu-system-x86 gdb grub-pc-bin xorriso mtools
       - name: Build
         run: make
       - name: Boot, record, verify every epoch byte-exact (in-kernel self-test)
@@ -108,6 +108,8 @@ jobs:
         run: bash tests/qemu/determinism_gate.sh
       - name: x87/SSE/AVX state survives preemption and is verified (in QEMU)
         run: bash tests/qemu/fpu_gate.sh
+      - name: Unmodified static Linux programs run and replay (in QEMU)
+        run: bash tests/qemu/linux_gate.sh
       - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
         run: python3 tests/qemu/timetravel_e2e.py
       - name: Power cut and resume on the IDE disk (in QEMU)

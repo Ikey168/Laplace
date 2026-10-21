@@ -12,6 +12,7 @@
 #include "entropy_record.h"
 #include "laplace/syscalls.h"
 #include "core/kjournal.h"
+#include "core/linux.h"
 
 void* memset(void* dst, int c, size_t n);
 
@@ -194,6 +195,9 @@ static void load_hwbps(const process_t* p) {
 
 /* The process whose state the FPU registers hold (see core/fpu.h). */
 static process_t* g_fpu_owner;
+/* FS/GS base (#238): written to the MSRs when a different process runs, or
+ * when arch_prctl changes them. */
+static process_t* g_seg_owner;
 
 void machine_fpu_flush(void) {
     if (g_fpu_owner) fpu_save(proc_arch(g_fpu_owner)->fpu);
@@ -201,6 +205,13 @@ void machine_fpu_flush(void) {
 
 void machine_fpu_forget(process_t* p) {
     if (g_fpu_owner == p) g_fpu_owner = 0;
+    if (g_seg_owner == p) g_seg_owner = 0;
+}
+
+void machine_load_segment_bases(process_t* p) {
+    wrmsr(MSR_FS_BASE, proc_arch(p)->fs_base);
+    wrmsr(MSR_GS_BASE, proc_arch(p)->gs_base);
+    g_seg_owner = p;
 }
 
 static void fpu_switch_to(process_t* p) {
@@ -235,6 +246,7 @@ static trap_frame_t* frame_slot(void) {
 static void load_current(trap_frame_t* f) {
     ctx_to_frame(&g_cur->context, f);
     fpu_switch_to(g_cur);
+    if (g_seg_owner != g_cur) machine_load_segment_bases(g_cur);
     if (g_stepping) f->rflags |= RFLAGS_TF;
     vmm_switch_address_space(g_cur->address_space);
     load_hwbps(g_cur);
@@ -258,6 +270,21 @@ void machine_terminate(process_t* p, int code) {
     if (next == p) next = 0;
     if (g_cur == p) g_cur = next;
     proc_destroy(p);
+}
+
+void machine_yield(process_t* p) {
+    process_t* next = proc_next_ready(p);
+    if (next && next != p) {
+        p->state = PROCESS_STATE_READY;
+        g_cur = next;
+    }
+}
+
+/* The pending entry ends its process: exit in either ABI. */
+static bool entry_is_exit(void) {
+    if (g_pending.vector == VEC_SYSCALL) return g_cur->context.rax == SYS_EXIT;
+    if (g_pending.vector == VEC_LINUX_SYSCALL) return linux_is_exit(g_cur->context.rax);
+    return false;
 }
 
 /* SYS_WRITE: copy out of user memory in chunks and print (unless replaying). */
@@ -321,7 +348,7 @@ static void emulate(process_t* p, emul_t kind, uint64_t len) {
 
 bool machine_entry_is_fault(void) {
     uint64_t len;
-    return g_cur && g_pending.vector != VEC_SYSCALL && emulated_insn(g_cur, &len) == EMUL_NONE;
+    return g_cur && !vec_is_syscall(g_pending.vector) && emulated_insn(g_cur, &len) == EMUL_NONE;
 }
 
 /* ---- Register trace (#241) ---- */
@@ -363,6 +390,9 @@ static after_t handle_entry(void) {
     process_t* p = g_cur;
     process_context_t* c = &p->context;
 
+    if (g_pending.vector == VEC_LINUX_SYSCALL) {
+        return linux_syscall(p) == LX_SWITCHED ? AFTER_SWITCHED : AFTER_CONTINUE;
+    }
     if (g_pending.vector != VEC_SYSCALL) {
         uint64_t len;
         emul_t kind = emulated_insn(p, &len);
@@ -385,15 +415,10 @@ static after_t handle_entry(void) {
     case SYS_WRITE:
         c->rax = (uint64_t)sys_write(p, c->rdi, c->rsi);
         break;
-    case SYS_YIELD: {
+    case SYS_YIELD:
         c->rax = 0;
-        process_t* next = proc_next_ready(p);
-        if (next && next != p) {
-            p->state = PROCESS_STATE_READY;
-            g_cur = next;
-        }
+        machine_yield(p);
         return AFTER_SWITCHED;
-    }
     case SYS_GETPID:
         c->rax = (uint64_t)p->pid;
         break;
@@ -491,11 +516,11 @@ static bool stop_at_entry(void) {
         stop_here(STOP_FAULT, 0);
         return true;
     }
-    if (g_cur->context.rax == SYS_BREAK) {
+    if (g_pending.vector == VEC_SYSCALL && g_cur->context.rax == SYS_BREAK) {
         stop_here(STOP_BREAK, g_cur->context.rdi);
         return true;
     }
-    if (g_cur->context.rax == SYS_EXIT && proc_count() == 1) {
+    if (entry_is_exit() && proc_count() == 1) {
         stop_here(STOP_EXITED, g_cur->context.rdi);
         return true;
     }

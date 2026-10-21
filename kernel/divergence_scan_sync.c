@@ -113,8 +113,12 @@ static uint32_t sum_contexts(void* ctx) {
             c->rip, c->rflags & 0xED5ULL, (uint64_t)proc_at(i)->pid,
         };
         crc = divergence_checksum(crc, regs, sizeof(regs));
-        /* x87/SSE/AVX state (#237). */
-        if (proc_at(i)->arch) crc = fpu_checksum(crc, proc_arch(proc_at(i))->fpu);
+        /* x87/SSE/AVX state (#237), FS/GS base (#238). */
+        if (proc_at(i)->arch) {
+            const lp_arch_t* a = proc_arch(proc_at(i));
+            crc = fpu_checksum(crc, a->fpu);
+            crc = divergence_checksum(crc, &a->fs_base, 2 * sizeof(uint64_t));
+        }
     }
     return crc;
 }

@@ -26,6 +26,7 @@ static uint64_t g_gdt[7];
 
 /* The trap stack: TSS.rsp0, where every user-mode trap lands. */
 static uint8_t g_trap_stack[65536] __attribute__((aligned(16)));
+extern uint64_t syscall_kernel_rsp;
 
 uint64_t cpu_trap_stack_top(void) {
     return (uint64_t)(g_trap_stack + sizeof(g_trap_stack));
@@ -89,6 +90,10 @@ static void idt_set(int vec, uint64_t handler, uint8_t dpl) {
     idt_entry_t* e = &g_idt[vec];
     e->off_lo = handler & 0xFFFF;
     e->sel = SEL_KCODE;
+    /* No IST: QEMU's TCG can deliver a second #DB at the handler's first
+     * instruction, which an IST stack would overwrite the first frame with.
+     * No #DB can arrive on the user's stack at the SYSCALL stub: SFMASK clears
+     * TF on entry, and the stub touches no user memory. */
     e->ist = 0;
     e->type_attr = (uint8_t)(0x8E | (dpl << 5));   /* present, interrupt gate */
     e->off_mid = (handler >> 16) & 0xFFFF;
@@ -111,6 +116,14 @@ void cpu_init(void) {
     /* User RDTSC/RDTSCP fault and are emulated from the journaled clock. */
     write_cr4(read_cr4() | CR4_TSD);
     fpu_init();
+
+    /* SYSCALL (#238): kernel CS 0x08 / SS 0x10 on entry; SYSRET would use
+     * 0x23 / 0x1B (the stub returns with iretq). Entry masks IF, TF, DF, AC,
+     * and NT. EFER.SCE was set by boot.asm. */
+    syscall_kernel_rsp = cpu_trap_stack_top();
+    wrmsr(MSR_STAR, ((uint64_t)0x10 << 48) | ((uint64_t)SEL_KCODE << 32));
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    wrmsr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x40000 | 0x4000);
 }
 
 /* ---- MSRs that may not exist ---- */

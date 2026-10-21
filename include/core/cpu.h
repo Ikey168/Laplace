@@ -40,6 +40,19 @@ typedef struct trap_frame {
 #define VEC_IRQ_BASE     32
 #define VEC_TIMER        32
 #define VEC_SYSCALL      128
+/* Not an IDT vector: the SYSCALL instruction's entry stub tags its frames
+ * with it (Linux system calls, #238). */
+#define VEC_LINUX_SYSCALL 129
+
+/* A kernel entry that is a system call, in either ABI. */
+static inline int vec_is_syscall(uint64_t v) { return v == VEC_SYSCALL || v == VEC_LINUX_SYSCALL; }
+
+#define MSR_EFER         0xC0000080
+#define MSR_STAR         0xC0000081
+#define MSR_LSTAR        0xC0000082
+#define MSR_SFMASK       0xC0000084
+#define MSR_FS_BASE      0xC0000100
+#define MSR_GS_BASE      0xC0000101
 
 static inline void outb(uint16_t port, uint8_t v) {
     __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port));
@@ -86,6 +99,10 @@ static inline void write_dr(int n, uint64_t v) {
 }
 static inline uint64_t read_dr6(void) {
     uint64_t v; __asm__ volatile("mov %%dr6, %0" : "=r"(v)); return v;
+}
+
+static inline void wrmsr(uint32_t msr, uint64_t v) {
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
 }
 
 static inline uint64_t read_cr4(void) {
@@ -151,6 +168,7 @@ bool cpu_rdrand64(uint64_t* out);
 void trap_dispatch(trap_frame_t* frame);
 void trap_return(trap_frame_t* frame) __attribute__((noreturn));
 void machine_enter(trap_frame_t* frame);
+void syscall_entry(void);
 void machine_exit(void) __attribute__((noreturn));
 
 /* 8259 PIC and 8253 PIT. */

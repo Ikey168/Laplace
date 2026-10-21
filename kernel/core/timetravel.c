@@ -20,6 +20,7 @@
 #include "entropy_record.h"
 #include "sched_record.h"
 #include "core/kjournal.h"
+#include "core/clock.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -31,7 +32,7 @@ void* memcpy(void* dst, const void* src, size_t n);
  *   [J_BASE, J_BASE + j)          journal ring: N regions
  */
 #define LABEL_MAGIC       0x3145434150414C4CULL   /* "LLAPACE1" */
-#define LABEL_VERSION     2   /* 2: CPUID table in the kernel state (#241) */
+#define LABEL_VERSION     3   /* 2: CPUID table (#241); 3: clock base (#238) */
 #define KF_BASE           8
 #define KF_INDEX_SECTORS  4
 #define KF_SLOT_SECTORS   2048   /* per region slot: up to 227 page records */
@@ -79,6 +80,8 @@ typedef struct {
     uint64_t pending_error;
     uint64_t pending_cr2;
     cpuid_table_t cpuid;          /* what user CPUID answered while recording (#241) */
+    clock_base_t clock;           /* how TSC reads became times (#238) */
+    uint64_t     clock_now_ns;    /* monotonic time at the keyframe, for a resume */
     kstate_proc_t procs[LP_MAX_PROCS];
 } kstate_t;
 
@@ -93,6 +96,8 @@ static uint32_t    g_wb_tick;          /* tick count when the keyframe was taken
 static uint32_t    g_ticks;
 
 static bool        g_sealed;           /* the open epoch's journal is on disk */
+static uint64_t    g_restored_now_ns;  /* clock at the last restored keyframe (#238) */
+static bool        g_force_keyframe;   /* take one at the next live entry */
 static uint64_t    g_end_epoch;        /* the recording's stop point */
 static uint64_t    g_end_step;
 
@@ -265,6 +270,8 @@ static void capture_kstate(uint64_t epoch) {
     ks.pending_error = machine_pending()->error;
     ks.pending_cr2 = machine_pending()->cr2;
     ks.cpuid = *cpu_cpuid_table();
+    ks.clock = *clock_base();
+    ks.clock_now_ns = clock_now_unrecorded();
     for (uint32_t i = 0; i < ks.nproc; i++) {
         process_t* p = proc_at(i);
         kstate_proc_t* kp = &ks.procs[i];
@@ -353,7 +360,9 @@ void tt_on_live_entry(void) {
     /* Writeback runs at a later entry than the take, so the processes write
      * pages in between and the COW hook preserves their keyframe images. */
     if (g_wb_pending && g_ticks != g_wb_tick) do_writeback();
-    if (machine_epoch() == 0 || g_ticks_since_kf >= g_cfg.interval_ticks || record_pressure()) {
+    if (machine_epoch() == 0 || g_ticks_since_kf >= g_cfg.interval_ticks || record_pressure() ||
+        g_force_keyframe) {
+        g_force_keyframe = false;
         take_keyframe();
     }
 }
@@ -459,6 +468,8 @@ int tt_restore_keyframe(uint64_t epoch) {
     }
     proc_set_next_pid(kst.next_pid);
     cpu_cpuid_set_table(&kst.cpuid);
+    clock_set_base(&kst.clock);
+    g_restored_now_ns = kst.clock_now_ns;
 
     /* Pass 2: the pages. */
     if (keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK) return TT_ERR_RESTORE;
@@ -709,7 +720,11 @@ int tt_resume_from_store(void) {
     if (!tt_window(&w)) return TT_ERR_STATE;
     int rc = tt_restore_keyframe(w.newest);
     if (rc != TT_OK) return rc;
-    /* Continue live from the keyframe: a new timeline from (newest, 0). */
+    /* Continue live from the keyframe: a new timeline from (newest, 0). This
+     * boot's TSC is not the recording's: keep the recorded clocks running from
+     * the keyframe's time, and record the new base in a keyframe at once. */
+    clock_reanchor(g_restored_now_ns);
+    g_force_keyframe = true;
     checkpoint_set_epoch(w.newest);
     machine_set_mode(MACHINE_LIVE);
     sched_record_begin_epoch(machine_sched_record(), w.newest);

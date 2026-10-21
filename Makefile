@@ -8,7 +8,7 @@
 #   make test       the self-test plus the in-QEMU end-to-end gates
 #   make legacy     the pre-Laplace wildcard build (does not compile; see #233)
 #
-# Needs gcc, GNU ld, nasm, and (to boot) qemu-system-x86_64.
+# Needs gcc, GNU ld, nasm, musl-gcc (musl-tools), and (to boot) qemu-system-x86_64.
 
 NASM    ?= nasm
 CC      ?= gcc
@@ -36,7 +36,8 @@ CORE_ASM := kernel/core/boot.asm kernel/core/isr.asm
 CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
-            kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c
+            kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
+            kernel/core/clock.c kernel/core/linux.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
 # kernel adapters.
@@ -61,6 +62,11 @@ KERNEL_OBJS := $(patsubst %.asm,$(KBUILD)/%.o,$(CORE_ASM)) \
 # User programs (#220, #230, #231): ring-3 ELF images embedded in the kernel.
 USER_PROGS := heisenbug noise counter hello tscprobe rdrandleak fpuprobe
 USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
+
+# Linux programs (#238): plain C built against musl, unmodified.
+MUSL_CC     ?= musl-gcc
+LINUX_PROGS := hello sysprobe
+LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \
            -fno-tree-loop-distribute-patterns -Wall -Wextra -Werror \
@@ -78,7 +84,7 @@ user: $(USER_ELFS)
 $(BUILD)/laplace.elf: $(KERNEL_OBJS) kernel/core/laplace.ld
 	$(LD) $(KLDFLAGS) -o $@ $(KERNEL_OBJS)
 
-$(KBUILD)/kernel/core/user_images.o: kernel/core/user_images.asm $(USER_ELFS)
+$(KBUILD)/kernel/core/user_images.o: kernel/core/user_images.asm $(USER_ELFS) $(LINUX_ELFS)
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 -o $@ $<
 
@@ -86,6 +92,10 @@ $(UBUILD)/%.elf: user/laplace/%.c user/laplace/ulib.h include/laplace/syscalls.h
 	@mkdir -p $(dir $@)
 	$(CC) $(UCFLAGS) -c $< -o $(UBUILD)/$*.o
 	$(LD) $(ULDFLAGS) -o $@ $(UBUILD)/$*.o
+
+$(UBUILD)/musl_%.elf: user/linux/%.c
+	@mkdir -p $(dir $@)
+	$(MUSL_CC) -static -O2 -g -o $@ $<
 
 $(KBUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -129,6 +139,7 @@ selftest: kernel
 test: all selftest
 	bash tests/qemu/determinism_gate.sh
 	bash tests/qemu/fpu_gate.sh
+	bash tests/qemu/linux_gate.sh
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 

@@ -18,6 +18,7 @@
 #include "core/machine.h"
 #include "core/timetravel.h"
 #include "core/monitor.h"
+#include "core/clock.h"
 #include "checkpoint.h"
 #include "checkpoint_ide_boot.h"
 #include "time_record.h"
@@ -188,8 +189,8 @@ static bool selftest(void) {
     if (!replay_perturb_applied()) {
         kprintf("selftest: perturbed replay: the oldest epoch has no inputs to perturb (skipped)\n");
     } else {
-        kprintf("selftest: perturbed replay: %s (epoch %lu component %u)\n",
-                bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
+        kprintf("selftest: perturbed replay: %s (rc %d, epoch %lu component %u)\n",
+                bad.diverged ? "divergence detected" : "NOT detected", rc, bad.first_epoch,
                 bad.first_component);
         ok = ok && (bad.diverged || !strict);
     }
@@ -311,7 +312,9 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     mm_init(mbi);
     pic_init();
     pit_init(MACHINE_TIMER_HZ);
-    kprintf("boot: %lu MiB free, timer %u Hz\n", pmm_free_frames() / 256, MACHINE_TIMER_HZ);
+    clock_init();
+    kprintf("boot: %lu MiB free, timer %u Hz, TSC %lu MHz\n", pmm_free_frames() / 256,
+            MACHINE_TIMER_HZ, clock_base()->tsc_hz / 1000000);
     kprintf("boot: user FPU state: %s (%u bytes)\n",
             !fpu_has_xsave() ? "x87+SSE (FXSAVE)" :
             (fpu_xcr0() & XCR0_AVX) ? "x87+SSE+AVX (XSAVE)" : "x87+SSE (XSAVE)", fpu_area_size());

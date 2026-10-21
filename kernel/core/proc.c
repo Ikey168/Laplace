@@ -5,6 +5,7 @@
 #include "core/console.h"
 #include "process_manager.h"
 #include "core/machine.h"
+#include "entropy_record.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -23,15 +24,19 @@ extern const uint8_t user_image_hello[], user_image_hello_end[];
 extern const uint8_t user_image_tscprobe[], user_image_tscprobe_end[];
 extern const uint8_t user_image_rdrandleak[], user_image_rdrandleak_end[];
 extern const uint8_t user_image_fpuprobe[], user_image_fpuprobe_end[];
+extern const uint8_t user_image_musl_hello[], user_image_musl_hello_end[];
+extern const uint8_t user_image_musl_sysprobe[], user_image_musl_sysprobe_end[];
 
 static const lp_image_t g_images[] = {
-    { "heisenbug", user_image_heisenbug, user_image_heisenbug_end },
-    { "noise",     user_image_noise,     user_image_noise_end },
-    { "counter",   user_image_counter,   user_image_counter_end },
-    { "hello",     user_image_hello,     user_image_hello_end },
-    { "tscprobe",  user_image_tscprobe,  user_image_tscprobe_end },
-    { "rdrandleak", user_image_rdrandleak, user_image_rdrandleak_end },
-    { "fpuprobe",  user_image_fpuprobe,  user_image_fpuprobe_end },
+    { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
+    { "noise",     user_image_noise,     user_image_noise_end, false },
+    { "counter",   user_image_counter,   user_image_counter_end, false },
+    { "hello",     user_image_hello,     user_image_hello_end, false },
+    { "tscprobe",  user_image_tscprobe,  user_image_tscprobe_end, false },
+    { "rdrandleak", user_image_rdrandleak, user_image_rdrandleak_end, false },
+    { "fpuprobe",  user_image_fpuprobe,  user_image_fpuprobe_end, false },
+    { "musl_hello", user_image_musl_hello, user_image_musl_hello_end, true },
+    { "musl_sysprobe", user_image_musl_sysprobe, user_image_musl_sysprobe_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {
@@ -164,7 +169,85 @@ static bool map_zeroed(vm_space_t* s, uint64_t va, uint32_t pte_flags) {
     return vmm_map_page(s, va, phys, pte_flags) == 0;
 }
 
-static bool load_elf(process_t* p, const uint8_t* img, uint64_t size) {
+/* ---- The System V initial stack (#238) ---- */
+
+#define AT_NULL     0
+#define AT_PHDR     3
+#define AT_PHENT    4
+#define AT_PHNUM    5
+#define AT_PAGESZ   6
+#define AT_BASE     7
+#define AT_FLAGS    8
+#define AT_ENTRY    9
+#define AT_UID      11
+#define AT_EUID     12
+#define AT_GID      13
+#define AT_EGID     14
+#define AT_PLATFORM 15
+#define AT_HWCAP    16
+#define AT_CLKTCK   17
+#define AT_SECURE   23
+#define AT_RANDOM   25
+#define AT_HWCAP2   26
+#define AT_EXECFN   31
+
+typedef struct {
+    vm_space_t* s;
+    uint64_t    sp;
+    bool        ok;
+} ustack_t;
+
+static uint64_t push_bytes(ustack_t* u, const void* data, uint64_t len) {
+    u->sp -= len;
+    if (!uaccess_write(u->s, u->sp, data, len)) u->ok = false;
+    return u->sp;
+}
+
+static void push_u64(ustack_t* u, uint64_t v) { push_bytes(u, &v, 8); }
+
+/* argc = 1 (the program's name), no environment, and the auxiliary vector a
+ * static Linux binary's startup code reads. No AT_SYSINFO_EHDR: without a
+ * vDSO, libc reads the time through a (journaled) system call. AT_RANDOM's
+ * bytes come from the entropy source; they are in the first keyframe. */
+static bool linux_initial_stack(process_t* p, const elf64_ehdr_t* eh, uint64_t phdr_va,
+                                uint64_t top) {
+    ustack_t u = { p->address_space, top, true };
+    const char* name = p->name;
+    uint64_t name_len = 0;
+    while (name[name_len]) name_len++;
+    uint64_t name_ptr = push_bytes(&u, name, name_len + 1);
+    uint64_t plat_ptr = push_bytes(&u, "x86_64", 7);
+    uint8_t rnd[16];
+    kentropy_fill(rnd, sizeof(rnd));
+    uint64_t rand_ptr = push_bytes(&u, rnd, sizeof(rnd));
+    u.sp &= ~15ULL;
+
+    uint32_t r[4];
+    cpu_cpuid(1, 0, r);
+    const uint64_t aux[][2] = {
+        { AT_PHDR, phdr_va }, { AT_PHENT, eh->phentsize }, { AT_PHNUM, eh->phnum },
+        { AT_PAGESZ, PAGE_SIZE }, { AT_BASE, 0 }, { AT_FLAGS, 0 }, { AT_ENTRY, eh->entry },
+        { AT_UID, 0 }, { AT_EUID, 0 }, { AT_GID, 0 }, { AT_EGID, 0 },
+        { AT_PLATFORM, plat_ptr }, { AT_HWCAP, r[3] }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
+        { AT_RANDOM, rand_ptr }, { AT_HWCAP2, 0 }, { AT_EXECFN, name_ptr }, { AT_NULL, 0 },
+    };
+    uint64_t naux = sizeof(aux) / sizeof(aux[0]);
+    /* argc, argv[0], NULL, envp NULL, auxv: keep rsp 16-byte aligned at argc. */
+    uint64_t words = 1 + 2 + 1 + 2 * naux;
+    if (words & 1) push_u64(&u, 0);
+    for (uint64_t i = naux; i-- > 0;) {
+        push_u64(&u, aux[i][1]);
+        push_u64(&u, aux[i][0]);
+    }
+    push_u64(&u, 0);            /* envp terminator */
+    push_u64(&u, 0);            /* argv terminator */
+    push_u64(&u, name_ptr);     /* argv[0] */
+    push_u64(&u, 1);            /* argc */
+    p->context.rsp = u.sp;
+    return u.ok;
+}
+
+static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux_abi) {
     const elf64_ehdr_t* eh = (const elf64_ehdr_t*)img;
     if (size < sizeof(*eh) || eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
         eh->ident[2] != 'L' || eh->ident[3] != 'F' || eh->ident[4] != 2 ||
@@ -172,9 +255,13 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size) {
         return false;
     }
     vm_space_t* s = p->address_space;
+    uint64_t phdr_va = 0;
     for (uint16_t i = 0; i < eh->phnum; i++) {
         const elf64_phdr_t* ph = (const elf64_phdr_t*)(img + eh->phoff + (uint64_t)i * eh->phentsize);
         if (ph->type != PT_LOAD || ph->memsz == 0) continue;
+        if (eh->phoff >= ph->offset && eh->phoff < ph->offset + ph->filesz) {
+            phdr_va = ph->vaddr + (eh->phoff - ph->offset);
+        }
         if (ph->vaddr < LP_USER_BASE || ph->offset + ph->filesz > size) return false;
         uint64_t start = ph->vaddr & ~0xFFFULL;
         uint64_t end = PAGE_ALIGN(ph->vaddr + ph->memsz);
@@ -200,8 +287,9 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size) {
         }
     }
     /* Stack. */
-    uint64_t stack_lo = LP_STACK_TOP - LP_STACK_PAGES * PAGE_SIZE;
-    if (!vmm_create_region(s, stack_lo, LP_STACK_PAGES * PAGE_SIZE,
+    uint64_t pages = linux_abi ? LP_LINUX_STACK_PAGES : LP_STACK_PAGES;
+    uint64_t stack_lo = LP_STACK_TOP - pages * PAGE_SIZE;
+    if (!vmm_create_region(s, stack_lo, pages * PAGE_SIZE,
                            VMM_FLAG_READ | VMM_FLAG_WRITE | VMM_FLAG_USER,
                            VMM_REGION_STACK, "stack")) {
         return false;
@@ -220,13 +308,14 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size) {
     p->entry_point = eh->entry;
     p->stack_start = stack_lo;
     p->stack_end = LP_STACK_TOP;
+    if (linux_abi) return linux_initial_stack(p, eh, phdr_va, LP_STACK_TOP);
     return true;
 }
 
 process_t* proc_spawn(const lp_image_t* image) {
     process_t* p = proc_alloc(g_next_pid, image->name);
     if (!p) return 0;
-    if (!load_elf(p, image->start, (uint64_t)(image->end - image->start))) {
+    if (!load_elf(p, image->start, (uint64_t)(image->end - image->start), image->linux_abi)) {
         vmm_destroy_address_space(p->address_space);
         kfree(p->arch_block);
         kfree(p);

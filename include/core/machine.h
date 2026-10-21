@@ -159,6 +159,12 @@ void machine_fpu_forget(process_t* p);
 /* Console output from user processes is suppressed while replaying. */
 bool machine_quiet(void);
 
+/* Give the CPU to the next ready process (a yield). */
+void machine_yield(process_t* p);
+
+/* Load p's FS/GS base into the MSRs (#238). */
+void machine_load_segment_bases(process_t* p);
+
 /* Terminate a process (fault or break handled, or exit). */
 void machine_terminate(process_t* p, int code);
 

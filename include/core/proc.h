@@ -23,12 +23,17 @@
 #define LP_STACK_TOP     0x80000000ULL
 #define LP_STACK_PAGES   4
 
-/* An embedded user program (user_images.asm). */
+/* An embedded user program (user_images.asm). A Linux program (#238) starts
+ * with the System V initial stack (argc, argv, envp, auxv) and a larger stack;
+ * a Laplace program's _start takes nothing. */
 typedef struct {
     const char*    name;
     const uint8_t* start;
     const uint8_t* end;
+    bool           linux_abi;
 } lp_image_t;
+
+#define LP_LINUX_STACK_PAGES 32
 
 const lp_image_t* proc_find_image(const char* name);
 const lp_image_t* proc_images(uint32_t* count);
@@ -62,7 +67,8 @@ void       proc_append(process_t* p);
 typedef struct {
     uint64_t fs_base;
     uint64_t gs_base;
-    uint8_t  reserved[48];
+    uint64_t clear_child_tid;        /* set_tid_address (#238) */
+    uint8_t  reserved[40];
     uint8_t  fpu[FPU_AREA_MAX];      /* 64-byte aligned: lp_arch_t is */
 } __attribute__((aligned(64))) lp_arch_t;
 

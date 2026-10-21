@@ -16,6 +16,8 @@ global isr_stub_table
 global trap_return
 global machine_enter
 global machine_exit
+global syscall_entry
+global syscall_kernel_rsp
 extern trap_dispatch
 
 section .text
@@ -114,6 +116,23 @@ trap_restore:
     add rsp, 16                     ; vector + error code
     iretq
 
+; SYSCALL entry (#238, Linux system calls). The CPU left the user's return
+; address in rcx and flags in r11, cleared IF/TF/DF/AC (SFMASK), and did not
+; switch stacks. Build the same trap frame an interrupt from user mode would
+; (ss, rsp, rflags, cs, rip, error, vector) on the trap stack and join the
+; common path; the return is an iretq like every other.
+syscall_entry:
+    mov [rel syscall_user_rsp], rsp
+    mov rsp, [rel syscall_kernel_rsp]
+    push qword 0x1B                 ; ss: user data
+    push qword [rel syscall_user_rsp]
+    push r11                        ; rflags
+    push qword 0x23                 ; cs: user code
+    push rcx                        ; rip
+    push qword 0                    ; error code
+    push qword 129                  ; VEC_LINUX_SYSCALL
+    jmp isr_common
+
 ; void trap_return(trap_frame_t* frame): restore `frame` and iretq to it.
 trap_return:
     mov rsp, rdi
@@ -159,5 +178,7 @@ isr_stub_table:
 section .bss
 align 8
 monitor_rsp: resq 1
+syscall_user_rsp: resq 1
+syscall_kernel_rsp: resq 1
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -193,6 +193,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Byte-exact verification of every retained epoch; a perturbed replay is caught | `make selftest`, `verify_replay`, `monitor verify` |
 | Raw `rdtsc`/`rdtscp`/`cpuid` in user code replay exactly; a divergence names the instruction that caused it | `tests/qemu/determinism_gate.sh` |
 | x87/SSE/AVX state survives preemption, is in every keyframe, and is part of what replay verifies | `tests/qemu/fpu_gate.sh`, `make selftest` |
+| Unmodified static Linux programs (musl) run; their clock and random reads replay exactly | `tests/qemu/linux_gate.sh` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
@@ -214,15 +215,20 @@ Limits, stated plainly:
   227 pages), so the recorded machine must fit in under 1 MiB (#244).
 - x87, SSE, and AVX state is saved and verified (#237); AVX-512 is not enabled
   in XCR0, so programs see no AVX-512.
-- Workloads are the programs embedded in the kernel (`user/laplace/`).
+- Workloads are the programs embedded in the kernel: Laplace's own
+  (`user/laplace/`, `int 0x80`) and unmodified static Linux programs built
+  with `musl-gcc -static` (`user/linux/`, the Linux `syscall` ABI, #238). The
+  Linux interface so far covers startup, TLS, stdio to the console, the clocks,
+  and `getrandom`; unimplemented calls return ENOSYS and are logged once.
 - Recorded history is read-only from the debuggers.
 
 ## The machine
 
 The system being recorded is Laplace's own small kernel (`kernel/core/`): a
-Multiboot entry into long mode, a frame allocator and per-process 4-level page
-tables, ring-3 processes loaded from embedded ELF images, `int 0x80` system
-calls, and a round-robin scheduler. The kernel runs with interrupts disabled and
+Multiboot entry into long mode, a higher-half kernel with a direct map of all
+RAM, per-process 4-level page tables over the whole lower half, ring-3
+processes loaded from embedded ELF images, Laplace (`int 0x80`) and Linux
+(`syscall`) system calls, and a round-robin scheduler. The kernel runs with interrupts disabled and
 never blocks, so a kernel entry is an atomic, deterministic step; the whole
 time-travel stack (`kernel/*.c`, host-tested under `tests/`) sits on top of it.
 
@@ -236,7 +242,7 @@ repairing or removing it.
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get install -y gcc make nasm qemu-system-x86 gdb python3
+sudo apt-get install -y gcc make nasm musl-tools qemu-system-x86 gdb python3
 # for make iso: grub-pc-bin xorriso mtools
 
 git clone https://github.com/Ikey168/Laplace.git && cd Laplace
