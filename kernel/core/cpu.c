@@ -107,6 +107,171 @@ static void idt_init(void) {
 void cpu_init(void) {
     gdt_init();
     idt_init();
+    /* User RDTSC/RDTSCP fault and are emulated from the journaled clock. */
+    write_cr4(read_cr4() | CR4_TSD);
+}
+
+/* ---- MSRs that may not exist ---- */
+
+static volatile bool g_msr_probing;
+static volatile bool g_msr_faulted;
+
+bool cpu_msr_probe_recover(trap_frame_t* f) {
+    if (!g_msr_probing || f->vector != VEC_GPF) return false;
+    g_msr_faulted = true;
+    f->rip += 2;                      /* RDMSR and WRMSR are both 0F 3x */
+    return true;
+}
+
+bool cpu_rdmsr_safe(uint32_t msr, uint64_t* out) {
+    uint32_t lo = 0, hi = 0;
+    g_msr_faulted = false;
+    g_msr_probing = true;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr) : "memory");
+    g_msr_probing = false;
+    if (g_msr_faulted) return false;
+    *out = ((uint64_t)hi << 32) | lo;
+    return true;
+}
+
+bool cpu_wrmsr_safe(uint32_t msr, uint64_t value) {
+    g_msr_faulted = false;
+    g_msr_probing = true;
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)value), "d"((uint32_t)(value >> 32))
+                     : "memory");
+    g_msr_probing = false;
+    return !g_msr_faulted;
+}
+
+/* ---- CPUID as user programs see it (#241) ---- */
+
+#define MSR_PLATFORM_INFO          0xCE
+#define MSR_MISC_FEATURES_ENABLES  0x140
+#define PLATFORM_INFO_CPUID_FAULT  (1ULL << 31)
+
+static cpuid_table_t g_cpuid;
+
+static bool leaf_indexed(uint32_t leaf) {
+    switch (leaf) {
+    case 0x4: case 0x7: case 0xB: case 0xD: case 0x1F: case 0x8000001D:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* What the recorder can replay. Everything not listed reads as 0. */
+static void mask_leaf(cpuid_entry_t* e) {
+    uint32_t* r = e->r;
+    switch (e->leaf) {
+    case 0x0:
+        if (r[0] > 0xD) r[0] = 0xD;
+        break;
+    case 0x1:
+        /* One CPU, APIC id 0. */
+        r[1] = (r[1] & 0x0000FFFFu) | (1u << 16);
+        /* SSE3 PCLMUL SSSE3 CX16 SSE4.1 SSE4.2 MOVBE POPCNT AES, and the
+         * hypervisor bit. No RDRAND (untrappable), no XSAVE/AVX/FMA/F16C until
+         * their state is saved (#237). */
+        r[2] &= (1u << 0) | (1u << 1) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) |
+                (1u << 22) | (1u << 23) | (1u << 25) | (1u << 31);
+        /* No PSN, DS, ACPI, SS, TM, PBE. */
+        r[3] &= ~((1u << 18) | (1u << 21) | (1u << 22) | (1u << 27) | (1u << 29) | (1u << 31));
+        break;
+    case 0x4:
+        r[0] &= ~0xFC000000u;          /* one core per package */
+        break;
+    case 0x7:
+        if (e->sub != 0) { r[0] = r[1] = r[2] = r[3] = 0; break; }
+        r[0] = 0;                      /* no further subleaves */
+        /* BMI1 BMI2 ERMS ADX CLFLUSHOPT SHA. No RDSEED (untrappable), no TSX
+         * (aborts are nondeterministic), no AVX2/AVX-512 (#237). */
+        r[1] &= (1u << 3) | (1u << 8) | (1u << 9) | (1u << 19) | (1u << 23) | (1u << 29);
+        r[2] = 0;                      /* no RDPID, WAITPKG, PKU */
+        r[3] &= (1u << 4);             /* FSRM */
+        break;
+    case 0xB:
+    case 0x1F:
+        r[3] = 0;                      /* x2APIC id 0 */
+        break;
+    case 0x80000000:
+        if (r[0] > 0x80000008) r[0] = 0x80000008;
+        break;
+    case 0x80000001:
+        r[2] &= (1u << 0) | (1u << 5) | (1u << 6) | (1u << 8);   /* LAHF ABM SSE4A PREFETCHW */
+        r[3] &= (1u << 11) | (1u << 20) | (1u << 26) | (1u << 27) | (1u << 29);
+        break;
+    case 0x80000002: case 0x80000003: case 0x80000004:   /* brand string */
+    case 0x80000006: case 0x80000007: case 0x80000008:
+        break;
+    case 0x2: case 0x16:
+        break;
+    default:
+        r[0] = r[1] = r[2] = r[3] = 0;
+        break;
+    }
+}
+
+static void add_leaf(uint32_t leaf, uint32_t sub, bool indexed) {
+    if (g_cpuid.count >= CPU_CPUID_MAX) return;
+    cpuid_entry_t* e = &g_cpuid.e[g_cpuid.count++];
+    e->leaf = leaf;
+    e->sub = sub;
+    e->flags = indexed ? CPU_CPUID_INDEXED : 0;
+    cpu_cpuid(leaf, sub, e->r);
+    mask_leaf(e);
+}
+
+static void add_range(uint32_t first, uint32_t last) {
+    for (uint32_t leaf = first; leaf <= last; leaf++) {
+        if (!leaf_indexed(leaf)) {
+            add_leaf(leaf, 0, false);
+            continue;
+        }
+        for (uint32_t sub = 0; sub < 8; sub++) {
+            uint32_t r[4];
+            cpu_cpuid(leaf, sub, r);
+            if (sub > 0 && leaf == 0x4 && (r[0] & 0x1F) == 0) break;
+            if (sub > 0 && (leaf == 0xB || leaf == 0x1F) && ((r[2] >> 8) & 0xFF) == 0) break;
+            if (sub > 0 && leaf == 0x7) break;
+            add_leaf(leaf, sub, true);
+        }
+    }
+}
+
+void cpu_cpuid_init(void) {
+    uint32_t r[4];
+    g_cpuid.count = 0;
+    cpu_cpuid(0, 0, r);
+    add_range(0, r[0] < 0xD ? r[0] : 0xD);
+    cpu_cpuid(0x80000000, 0, r);
+    if (r[0] >= 0x80000000) add_range(0x80000000, r[0] < 0x80000008 ? r[0] : 0x80000008);
+
+    uint64_t info = 0;
+    g_cpuid.faulting = cpu_rdmsr_safe(MSR_PLATFORM_INFO, &info) &&
+                       (info & PLATFORM_INFO_CPUID_FAULT) &&
+                       cpu_wrmsr_safe(MSR_MISC_FEATURES_ENABLES, 1);
+}
+
+bool cpu_cpuid_faulting(void) { return g_cpuid.faulting != 0; }
+const cpuid_table_t* cpu_cpuid_table(void) { return &g_cpuid; }
+
+void cpu_cpuid_set_table(const cpuid_table_t* t) {
+    uint32_t faulting = g_cpuid.faulting;   /* a property of this CPU, not the recording */
+    g_cpuid = *t;
+    if (g_cpuid.count > CPU_CPUID_MAX) g_cpuid.count = CPU_CPUID_MAX;
+    g_cpuid.faulting = faulting;
+}
+
+void cpu_cpuid_lookup(uint32_t leaf, uint32_t sub, uint32_t out[4]) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+    for (uint32_t i = 0; i < g_cpuid.count; i++) {
+        const cpuid_entry_t* e = &g_cpuid.e[i];
+        if (e->leaf != leaf) continue;
+        if ((e->flags & CPU_CPUID_INDEXED) && e->sub != sub) continue;
+        for (int k = 0; k < 4; k++) out[k] = e->r[k];
+        return;
+    }
 }
 
 /* ---- 8259 PIC ---- */

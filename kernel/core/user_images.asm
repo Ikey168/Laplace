@@ -15,5 +15,7 @@ USER_IMAGE heisenbug
 USER_IMAGE noise
 USER_IMAGE counter
 USER_IMAGE hello
+USER_IMAGE tscprobe
+USER_IMAGE rdrandleak
 
 section .note.GNU-stack noalloc noexec nowrite progbits

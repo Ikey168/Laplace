@@ -71,7 +71,21 @@ int journal_capture_epoch(journal_store_t* store, uint64_t epoch,
         }
     }
 
-    /* 4. Divergence checksums for the epoch boundary (#197): one event per
+    /* 4. Extended events (#241): whatever the kernel's extended journal holds,
+     *    verbatim and in order. */
+    if (src->extended_events) {
+        const journal_capture_event_t* evs = NULL;
+        uint32_t n = src->extended_events(&evs);
+        for (uint32_t i = 0; i < n && evs; i++) {
+            rc = journal_writer_append_len(&writer, evs[i].type, evs[i].lclock,
+                                           evs[i].value, evs[i].len);
+            if (rc != JOURNAL_OK) {
+                return rc;
+            }
+        }
+    }
+
+    /* 5. Divergence checksums for the epoch boundary (#197): one event per
      *    component, carrying the component id in lclock and the checksum in
      *    value, so replay can compare recomputed sums against these. */
     if (src->divergence_sums) {
@@ -87,7 +101,7 @@ int journal_capture_epoch(journal_store_t* store, uint64_t epoch,
         }
     }
 
-    /* 5. The epoch's length in steps (#223), written last so a reader that
+    /* 6. The epoch's length in steps (#223), written last so a reader that
      *    sees it knows the journal is complete. */
     if (src->epoch_length) {
         uint64_t len = src->epoch_length();

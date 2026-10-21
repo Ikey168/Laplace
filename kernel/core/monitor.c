@@ -106,9 +106,18 @@ int monitor_command(const char* cmd, char* out, uint32_t cap) {
         int rc = tt_verify(&v);
         monitor_note_navigation();
         if (rc != TT_OK) return ksnprintf(out, cap, "verification could not run (%d)\n", rc);
+        if (v.diverged && v.leak_found) {
+            return ksnprintf(out, cap, "DIVERGED: %u of %u epochs; first epoch %lu component %u, "
+                             "between steps %lu..%lu; %s at rip %lx in pid %u (step %lu insn %lu)\n",
+                             v.epochs_diverged, v.epochs_checked, v.first_epoch, v.first_component,
+                             v.diag_step_lo, v.diag_step_hi, v.leak_what, v.leak_rip, v.leak_pid,
+                             v.leak_step, v.leak_insn);
+        }
         if (v.diverged) {
-            return ksnprintf(out, cap, "DIVERGED: %u of %u epochs; first epoch %lu component %u\n",
-                             v.epochs_diverged, v.epochs_checked, v.first_epoch, v.first_component);
+            return ksnprintf(out, cap, "DIVERGED: %u of %u epochs; first epoch %lu component %u, "
+                             "between steps %lu..%lu\n",
+                             v.epochs_diverged, v.epochs_checked, v.first_epoch, v.first_component,
+                             v.diag_step_lo, v.diag_step_hi);
         }
         return ksnprintf(out, cap, "byte-exact: %u epochs re-executed from their keyframes\n",
                          v.epochs_checked);

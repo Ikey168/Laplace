@@ -35,7 +35,7 @@ CORE_ASM := kernel/core/boot.asm kernel/core/isr.asm
 CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
-            kernel/core/monitor.c kernel/core/gdb_target.c
+            kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
 # kernel adapters.
@@ -58,7 +58,7 @@ KERNEL_OBJS := $(patsubst %.asm,$(KBUILD)/%.o,$(CORE_ASM)) \
                $(KBUILD)/kernel/core/user_images.o
 
 # User programs (#220, #230, #231): ring-3 ELF images embedded in the kernel.
-USER_PROGS := heisenbug noise counter hello
+USER_PROGS := heisenbug noise counter hello tscprobe rdrandleak
 USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer -mgeneral-regs-only \
@@ -126,6 +126,7 @@ selftest: kernel
 # Everything CI runs: host unit tests are in .github/workflows/laplace.yml;
 # these are the booted-kernel gates.
 test: all selftest
+	bash tests/qemu/determinism_gate.sh
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 

@@ -41,11 +41,22 @@ a live run and forces the same switches on replay. This is what makes the
 logical clock execution-derived; the original design counted timer ticks, which
 land at a different instruction on every run. The clock (`SYS_TIME`) and
 entropy (`SYS_RANDOM`) system calls go through `ktime_read()` and
-`kentropy_fill()`. Everything else the embedded programs observe is a function
-of their memory and registers, so re-executing from a keyframe with the journal
-reproduces the run exactly. That holds because they never execute `rdtsc`,
-`rdrand`, or `cpuid`: user mode can, and those reads are not journaled yet
-(#241).
+`kentropy_fill()`. User-mode `rdtsc` and `rdtscp` raise #GP (CR4.TSD) and are
+emulated from `ktime_read()`; with CPUID faulting, user `cpuid` raises #GP too
+and is answered from a masked table captured in every keyframe's kernel state
+(#241). Each emulated instruction is a kernel entry, so a step. Everything else
+a program observes is a function of its memory and registers, so re-executing
+from a keyframe with the journal reproduces the run exactly, unless it
+executes an instruction nothing can trap (`rdrand`, `rdseed`, `rdpid`), which
+the table hides and verification reports.
+
+**Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
+rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
+journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the
+first trace sample that differs bounds the divergence to 16 entries (or the
+whole epoch, when only memory differs); the window is then single-stepped and
+the first untrappable instruction in it is reported with its pid, address, and
+position.
 
 **Recording** (`kernel/core/timetravel.c`). At the first entry, and then
 whenever the interval elapses or a record buffer fills, the kernel closes the
@@ -93,8 +104,10 @@ the recording and continues live, still recording.
   kernel is not preempted while recording.
 - The journaled inputs are the ones programs can see today: preemption, time,
   and entropy. There is no device input (keyboard, network) to journal yet.
-- User-mode `rdtsc`, `rdrand`, and `cpuid` bypass the journal: CR4.TSD is not
-  set and CPUID faulting is not used (#241).
+- `rdrand`, `rdseed`, and `rdpid` cannot be trapped: the CPUID table hides
+  them, and executing them anyway is a divergence that `verify` names. Without
+  CPUID faulting (QEMU TCG), user `cpuid` runs natively: deterministic on one
+  host, but a recording moved to another CPU may diverge (#241).
 - A keyframe is a full copy of every mapped user page, written into one region
   slot of `KF_SLOT_SECTORS` (2048 sectors, at most 227 page records), so the
   recorded machine must fit in under 1 MiB (#244).

@@ -65,6 +65,11 @@ typedef struct {
     uint32_t epochs_diverged;
     uint64_t first_epoch;
     uint32_t first_component;
+    /* Diagnosis of the first diverging epoch (#241). */
+    uint64_t diag_step_lo, diag_step_hi;
+    char     leak[8];            /* "" when no untrappable instruction was found */
+    uint32_t leak_pid;
+    uint64_t leak_rip;
 } mcp_verify_t;
 
 /* Operations the tools drive. Each returns 0 on success. The first four (and

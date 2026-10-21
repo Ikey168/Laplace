@@ -20,6 +20,7 @@
 #include "journal_capture.h"     /* journal_capture_load, JOURNAL_EV_DIVERGE */
 #include "checkpoint_journal.h"  /* journal_reader_t, journal_reader_next */
 #include "core/timetravel.h"     /* tt_restore_keyframe, tt_drive */
+#include "core/kjournal.h"        /* kj_replay_begin, kj_replay_add (#241) */
 #include <stddef.h>
 
 int tt_drive(uint64_t epoch, uint64_t step, uint64_t insn, uint64_t epoch_len);
@@ -34,6 +35,7 @@ static bool             g_perturb;
 static int src_begin_epoch(void* ctx, uint64_t epoch) {
     (void)ctx;
     g_reader_ok = journal_capture_load(epoch, &g_reader) == JOURNAL_OK;
+    kj_replay_begin(epoch);
     return g_reader_ok ? 0 : -1;
 }
 
@@ -44,6 +46,7 @@ static int src_next(void* ctx, replay_event_t* out) {
     int rc = journal_reader_next(&g_reader, &ev);
     if (rc == JOURNAL_ERR_NO_JOURNAL) return 0;   /* epoch exhausted */
     if (rc != JOURNAL_OK) return -1;
+    if (ev.type >= JOURNAL_EV_EXTENDED_BASE) kj_replay_add(ev.type, ev.len, ev.lclock, ev.value);
     out->type = ev.type;
     out->len = ev.len;
     out->lclock = ev.lclock;

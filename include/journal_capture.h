@@ -38,6 +38,17 @@
  * previous epoch reaches. value carries the step count. */
 #define JOURNAL_EV_EPOCH_LEN 7
 
+/* Event types from 16 up belong to the kernel's extended journal
+ * (include/core/kjournal.h): written verbatim, in order, after the entropy run. */
+#define JOURNAL_EV_EXTENDED_BASE 16
+
+typedef struct {
+    uint32_t type;
+    uint32_t len;
+    uint64_t lclock;
+    uint64_t value;
+} journal_capture_event_t;
+
 /* Injected delta sources. The live kernel wires these to
  * scheduler_preempt_points / ktime_values / kentropy_bytes; tests pass fakes.
  * Each returns the count for the current epoch and points *out at the buffer.
@@ -51,6 +62,9 @@ typedef struct {
     uint32_t (*divergence_sums)(const uint32_t** ids, const uint32_t** sums);
     /* Steps the epoch ran (#223). NULL to skip. */
     uint64_t (*epoch_length)(void);
+    /* Extended events (type >= JOURNAL_EV_EXTENDED_BASE), in order. NULL to
+     * skip. */
+    uint32_t (*extended_events)(const journal_capture_event_t** out);
 } journal_capture_sources_t;
 
 /* Gather the epoch's deltas from src and write them to store as a single

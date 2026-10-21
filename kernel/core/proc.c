@@ -19,12 +19,16 @@ extern const uint8_t user_image_heisenbug[], user_image_heisenbug_end[];
 extern const uint8_t user_image_noise[], user_image_noise_end[];
 extern const uint8_t user_image_counter[], user_image_counter_end[];
 extern const uint8_t user_image_hello[], user_image_hello_end[];
+extern const uint8_t user_image_tscprobe[], user_image_tscprobe_end[];
+extern const uint8_t user_image_rdrandleak[], user_image_rdrandleak_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end },
     { "noise",     user_image_noise,     user_image_noise_end },
     { "counter",   user_image_counter,   user_image_counter_end },
     { "hello",     user_image_hello,     user_image_hello_end },
+    { "tscprobe",  user_image_tscprobe,  user_image_tscprobe_end },
+    { "rdrandleak", user_image_rdrandleak, user_image_rdrandleak_end },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {

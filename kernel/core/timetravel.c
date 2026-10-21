@@ -19,6 +19,7 @@
 #include "time_record.h"
 #include "entropy_record.h"
 #include "sched_record.h"
+#include "core/kjournal.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -30,7 +31,7 @@ void* memcpy(void* dst, const void* src, size_t n);
  *   [J_BASE, J_BASE + j)          journal ring: N regions
  */
 #define LABEL_MAGIC       0x3145434150414C4CULL   /* "LLAPACE1" */
-#define LABEL_VERSION     1
+#define LABEL_VERSION     2   /* 2: CPUID table in the kernel state (#241) */
 #define KF_BASE           8
 #define KF_INDEX_SECTORS  4
 #define KF_SLOT_SECTORS   2048   /* per region slot: up to 227 page records */
@@ -77,6 +78,7 @@ typedef struct {
     uint64_t pending_vector;
     uint64_t pending_error;
     uint64_t pending_cr2;
+    cpuid_table_t cpuid;          /* what user CPUID answered while recording (#241) */
     kstate_proc_t procs[LP_MAX_PROCS];
 } kstate_t;
 
@@ -262,6 +264,7 @@ static void capture_kstate(uint64_t epoch) {
     ks.pending_vector = machine_pending()->vector;
     ks.pending_error = machine_pending()->error;
     ks.pending_cr2 = machine_pending()->cr2;
+    ks.cpuid = *cpu_cpuid_table();
     for (uint32_t i = 0; i < ks.nproc; i++) {
         process_t* p = proc_at(i);
         kstate_proc_t* kp = &ks.procs[i];
@@ -292,6 +295,7 @@ static bool record_pressure(void) {
     if (ktime_values(&p64) >= KTIME_LOG_MAX * 3 / 4) return true;
     if (kentropy_bytes(&p8) >= KENTROPY_LOG_MAX * 3 / 4) return true;
     if (sched_record_points(machine_sched_record(), &p64) >= 3072) return true;
+    if (kj_count() >= KJ_MAX_EVENTS * 3 / 4) return true;
     return false;
 }
 
@@ -328,6 +332,7 @@ static void take_keyframe(void) {
     sched_record_begin_epoch(machine_sched_record(), e);
     ktime_begin_epoch(e);
     kentropy_begin_epoch(e);
+    kj_begin_epoch(e);
 
     g_wb_pending = true;
     g_wb_tick = g_ticks;
@@ -444,6 +449,7 @@ int tt_restore_keyframe(uint64_t epoch) {
         proc_append(p);
     }
     proc_set_next_pid(kst.next_pid);
+    cpu_cpuid_set_table(&kst.cpuid);
 
     /* Pass 2: the pages. */
     if (keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK) return TT_ERR_RESTORE;
@@ -573,6 +579,73 @@ void tt_perturb_next_replay(bool on) {
 
 /* ---- Verification ---- */
 
+/* Instructions whose result the recorder cannot reproduce (#241): RDRAND and
+ * RDSEED cannot be trapped, RDPID reads TSC_AUX, and CPUID runs natively when
+ * the CPU has no CPUID faulting. Decodes the instruction at `rip` past legacy
+ * and REX prefixes; returns its name, or NULL. */
+static const char* leak_at(process_t* p, uint64_t rip) {
+    uint8_t b[8];
+    if (!uaccess_read(p->address_space, rip, b, sizeof(b)) &&
+        !uaccess_read(p->address_space, rip, b, 4)) {
+        return 0;
+    }
+    uint32_t i = 0;
+    bool rep = false;
+    while (i < 4 && (b[i] == 0x66 || b[i] == 0xF2 || b[i] == 0xF3 || (b[i] & 0xF0) == 0x40)) {
+        if (b[i] == 0xF3) rep = true;
+        i++;
+    }
+    if (b[i] != 0x0F) return 0;
+    uint8_t op = b[i + 1], modrm = b[i + 2];
+    if (op == 0xA2 && !cpu_cpuid_faulting()) return "cpuid";
+    if (op == 0xC7 && (modrm >> 6) == 3) {
+        uint32_t reg = (modrm >> 3) & 7;
+        if (reg == 6) return "rdrand";
+        if (reg == 7) return rep ? "rdpid" : "rdseed";
+    }
+    return 0;
+}
+
+typedef struct {
+    tt_verify_t* out;
+    uint64_t     budget;
+} leak_scan_t;
+
+static void leak_visit(void* c, process_t* p, uint64_t rip) {
+    leak_scan_t* ls = (leak_scan_t*)c;
+    if (ls->out->leak_found) return;
+    if (ls->budget == 0) return;
+    ls->budget--;
+    const char* what = leak_at(p, rip);
+    if (!what) return;
+    ls->out->leak_found = true;
+    ls->out->leak_what = what;
+    ls->out->leak_pid = (uint32_t)p->pid;
+    ls->out->leak_rip = rip;
+    ls->out->leak_step = machine_step();
+    ls->out->leak_insn = machine_insn();
+}
+
+/* The first epoch diverged: bound where (from the register trace) and look
+ * for an instruction the recorder cannot replay in that window. */
+static void diagnose(uint64_t epoch, uint64_t len, tt_verify_t* out) {
+    uint64_t bad, lo = 0, hi = len;
+    if (machine_trace_mismatch(&bad)) {
+        /* The sample KJ_TRACE_EVERY entries earlier still matched. */
+        hi = bad;
+        lo = bad >= KJ_TRACE_EVERY ? bad - KJ_TRACE_EVERY : 0;
+    }
+    out->diag_step_lo = lo;
+    out->diag_step_hi = hi;
+    if (tt_goto(epoch, lo, 0) != TT_OK) return;
+    leak_scan_t ls = { out, 2000000 };
+    machine_set_insn_hook(leak_visit, &ls);
+    machine_set_count_insns(true);
+    tt_drive(epoch, hi, 0, len);
+    machine_set_count_insns(false);
+    machine_set_insn_hook(0, 0);
+}
+
 int tt_verify(tt_verify_t* out) {
     memset(out, 0, sizeof(*out));
     tt_window_t w;
@@ -604,6 +677,7 @@ int tt_verify(tt_verify_t* out) {
                     out->first_component = d->diverged_component;
                     out->expected = d->diverged_expected;
                     out->actual = d->diverged_actual;
+                    diagnose(epoch, len, out);
                 }
             }
         }
@@ -632,6 +706,7 @@ int tt_resume_from_store(void) {
     sched_record_begin_epoch(machine_sched_record(), w.newest);
     ktime_begin_epoch(w.newest);
     kentropy_begin_epoch(w.newest);
+    kj_begin_epoch(w.newest);
     g_ticks_since_kf = 0;
     g_sealed = false;
     return TT_OK;

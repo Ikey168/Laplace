@@ -191,6 +191,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Recording: keyframes with deferred copy-on-write writeback, one journal per keyframe, on the IDE disk | `make selftest`, e2e |
 | Replay by re-executing the processes to any (epoch, step, instruction) | e2e, `make selftest` |
 | Byte-exact verification of every retained epoch; a perturbed replay is caught | `make selftest`, `verify_replay`, `monitor verify` |
+| Raw `rdtsc`/`rdtscp`/`cpuid` in user code replay exactly; a divergence names the instruction that caused it | `tests/qemu/determinism_gate.sh` |
 | gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
 | MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
@@ -202,9 +203,12 @@ Limits, stated plainly:
   enters the kernel is not preempted while recording.
 - The journaled inputs are preemption, clock, and entropy. There is no device
   input (keyboard, network) yet, so there is nothing else to journal.
-- User code can execute `rdtsc`, `rdrand`, and `cpuid` directly; those reads
-  bypass the journal. The embedded programs don't, so their replays are exact,
-  but an arbitrary program's would not be (#241).
+- User `rdtsc`/`rdtscp` are trapped and journaled, and user `cpuid` is answered
+  from a recorded, masked table where the CPU has CPUID faulting (KVM, recent
+  bare metal; QEMU's emulator has none, so there `cpuid` runs natively).
+  `rdrand`, `rdseed`, and `rdpid` cannot be trapped: they are hidden from the
+  table, and a program that executes them anyway diverges; `verify` then names
+  the instruction and its address (#241).
 - Every keyframe is a full copy of every user page into a 1 MiB slot (at most
   227 pages), so the recorded machine must fit in under 1 MiB (#244).
 - Programs may not use x87/SSE state; user programs build with
@@ -292,8 +296,6 @@ Laplace/
 The plan for running real programs (unmodified static Linux binaries, threads
 included) is tracked in #235. Its main steps:
 
-- Trap `rdtsc` and `cpuid` and journal them, and hide `rdrand`/`rdseed`, so
-  user code can't read the clock or randomness behind the recorder's back (#241)
 - Incremental keyframes that write only dirtied pages, so keyframes scale to
   real memory sizes (#244)
 - x87/SSE state in contexts and keyframes (#237)

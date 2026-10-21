@@ -11,6 +11,7 @@
 #include "time_record.h"
 #include "entropy_record.h"
 #include "laplace/syscalls.h"
+#include "core/kjournal.h"
 
 void* memset(void* dst, int c, size_t n);
 
@@ -58,6 +59,16 @@ static uint64_t       g_dr_enabled;      /* DR6 B0-B3 bits of the slots DR7 enab
 static machine_entry_hook_fn g_entry_hook;
 static void*                 g_entry_hook_ctx;
 
+/* #241: per-instruction hook while single-stepping (leak diagnosis). */
+static machine_insn_hook_fn g_insn_hook;
+static void*                g_insn_hook_ctx;
+
+/* #241: rolling hash of the registers at every entry of this epoch, journaled
+ * every KJ_TRACE_EVERY steps; on replay, the first step whose hash differs. */
+static uint64_t g_trace;
+static bool     g_trace_bad;
+static uint64_t g_trace_bad_step;
+
 /* ---- Accessors ---- */
 
 void machine_init(void) {
@@ -84,6 +95,20 @@ void machine_set_position(uint64_t epoch, uint64_t step) {
     g_step = step;
     g_insn = 0;
     g_at_entry = true;
+    if (step == 0) {
+        g_trace = 0;
+        g_trace_bad = false;
+    }
+}
+
+bool machine_trace_mismatch(uint64_t* step) {
+    if (g_trace_bad && step) *step = g_trace_bad_step;
+    return g_trace_bad;
+}
+
+void machine_set_insn_hook(machine_insn_hook_fn fn, void* ctx) {
+    g_insn_hook = fn;
+    g_insn_hook_ctx = ctx;
 }
 const pending_entry_t* machine_pending(void) { return &g_pending; }
 void machine_set_pending(const pending_entry_t* e) { g_pending = *e; }
@@ -233,6 +258,80 @@ static int64_t sys_random(process_t* p, uint64_t buf, uint64_t len) {
     return uaccess_write(p->address_space, buf, tmp, len) ? 0 : -1;
 }
 
+/* ---- Emulated instructions (#241) ----
+ *
+ * CR4.TSD makes user RDTSC/RDTSCP raise #GP, and CPUID faulting does the same
+ * for CPUID. The kernel answers them from the journaled clock and the recorded
+ * CPUID table, so a program that reads the time stamp counter or the CPU's
+ * identity directly replays exactly. Each one is a kernel entry, so a step. */
+
+typedef enum { EMUL_NONE = 0, EMUL_RDTSC, EMUL_RDTSCP, EMUL_CPUID } emul_t;
+
+static emul_t emulated_insn(process_t* p, uint64_t* len) {
+    if (g_pending.vector != VEC_GPF || g_pending.error != 0) return EMUL_NONE;
+    uint8_t b[3] = { 0, 0, 0 };
+    if (!uaccess_read(p->address_space, p->context.rip, b, 2)) return EMUL_NONE;
+    if (b[0] != 0x0F) return EMUL_NONE;
+    if (b[1] == 0x31) { *len = 2; return EMUL_RDTSC; }
+    if (b[1] == 0xA2) { *len = 2; return cpu_cpuid_faulting() ? EMUL_CPUID : EMUL_NONE; }
+    if (b[1] == 0x01 && uaccess_read(p->address_space, p->context.rip + 2, &b[2], 1) &&
+        b[2] == 0xF9) {
+        *len = 3;
+        return EMUL_RDTSCP;
+    }
+    return EMUL_NONE;
+}
+
+static void emulate(process_t* p, emul_t kind, uint64_t len) {
+    process_context_t* c = &p->context;
+    if (kind == EMUL_CPUID) {
+        uint32_t r[4];
+        cpu_cpuid_lookup((uint32_t)c->rax, (uint32_t)c->rcx, r);
+        c->rax = r[0]; c->rbx = r[1]; c->rcx = r[2]; c->rdx = r[3];
+    } else {
+        uint64_t t = ktime_read();
+        c->rax = (uint32_t)t;
+        c->rdx = t >> 32;
+        if (kind == EMUL_RDTSCP) c->rcx = 0;   /* IA32_TSC_AUX: CPU 0 */
+    }
+    c->rip += len;
+}
+
+bool machine_entry_is_fault(void) {
+    uint64_t len;
+    return g_cur && g_pending.vector != VEC_SYSCALL && emulated_insn(g_cur, &len) == EMUL_NONE;
+}
+
+/* ---- Register trace (#241) ---- */
+
+static uint64_t mix64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    return h ^ (h >> 32);
+}
+
+static void trace_entry(uint64_t step) {
+    const process_context_t* c = &g_cur->context;
+    const uint64_t regs[] = {
+        step, (uint64_t)g_cur->pid, g_pending.vector,
+        c->rax, c->rbx, c->rcx, c->rdx, c->rsi, c->rdi, c->rbp, c->rsp,
+        c->r8, c->r9, c->r10, c->r11, c->r12, c->r13, c->r14, c->r15,
+        c->rip, c->rflags & 0xED5ULL,
+    };
+    for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) g_trace = mix64(g_trace, regs[i]);
+    if ((step + 1) % KJ_TRACE_EVERY != 0) return;
+    if (g_mode == MACHINE_LIVE) {
+        kj_append(KJ_EV_TRACE, step, g_trace, 0);
+        return;
+    }
+    uint64_t want;
+    if (!g_trace_bad && kj_find(KJ_EV_TRACE, step, &want) && want != g_trace) {
+        g_trace_bad = true;
+        g_trace_bad_step = step;
+    }
+}
+
 typedef enum { AFTER_CONTINUE, AFTER_SWITCHED } after_t;
 
 /* Handle the pending entry of g_cur. Returns AFTER_SWITCHED when the entry
@@ -243,6 +342,12 @@ static after_t handle_entry(void) {
     process_context_t* c = &p->context;
 
     if (g_pending.vector != VEC_SYSCALL) {
+        uint64_t len;
+        emul_t kind = emulated_insn(p, &len);
+        if (kind != EMUL_NONE) {
+            emulate(p, kind, len);
+            return AFTER_CONTINUE;
+        }
         /* A fault that was reported (or replayed): the process dies. */
         machine_terminate(p, -1);
         return AFTER_SWITCHED;
@@ -312,6 +417,7 @@ static bool want_stepping(void) {
  * Returns false when no process is left to run. */
 static bool complete_entry(void) {
     uint64_t step = g_step;
+    trace_entry(step);
     if (handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
     g_step = step + 1;
     g_insn = 1;
@@ -323,6 +429,7 @@ static bool complete_entry(void) {
     g_cur->state = PROCESS_STATE_RUNNING;
     g_at_entry = false;
     g_stepping = want_stepping();
+    if (g_stepping && g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, g_cur->context.rip);
     return true;
 }
 
@@ -358,7 +465,7 @@ static bool stop_at_entry(void) {
         stop_here(STOP_REQUEST, 0);
         return true;
     }
-    if (g_pending.vector != VEC_SYSCALL) {
+    if (machine_entry_is_fault()) {
         stop_here(STOP_FAULT, 0);
         return true;
     }
@@ -450,6 +557,7 @@ static void on_debug(trap_frame_t* f) {
     if (stepped) {
         g_insn++;
         if (g_count_insns) g_counted++;
+        if (g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, f->rip);
     }
     if (dr6 & 0xF) {
         g_seg_hits++;
@@ -495,6 +603,7 @@ void trap_dispatch(trap_frame_t* f) {
          * the first. DR6 already holds both causes for that handler, so return
          * without touching it. */
         if (f->vector == VEC_DEBUG) return;
+        if (cpu_msr_probe_recover(f)) return;
         kernel_trap(f);
     }
 

@@ -138,6 +138,19 @@ void machine_set_hit_hook(machine_hit_hook_fn fn, void* ctx);
 void     machine_set_count_insns(bool on);
 uint64_t machine_counted_insns(void);
 
+/* #241: the entry pending now is a real fault (not an emulated RDTSC, RDTSCP,
+ * or CPUID). */
+bool machine_entry_is_fault(void);
+
+/* #241: while replaying, the first step at which the register trace differed
+ * from the recording's (since the current epoch began). */
+bool machine_trace_mismatch(uint64_t* step);
+
+/* #241: called before every user instruction executes while single-stepping
+ * (the segment's first instruction, then after every step). */
+typedef void (*machine_insn_hook_fn)(void* ctx, process_t* p, uint64_t rip);
+void machine_set_insn_hook(machine_insn_hook_fn fn, void* ctx);
+
 /* Console output from user processes is suppressed while replaying. */
 bool machine_quiet(void);
 

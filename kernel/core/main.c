@@ -162,8 +162,13 @@ static bool selftest(void) {
     kprintf("selftest: verify rc=%d: %u epochs replayed, %u diverged\n", rc, v.epochs_checked,
             v.epochs_diverged);
     if (v.diverged) {
-        kprintf("selftest: first divergence epoch %lu component %u expected %x actual %x\n",
-                v.first_epoch, v.first_component, v.expected, v.actual);
+        kprintf("selftest: first divergence epoch %lu component %u expected %x actual %x, "
+                "between steps %lu..%lu\n", v.first_epoch, v.first_component, v.expected,
+                v.actual, v.diag_step_lo, v.diag_step_hi);
+        if (v.leak_found) {
+            kprintf("selftest: leak: %s at rip %lx in pid %u (step %lu insn %lu)\n", v.leak_what,
+                    v.leak_rip, v.leak_pid, v.leak_step, v.leak_insn);
+        }
     }
     bool ok = rc == TT_OK && !v.diverged && v.epochs_checked > 0;
 
@@ -285,10 +290,14 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     parse_cmdline((mbi[0] & MB_FLAG_CMDLINE) ? (const char*)(uint64_t)mbi[4] : 0);
 
     cpu_init();
+    cpu_cpuid_init();
     mm_init(mb_info);
     pic_init();
     pit_init(MACHINE_TIMER_HZ);
     kprintf("boot: %lu MiB free, timer %u Hz\n", pmm_free_frames() / 256, MACHINE_TIMER_HZ);
+    kprintf("boot: user rdtsc/rdtscp emulated; user cpuid %s\n",
+            cpu_cpuid_faulting() ? "answered from the recorded table (CPUID faulting)"
+                                 : "native (no CPUID faulting on this CPU)");
 
     ktime_init();
     kentropy_init();

@@ -138,6 +138,17 @@ typedef struct {
     uint32_t first_component;    /* KDIVERGE_* */
     uint32_t expected;
     uint32_t actual;
+    /* Diagnosis of the first diverging epoch (#241): the register trace
+     * bounds the divergence to entries (diag_step_lo, diag_step_hi]; the
+     * first instruction in that window the recorder cannot replay, if any. */
+    uint64_t diag_step_lo;
+    uint64_t diag_step_hi;
+    bool        leak_found;
+    const char* leak_what;       /* "rdrand", "rdseed", "rdpid", "cpuid" */
+    uint32_t    leak_pid;
+    uint64_t    leak_rip;
+    uint64_t    leak_step;
+    uint64_t    leak_insn;
 } tt_verify_t;
 
 /* Replay every retained epoch from its keyframe to its end and compare the

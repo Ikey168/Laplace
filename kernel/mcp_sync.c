@@ -183,6 +183,16 @@ static int op_verify(void* c, mcp_verify_t* out) {
     out->epochs_diverged = v.epochs_diverged;
     out->first_epoch = v.first_epoch;
     out->first_component = v.first_component;
+    out->diag_step_lo = v.diag_step_lo;
+    out->diag_step_hi = v.diag_step_hi;
+    out->leak[0] = 0;
+    if (v.leak_found) {
+        uint32_t i = 0;
+        for (; v.leak_what[i] && i < sizeof(out->leak) - 1; i++) out->leak[i] = v.leak_what[i];
+        out->leak[i] = 0;
+        out->leak_pid = v.leak_pid;
+        out->leak_rip = v.leak_rip;
+    }
     return 0;
 }
 
