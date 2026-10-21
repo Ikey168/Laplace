@@ -41,9 +41,11 @@ a live run and forces the same switches on replay. This is what makes the
 logical clock execution-derived; the original design counted timer ticks, which
 land at a different instruction on every run. The clock (`SYS_TIME`) and
 entropy (`SYS_RANDOM`) system calls go through `ktime_read()` and
-`kentropy_fill()`. Everything else a program can observe is a function of its
-memory and registers, so re-executing from a keyframe with the journal
-reproduces the run exactly.
+`kentropy_fill()`. Everything else the embedded programs observe is a function
+of their memory and registers, so re-executing from a keyframe with the journal
+reproduces the run exactly. That holds because they never execute `rdtsc`,
+`rdrand`, or `cpuid`: user mode can, and those reads are not journaled yet
+(#241).
 
 **Recording** (`kernel/core/timetravel.c`). At the first entry, and then
 whenever the interval elapses or a record buffer fills, the kernel closes the
@@ -91,10 +93,18 @@ the recording and continues live, still recording.
   kernel is not preempted while recording.
 - The journaled inputs are the ones programs can see today: preemption, time,
   and entropy. There is no device input (keyboard, network) to journal yet.
+- User-mode `rdtsc`, `rdrand`, and `cpuid` bypass the journal: CR4.TSD is not
+  set and CPUID faulting is not used (#241).
+- A keyframe is a full copy of every mapped user page, written into one region
+  slot of `KF_SLOT_SECTORS` (2048 sectors, at most 227 page records), so the
+  recorded machine must fit in under 1 MiB (#244).
 - Programs may not use x87/SSE state (the context switch saves the general
   registers only); user programs are built with `-mgeneral-regs-only`.
 - Recorded history is read-only: gdb memory and register writes are refused.
 - The workloads are the embedded programs in `user/laplace/`.
+- KVM works (`make selftest` passes under `-enable-kvm -cpu host`, checked on a
+  GitHub-hosted runner on 2026-10-21), but those runners expose no PMU, so
+  instruction-precise preemption can't rely on a hardware branch counter (#245).
 
 ## Modules
 

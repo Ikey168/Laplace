@@ -202,6 +202,11 @@ Limits, stated plainly:
   enters the kernel is not preempted while recording.
 - The journaled inputs are preemption, clock, and entropy. There is no device
   input (keyboard, network) yet, so there is nothing else to journal.
+- User code can execute `rdtsc`, `rdrand`, and `cpuid` directly; those reads
+  bypass the journal. The embedded programs don't, so their replays are exact,
+  but an arbitrary program's would not be (#241).
+- Every keyframe is a full copy of every user page into a 1 MiB slot (at most
+  227 pages), so the recorded machine must fit in under 1 MiB (#244).
 - Programs may not use x87/SSE state; user programs build with
   `-mgeneral-regs-only`.
 - Workloads are the programs embedded in the kernel (`user/laplace/`).
@@ -284,12 +289,22 @@ Laplace/
 
 ## Roadmap
 
+The plan for running real programs (unmodified static Linux binaries, threads
+included) is tracked in #235. Its main steps:
+
+- Trap `rdtsc` and `cpuid` and journal them, and hide `rdrand`/`rdseed`, so
+  user code can't read the clock or randomness behind the recorder's back (#241)
+- Incremental keyframes that write only dirtied pages, so keyframes scale to
+  real memory sizes (#244)
+- x87/SSE state in contexts and keyframes (#237)
+- The Linux system call interface, a loader for programs not embedded in the
+  kernel, and `brk`/`mmap` (#238, #240, #239)
 - Journal device input (keyboard, disk completions) so interactive programs
-  can be recorded
-- A loader for programs not embedded in the kernel
-- x87/SSE state in contexts and keyframes
-- Retired-instruction counting (where available) for preemption finer than a
-  kernel entry
+  can be recorded (#242, #249)
+- Preemption at any instruction, recorded as a register-and-memory state that
+  replay finds with a breakpoint, so it works without a hardware branch counter
+  (QEMU TCG, and CI runners without a PMU), with the counter as a speed-up where
+  present (#245)
 - SMP-safe deterministic replay
 - Repair or remove the legacy subsystems (#233)
 
