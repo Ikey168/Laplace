@@ -22,6 +22,7 @@
 #include "core/kjournal.h"
 #include "core/clock.h"
 #include "core/vm.h"
+#include "core/kstate.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -33,8 +34,8 @@ void* memcpy(void* dst, const void* src, size_t n);
  *   [J_BASE, J_BASE + j)          journal ring: N regions
  */
 #define LABEL_MAGIC       0x3145434150414C4CULL   /* "LLAPACE1" */
-#define LABEL_VERSION     5   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240);
-                                 5: region list (#239) */
+#define LABEL_VERSION     6   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240);
+                                 5: region list (#239); 6: sectioned kernel state (#243) */
 #define KF_BASE           8
 #define KF_INDEX_SECTORS  4
 #define KF_SLOT_SECTORS   2048   /* per region slot: up to 227 page records */
@@ -51,45 +52,9 @@ typedef struct {
     uint32_t crc;
 } tt_label_t;
 
-/* Kernel-state blob captured with every keyframe (#224). */
+/* Kernel-state blob captured with every keyframe (#224, #243): one section per
+ * kernel subsystem, see include/core/kstate.h. */
 #define KSTATE_TAG        0x4C50u               /* "LP" */
-#define KSTATE_MAGIC      0x3145544154534B4CULL /* "LKSTATE1" */
-#define KSTATE_MAX_REGIONS 1024             /* all processes together */
-
-typedef struct {
-    uint64_t start, end;
-    uint32_t flags, type;
-    char     name[16];
-} kstate_region_t;
-
-typedef struct {
-    uint32_t pid;
-    uint32_t state;
-    char     name[MAX_PROCESS_NAME];
-    uint32_t first_region;        /* its regions: kstate_t.regions[first, first + n) */
-    uint32_t nregions;
-    uint32_t exe_crc;             /* the executable's image (#240) */
-    char     exe[64];
-} kstate_proc_t;
-
-typedef struct {
-    uint64_t magic;
-    uint64_t epoch;
-    uint32_t nproc;
-    uint32_t current_pid;
-    uint32_t next_pid;
-    uint32_t reserved;
-    uint64_t pending_vector;
-    uint64_t pending_error;
-    uint64_t pending_cr2;
-    cpuid_table_t cpuid;          /* what user CPUID answered while recording (#241) */
-    clock_base_t clock;           /* how TSC reads became times (#238) */
-    uint64_t     clock_now_ns;    /* monotonic time at the keyframe, for a resume */
-    kstate_proc_t procs[LP_MAX_PROCS];
-    uint32_t nregions;            /* the address spaces' layouts (#239) */
-    uint32_t reserved2;
-    kstate_region_t regions[KSTATE_MAX_REGIONS];   /* captured up to nregions */
-} kstate_t;
 
 /* ---- State ---- */
 
@@ -102,7 +67,6 @@ static uint32_t    g_wb_tick;          /* tick count when the keyframe was taken
 static uint32_t    g_ticks;
 
 static bool        g_sealed;           /* the open epoch's journal is on disk */
-static uint64_t    g_restored_now_ns;  /* clock at the last restored keyframe (#238) */
 static bool        g_force_keyframe;   /* take one at the next live entry */
 static uint64_t    g_end_epoch;        /* the recording's stop point */
 static uint64_t    g_end_step;
@@ -264,44 +228,12 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
 /* ---- Kernel-state blob ---- */
 
 static void capture_kstate(uint64_t epoch) {
-    static kstate_t ks;
-    memset(&ks, 0, sizeof(ks));
-    ks.magic = KSTATE_MAGIC;
-    ks.epoch = epoch;
-    ks.nproc = proc_count();
-    process_t* cur = machine_current();
-    ks.current_pid = cur ? (uint32_t)cur->pid : 0;
-    ks.next_pid = proc_next_pid();
-    ks.pending_vector = machine_pending()->vector;
-    ks.pending_error = machine_pending()->error;
-    ks.pending_cr2 = machine_pending()->cr2;
-    ks.cpuid = *cpu_cpuid_table();
-    ks.clock = *clock_base();
-    ks.clock_now_ns = clock_now_unrecorded();
-    for (uint32_t i = 0; i < ks.nproc; i++) {
-        process_t* p = proc_at(i);
-        kstate_proc_t* kp = &ks.procs[i];
-        kp->pid = (uint32_t)p->pid;
-        kp->state = (uint32_t)p->state;
-        memcpy(kp->name, p->name, sizeof(kp->name));
-        memcpy(kp->exe, p->exe_path, sizeof(kp->exe));
-        kp->exe_crc = p->exe_crc;
-        kp->first_region = ks.nregions;
-        for (vm_region_t* r = p->address_space->regions; r; r = r->next) {
-            if (ks.nregions >= KSTATE_MAX_REGIONS) panic("timetravel: more than %u regions", KSTATE_MAX_REGIONS);
-            kstate_region_t* kr = &ks.regions[ks.nregions++];
-            kp->nregions++;
-            kr->start = r->start_addr;
-            kr->end = r->end_addr;
-            kr->flags = r->flags;
-            kr->type = (uint32_t)r->type;
-            memcpy(kr->name, r->name, sizeof(kr->name) - 1);
-        }
-    }
-    uint32_t size = (uint32_t)((uint8_t*)&ks.regions[ks.nregions] - (uint8_t*)&ks);
-    if (checkpoint_capture_kernel_blob(KSTATE_TAG, &ks, size) != CHECKPOINT_OK) {
+    uint32_t size = 0;
+    uint8_t* blob = kstate_encode(epoch, &size);
+    if (!blob || checkpoint_capture_kernel_blob(KSTATE_TAG, blob, size) != CHECKPOINT_OK) {
         panic("timetravel: cannot capture kernel state");
     }
+    kfree(blob);
 }
 
 /* ---- Recording ---- */
@@ -412,11 +344,6 @@ bool tt_window(tt_window_t* w) {
 
 /* ---- Restore ---- */
 
-typedef struct {
-    uint32_t pid;
-    uint8_t  page[PAGE_SIZE];     /* process_context_t + lp_arch_t (#237) */
-} saved_ctx_t;
-
 static bool g_perturb_xmm;
 void tt_perturb_next_restore(bool on) { g_perturb_xmm = on; }
 
@@ -430,72 +357,57 @@ int tt_restore_keyframe(uint64_t epoch) {
         return TT_ERR_RANGE;
     }
 
-    /* Pass 1: the kernel-state blob and the saved registers. */
-    static kstate_t kst;
-    static saved_ctx_t ctxs[LP_MAX_PROCS];
-    uint32_t nctx = 0;
+    /* Pass 1: the kernel-state blob. */
+    uint8_t* blob = 0;
     uint32_t blob_size = 0;
-    memset(&kst, 0, sizeof(kst));
     rec.page_data = g_pagebuf;
     while (snapshot_reader_next(&rd, &rec) == SNAPSHOT_OK) {
-        if ((rec.flags & CHECKPOINT_REC_KERNEL) && rec.pid == KSTATE_TAG) {
-            uint32_t size = (uint32_t)(rec.virt_addr >> 32);
-            uint32_t idx = (uint32_t)rec.virt_addr;
-            uint32_t off = idx * PAGE_SIZE;
-            if (size > sizeof(kst) || off >= size) return TT_ERR_RESTORE;
-            uint32_t n = size - off < PAGE_SIZE ? size - off : PAGE_SIZE;
-            memcpy((uint8_t*)&kst + off, g_pagebuf, n);
+        if (!(rec.flags & CHECKPOINT_REC_KERNEL) || rec.pid != KSTATE_TAG) continue;
+        uint32_t size = (uint32_t)(rec.virt_addr >> 32);
+        uint32_t off = (uint32_t)rec.virt_addr * PAGE_SIZE;
+        if (!blob) {
+            blob = (uint8_t*)kmalloc(size);
+            if (!blob) return TT_ERR_RESTORE;
             blob_size = size;
-        } else if (rec.flags & CHECKPOINT_REC_CONTEXT) {
-            if (nctx >= LP_MAX_PROCS) return TT_ERR_RESTORE;
-            ctxs[nctx].pid = rec.pid;
-            memcpy(ctxs[nctx].page, g_pagebuf, PAGE_SIZE);
-            nctx++;
         }
+        if (size != blob_size || off >= size) {
+            kfree(blob);
+            return TT_ERR_RESTORE;
+        }
+        memcpy(blob + off, g_pagebuf, size - off < PAGE_SIZE ? size - off : PAGE_SIZE);
     }
-    if (!blob_size || kst.magic != KSTATE_MAGIC || kst.epoch != epoch || kst.nproc > LP_MAX_PROCS ||
-        kst.nregions > KSTATE_MAX_REGIONS) {
+    uint64_t blob_epoch = 0;
+    if (!blob || !kstate_blob_epoch(blob, blob_size, &blob_epoch) || blob_epoch != epoch) {
+        if (blob) kfree(blob);
         return TT_ERR_RESTORE;
     }
 
     /* Discard the live machine and rebuild it from the keyframe. */
-    vmm_switch_address_space(0);
-    proc_destroy_all();
-    for (uint32_t i = 0; i < kst.nproc; i++) {
-        kstate_proc_t* kp = &kst.procs[i];
-        process_t* p = proc_alloc(kp->pid, kp->name);
-        if (!p) return TT_ERR_RESTORE;
-        p->state = (process_state_t)kp->state;
-        memcpy(p->exe_path, kp->exe, sizeof(p->exe_path));
-        p->exe_crc = kp->exe_crc;
-        if (kp->first_region + kp->nregions > kst.nregions) return TT_ERR_RESTORE;
-        for (uint32_t r = 0; r < kp->nregions; r++) {
-            kstate_region_t* kr = &kst.regions[kp->first_region + r];
-            vmm_create_region(p->address_space, kr->start, kr->end - kr->start, kr->flags,
-                              (vmm_region_type_t)kr->type, kr->name);
-        }
-        for (uint32_t c = 0; c < nctx; c++) {
-            if (ctxs[c].pid == kp->pid) proc_context_load(p, ctxs[c].page);
-        }
-        if (g_perturb_xmm && i == 0) {
-            /* Test hook: flip a bit of XMM15, which programs rarely touch. */
-            g_perturb_xmm = false;
-            proc_arch(p)->fpu[FPU_XMM_OFFSET + 15 * 16] ^= 0x01;
-        }
-        proc_append(p);
+    uint32_t failed = 0;
+    int krc = kstate_restore(blob, blob_size, &failed);
+    kfree(blob);
+    if (krc != KSF_OK) {
+        kprintf("timetravel: keyframe %lu: kernel state section %u (%s) did not restore (%d)\n",
+                epoch, failed, kstate_subsys_name(failed), krc);
+        return TT_ERR_RESTORE;
     }
-    proc_set_next_pid(kst.next_pid);
-    cpu_cpuid_set_table(&kst.cpuid);
-    clock_set_base(&kst.clock);
-    g_restored_now_ns = kst.clock_now_ns;
 
-    /* Pass 2: the pages. */
+    /* Pass 2: the registers and the pages. */
     if (keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK) return TT_ERR_RESTORE;
     rec.page_data = g_pagebuf;
     while (snapshot_reader_next(&rd, &rec) == SNAPSHOT_OK) {
-        if (rec.flags & (CHECKPOINT_REC_KERNEL | CHECKPOINT_REC_CONTEXT)) continue;
+        if (rec.flags & CHECKPOINT_REC_KERNEL) continue;
         process_t* p = proc_by_pid(rec.pid);
         if (!p) return TT_ERR_RESTORE;
+        if (rec.flags & CHECKPOINT_REC_CONTEXT) {
+            proc_context_load(p, g_pagebuf);
+            if (g_perturb_xmm && p == proc_at(0)) {
+                /* Test hook: flip a bit of XMM15, which programs rarely touch. */
+                g_perturb_xmm = false;
+                proc_arch(p)->fpu[FPU_XMM_OFFSET + 15 * 16] ^= 0x01;
+            }
+            continue;
+        }
         uint64_t phys = vmm_get_physical_addr(p->address_space, rec.virt_addr);
         if (!phys) {
             phys = pmm_alloc();
@@ -510,9 +422,6 @@ int tt_restore_keyframe(uint64_t epoch) {
         memcpy(P2V(phys & ~0xFFFULL), g_pagebuf, PAGE_SIZE);
     }
 
-    pending_entry_t pe = { kst.pending_vector, kst.pending_error, kst.pending_cr2 };
-    machine_set_pending(&pe);
-    machine_set_current(proc_by_pid(kst.current_pid));
     machine_set_position(epoch, 0);
     machine_set_mode(MACHINE_REPLAY);
     g_stats.restores++;
@@ -697,8 +606,8 @@ int tt_verify(tt_verify_t* out) {
     for (;;) {
         uint64_t len;
         if (tt_epoch_len(epoch, &len)) {
-            uint32_t ids[KDIVERGE_COMPONENT_COUNT], sums[KDIVERGE_COMPONENT_COUNT], n = 0;
-            if (replay_recorded_sums(epoch, ids, sums, KDIVERGE_COMPONENT_COUNT, &n) != 0 || n == 0) {
+            uint32_t ids[DIVERGE_MAX_COMPONENTS], sums[DIVERGE_MAX_COMPONENTS], n = 0;
+            if (replay_recorded_sums(epoch, ids, sums, DIVERGE_MAX_COMPONENTS, &n) != 0 || n == 0) {
                 return TT_ERR_JOURNAL;
             }
             int rc = tt_goto(epoch, len, 0);
@@ -756,7 +665,7 @@ int tt_resume_from_store(void) {
     /* Continue live from the keyframe: a new timeline from (newest, 0). This
      * boot's TSC is not the recording's: keep the recorded clocks running from
      * the keyframe's time, and record the new base in a keyframe at once. */
-    clock_reanchor(g_restored_now_ns);
+    clock_reanchor(kstate_restored_now_ns());
     g_force_keyframe = true;
     checkpoint_set_epoch(w.newest);
     machine_set_mode(MACHINE_LIVE);

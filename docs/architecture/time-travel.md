@@ -102,10 +102,24 @@ position.
 whenever the interval elapses or a record buffer fills, the kernel closes the
 epoch (its journal goes to the journal ring) and takes a keyframe at that entry:
 `checkpoint_take()` marks every writable user page copy-on-write and captures
-registers, and a kernel-state blob captures the process table, each space's
-regions, the run order, and the pending entry. Writeback to the keyframe store
+registers, and a kernel-state blob captures the kernel's own state. Writeback to the keyframe store
 runs at a later entry, so programs write in between and the COW hook preserves
 the checkpoint-time images.
+
+**Kernel state** (#243, `include/kstate_format.h`, `kernel/core/kstate.c`).
+The blob is a set of sections, one per kernel subsystem, each with its own
+version and CRC; there is no fixed cap on processes, regions, or other
+objects. A subsystem registers a save, a restore, and optionally a checksum:
+`procs` (pid, parent, state, name, executable, and every region), `cpuid`,
+`clock`, `machine` (epoch, current process, next pid, pending entry), and
+`probe`, a one-word test subsystem. Restore runs them in registration order,
+so a subsystem whose objects name another's (a file descriptor its process)
+registers after it and resolves the reference by id; a blob with an unknown
+section, or without a registered one, is refused. Registers and pages stay
+keyframe records of their own. Each subsystem with a checksum is its own
+divergence component (6 and up), and every report names the component:
+`verify` says `component 6 (probe)`, the self-test perturbs the probe's
+restore and requires that name.
 
 **Storage.** The first IDE disk (or a RAM disk) holds a label, the keyframe
 store (a ring index plus N double-buffered regions), and the journal ring: one
@@ -167,6 +181,7 @@ the recording and continues live, still recording.
 |-------|---------|
 | Boot, CPU, memory, processes, system calls | `kernel/core/{boot.asm,isr.asm,cpu.c,mm.c,proc.c,machine.c,main.c}` |
 | Recording, keyframes, restore, replay, verify, navigation | `kernel/core/timetravel.c` |
+| Kernel state in keyframes: sectioned format, subsystems | `kernel/kstate_format.c`, `kernel/core/kstate.c` |
 | Input journal (double-buffered store) and live capture | `kernel/checkpoint_journal.c`, `kernel/journal_capture.c`, `kernel/journal_capture_sync.c` |
 | Journal ring (one journal per retained keyframe) | `kernel/journal_ring.c` |
 | Deterministic preemption, time, entropy | `kernel/sched_record.c`, `kernel/time_record*.c`, `kernel/entropy_record*.c` |

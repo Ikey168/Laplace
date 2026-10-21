@@ -501,6 +501,7 @@ static int tool_call(const mcp_ops_t* ops, sb_t* s, const rid_t* id, const char*
         if (v.epochs_diverged) {
             sb_put(s, " first_epoch="); sb_put_u64(s, v.first_epoch);
             sb_put(s, " component="); sb_put_u64(s, v.first_component);
+            if (v.component_name[0]) { sb_put(s, " ("); sb_put(s, v.component_name); sb_put(s, ")"); }
             sb_put(s, " between_steps="); sb_put_u64(s, v.diag_step_lo);
             sb_put(s, ".."); sb_put_u64(s, v.diag_step_hi);
             if (v.leak[0]) {

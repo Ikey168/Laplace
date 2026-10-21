@@ -17,6 +17,7 @@
 #include "core/proc.h"
 #include "core/machine.h"
 #include "core/timetravel.h"
+#include "core/kstate.h"
 #include "core/monitor.h"
 #include "core/clock.h"
 #include "checkpoint.h"
@@ -29,6 +30,7 @@
 #include "replay_driver.h"
 
 int strncmp(const char* a, const char* b, size_t n);
+int strcmp(const char* a, const char* b);
 size_t strlen(const char* s);
 
 #define MB_FLAG_CMDLINE (1u << 2)
@@ -203,9 +205,10 @@ static bool selftest(void) {
     kprintf("selftest: verify rc=%d: %u epochs replayed, %u diverged\n", rc, v.epochs_checked,
             v.epochs_diverged);
     if (v.diverged) {
-        kprintf("selftest: first divergence epoch %lu component %u expected %x actual %x, "
-                "between steps %lu..%lu\n", v.first_epoch, v.first_component, v.expected,
-                v.actual, v.diag_step_lo, v.diag_step_hi);
+        kprintf("selftest: first divergence epoch %lu component %u (%s) expected %x actual %x, "
+                "between steps %lu..%lu\n", v.first_epoch, v.first_component,
+                kstate_component_name(v.first_component), v.expected, v.actual, v.diag_step_lo,
+                v.diag_step_hi);
         if (v.leak_found) {
             kprintf("selftest: leak: %s at rip %lx in pid %u (step %lu insn %lu)\n", v.leak_what,
                     v.leak_rip, v.leak_pid, v.leak_step, v.leak_insn);
@@ -213,15 +216,17 @@ static bool selftest(void) {
     }
     bool ok = rc == TT_OK && !v.diverged && v.epochs_checked > 0;
 
-    process_t* hb = 0;
+    /* By pid: every restore rebuilds the process table, so a process_t
+     * pointer does not survive tt_verify. */
+    uint32_t hb_pid = 0;
     for (uint32_t i = 0; i < proc_count(); i++) {
-        if (strncmp(proc_at(i)->name, "heisenbug", 9) == 0) hb = proc_at(i);
+        if (strncmp(proc_at(i)->name, "heisenbug", 9) == 0) hb_pid = (uint32_t)proc_at(i)->pid;
     }
     /* The detector must notice a corrupted replay. Only the heisenbug's
      * recording is sure to show it: programs that do not interact end in the
      * same state under another schedule, and a process that exits takes its
      * corrupted registers with it. Elsewhere the results are reported. */
-    bool strict = hb != 0;
+    bool strict = hb_pid != 0;
     tt_verify_t bad;
     tt_perturb_next_replay(true);
     rc = tt_verify(&bad);
@@ -241,6 +246,16 @@ static bool selftest(void) {
             bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
             bad.first_component);
     ok = ok && (bad.diverged || !strict);
+
+    /* ... and a kernel subsystem restored wrongly, named by the report (#243).
+     * The probe's state lasts the whole epoch, so this holds for any program. */
+    kstate_perturb_next_restore(KS_ID_PROBE);
+    rc = tt_verify(&bad);
+    const char* who = bad.diverged ? kstate_component_name(bad.first_component) : "-";
+    kprintf("selftest: perturbed kernel-state section 'probe': %s (epoch %lu component %u: %s)\n",
+            bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
+            bad.first_component, who);
+    ok = ok && bad.diverged && strcmp(who, "probe") == 0;
     tt_verify(&v);   /* back to the end of the recording, clean */
 
     /* A scan of the newest epoch visits every position through the stop
@@ -255,8 +270,8 @@ static bool selftest(void) {
 
     /* Who last wrote the heisenbug's batch_limit? Found by value, to the
      * exact instruction (#228). */
-    if (hb) {
-        uint32_t pid = (uint32_t)hb->pid;
+    if (hb_pid) {
+        uint32_t pid = hb_pid;
         g_watch_pid = pid;
         tt_pos_t end, w1, w2;
         tt_position(&end);
@@ -286,7 +301,7 @@ static bool selftest(void) {
 
         /* Step back and forth over instructions and land on the same state. */
         tt_goto_pos(&end);
-        uint32_t ids[KDIVERGE_COMPONENT_COUNT], a_sums[KDIVERGE_COMPONENT_COUNT];
+        uint32_t ids[DIVERGE_MAX_COMPONENTS], a_sums[DIVERGE_MAX_COMPONENTS];
         kdiverge_record_epoch(machine_epoch());
         uint32_t na = kdiverge_journal_sums(0, 0);
         const uint32_t* pids;
@@ -367,6 +382,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     g_rdrand = cpu_has_rdrand();
     kentropy_set_source(entropy_source, 0);
     machine_init();
+    kstate_init();
     kdiverge_init();
     kdiverge_register_kernel_sources();
     checkpoint_init();

@@ -65,6 +65,7 @@ typedef struct {
     uint32_t epochs_diverged;
     uint64_t first_epoch;
     uint32_t first_component;
+    char     component_name[24];   /* the subsystem that diverged (#243) */
     /* Diagnosis of the first diverging epoch (#241). */
     uint64_t diag_step_lo, diag_step_hi;
     char     leak[8];            /* "" when no untrappable instruction was found */

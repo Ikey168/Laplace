@@ -14,6 +14,7 @@
 #include "reverse.h"
 #include "revbreak.h"
 #include "core/timetravel.h"
+#include "core/kstate.h"
 #include "core/machine.h"
 #include "core/monitor.h"
 #include "core/proc.h"
@@ -183,6 +184,12 @@ static int op_verify(void* c, mcp_verify_t* out) {
     out->epochs_diverged = v.epochs_diverged;
     out->first_epoch = v.first_epoch;
     out->first_component = v.first_component;
+    {
+        const char* n = kstate_component_name(v.first_component);
+        uint32_t i = 0;
+        for (; n[i] && i < sizeof(out->component_name) - 1; i++) out->component_name[i] = n[i];
+        out->component_name[i] = 0;
+    }
     out->diag_step_lo = v.diag_step_lo;
     out->diag_step_hi = v.diag_step_hi;
     out->leak[0] = 0;

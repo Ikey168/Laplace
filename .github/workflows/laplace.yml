@@ -69,6 +69,7 @@ jobs:
           gcc -I../include -Wall -o /tmp/t_mcp    test_mcp.c                  ../kernel/mcp.c && /tmp/t_mcp
           gcc -I../include -Wall -o /tmp/t_jc     test_journal_capture.c      ../kernel/journal_capture.c ../kernel/checkpoint_journal.c && /tmp/t_jc
           gcc -I../include -Wall -o /tmp/t_ks     test_keyframe_store.c       ../kernel/keyframe_store.c ../kernel/snapshot_store.c ../kernel/keyframe_ring.c && /tmp/t_ks
+          gcc -I../include -Wall -o /tmp/t_ksf    test_kstate_format.c        ../kernel/kstate_format.c ../kernel/snapshot_store.c && /tmp/t_ksf
           gcc -I../include -Wall -o /tmp/t_rd     test_replay_driver.c        ../kernel/replay_driver.c ../kernel/replay_engine.c && /tmp/t_rd
           gcc -I../include -Wall -o /tmp/t_ds     test_divergence_scan.c      ../kernel/divergence_scan.c ../kernel/divergence.c && /tmp/t_ds
           gcc -I../include -Wall -o /tmp/t_gsl    test_gdb_serial.c           ../kernel/gdb_serial.c ../kernel/gdbstub.c ../kernel/gdbstub_sync.c && /tmp/t_gsl

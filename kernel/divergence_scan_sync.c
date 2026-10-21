@@ -22,16 +22,17 @@
 #include "core/proc.h"           /* process table order */
 #include "core/mm.h"             /* vmm_for_each_page */
 #include "core/machine.h"        /* machine_current, machine_pending */
+#include "core/kstate.h"         /* kstate_register_checksums */
 #include <stddef.h>
 
 /* ---- Source registry ---- */
 
-static diverge_source_t g_sources[KDIVERGE_COMPONENT_COUNT];
+static diverge_source_t g_sources[DIVERGE_MAX_COMPONENTS];
 static uint32_t         g_nsources;
 
 /* Sums stashed by the last record scan, for journaling. */
-static uint32_t g_rec_ids[KDIVERGE_COMPONENT_COUNT];
-static uint32_t g_rec_sums[KDIVERGE_COMPONENT_COUNT];
+static uint32_t g_rec_ids[DIVERGE_MAX_COMPONENTS];
+static uint32_t g_rec_sums[DIVERGE_MAX_COMPONENTS];
 static uint32_t g_rec_count;
 
 void kdiverge_reset_sources(void) {
@@ -39,7 +40,7 @@ void kdiverge_reset_sources(void) {
 }
 
 void kdiverge_register(uint32_t component, diverge_source_fn source, void* ctx) {
-    if (!source || g_nsources >= KDIVERGE_COMPONENT_COUNT) return;
+    if (!source || g_nsources >= DIVERGE_MAX_COMPONENTS) return;
     g_sources[g_nsources].component = component;
     g_sources[g_nsources].source = source;
     g_sources[g_nsources].ctx = ctx;
@@ -137,6 +138,7 @@ void kdiverge_register_kernel_sources(void) {
     kdiverge_register(KDIVERGE_SCHEDULER, sum_scheduler, NULL);
     kdiverge_register(KDIVERGE_USER_PAGES, sum_user_pages, NULL);
     kdiverge_register(KDIVERGE_CONTEXTS, sum_contexts, NULL);
+    kstate_register_checksums();   /* one component per kernel subsystem (#243) */
 }
 
 /* ---- Record side ---- */

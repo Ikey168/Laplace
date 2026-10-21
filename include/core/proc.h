@@ -19,7 +19,7 @@
 #include "core/cpu.h"
 #include "core/fpu.h"
 
-#define LP_MAX_PROCS     16
+#define LP_MAX_PROCS     256   /* PM_MAX_PROCESSES; the keyframe format has no cap (#243) */
 #define LP_STACK_TOP     0x80000000ULL
 #define LP_STACK_PAGES   4
 
