@@ -9,6 +9,7 @@
 #include "core/vm.h"
 #include "core/files.h"
 #include "core/pctl.h"
+#include "core/ksig.h"
 #include "core/console.h"
 #include "entropy_record.h"
 #include "time_record.h"
@@ -167,25 +168,6 @@ static lx_after_t sys_clock_nanosleep(process_t* p, uint64_t clk, uint64_t flags
     return sleep_until(p, ns);
 }
 
-/* ---- Signals (no delivery yet, #250) ---- */
-
-static int64_t sys_rt_sigaction(process_t* p, uint64_t oact) {
-    if (oact) {
-        uint8_t z[32];
-        memset(z, 0, sizeof(z));
-        if (!put_user(p, oact, z, sizeof(z))) return err(LX_EFAULT);
-    }
-    return 0;
-}
-
-static int64_t sys_rt_sigprocmask(process_t* p, uint64_t oset) {
-    if (oset) {
-        uint64_t z = 0;
-        if (!put_user(p, oset, &z, 8)) return err(LX_EFAULT);
-    }
-    return 0;
-}
-
 /* ---- Unimplemented calls ---- */
 
 static uint8_t g_reported[512 / 8];
@@ -219,6 +201,8 @@ lx_after_t linux_syscall(process_t* p) {
     /* Processes (#248): fork, execve, wait4, kill, ... */
     lx_after_t after;
     if (pctl_syscall(p, nr, &after)) return after;
+    /* Signals and timers (#250). */
+    if (ksig_syscall(p, nr, &after)) return after == LX_CONTINUE_KEEP ? LX_CONTINUE : after;
     switch (nr) {
     case LX_exit:
     case LX_exit_group:
@@ -250,9 +234,6 @@ lx_after_t linux_syscall(process_t* p) {
     case LX_gettimeofday:    r = sys_gettimeofday(p, a0, a1); break;
     case LX_time:            r = sys_time(p, a0); break;
     case LX_getrandom:       r = sys_getrandom(p, a0, a1); break;
-    case LX_rt_sigaction:    r = sys_rt_sigaction(p, a2); break;
-    case LX_rt_sigprocmask:  r = sys_rt_sigprocmask(p, a2); break;
-    case LX_sigaltstack:     r = 0; break;
     case LX_brk:             r = vm_brk(p, a0); break;
     case LX_mmap:            r = vm_mmap(p, a0, a1, a2, a3, (int64_t)c->r8, c->r9); break;
     case LX_munmap:          r = vm_munmap(p, a0, a1); break;

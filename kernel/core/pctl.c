@@ -10,6 +10,7 @@
 #include "core/files.h"
 #include "core/timetravel.h"
 #include "core/console.h"
+#include "core/ksig.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -81,6 +82,7 @@ static process_t* do_fork(process_t* p, int64_t* err_out) {
     memcpy(c->exe_path, p->exe_path, sizeof(c->exe_path));
     c->exe_crc = p->exe_crc;
     files_fork(p, c);
+    ksig_fork(p, c);
     c->state = PROCESS_STATE_READY;
     proc_append(c);
     return c;
@@ -148,6 +150,7 @@ static int64_t sys_execve(process_t* p, uint64_t upath, uint64_t uargv, uint64_t
     rc = proc_exec(p, img, argc, argv, envc, envp);
     if (rc < 0) return rc;
     files_exec(p);                              /* close-on-exec descriptors */
+    ksig_exec(p);                               /* handlers back to default */
     return 0;
 }
 
@@ -207,20 +210,15 @@ static lx_after_t sys_wait4(process_t* p, int64_t pid, uint64_t ustatus, uint64_
 
 /* ---- kill ---- */
 
-static bool default_ignored(uint64_t sig) {
-    return sig == SIGCHLD || sig == 23 /* SIGURG */ || sig == 28 /* SIGWINCH */ ||
-           sig == 18 /* SIGCONT */;
-}
-
-static lx_after_t do_kill(process_t* p, int64_t pid, uint64_t sig, int64_t* r) {
+static lx_after_t do_kill(process_t* p, int64_t pid, uint64_t sig, int32_t code, int64_t* r) {
     if (sig > 64) { *r = err(LX_EINVAL); return LX_CONTINUE; }
     process_t* t = pid > 0 ? proc_by_pid((uint32_t)pid) : pid == 0 ? p : 0;
     if (!t) { *r = err(LX_ESRCH); return LX_CONTINUE; }
     *r = 0;
-    if (sig == 0 || t->state == PROCESS_STATE_ZOMBIE || default_ignored(sig)) return LX_CONTINUE;
-    /* No handlers yet (#250): every other signal ends the process. */
-    machine_kill(t, (uint32_t)sig);
-    return t == p ? LX_SWITCHED : LX_CONTINUE;
+    if (sig == 0) return LX_CONTINUE;
+    /* Pending until t next runs (#250); SIGKILL ends t now. */
+    ksig_send(t, (uint32_t)sig, code, (uint64_t)p->pid);
+    return t == p && sig == SIG_SIGKILL ? LX_SWITCHED : LX_CONTINUE;
 }
 
 /* ---- Dispatch ---- */
@@ -249,13 +247,13 @@ bool pctl_syscall(process_t* p, uint64_t nr, lx_after_t* after) {
         a = sys_wait4(p, (int64_t)a0, a1, a2, a3, &r);
         break;
     case LX_kill:
-        a = do_kill(p, (int64_t)a0, a1, &r);
+        a = do_kill(p, (int64_t)a0, a1, SI_USER, &r);
         break;
     case 200:                                   /* tkill */
-        a = do_kill(p, (int64_t)a0, a1, &r);
+        a = do_kill(p, (int64_t)a0, a1, SI_TKILL, &r);
         break;
     case 234:                                   /* tgkill */
-        a = do_kill(p, (int64_t)a1, a2, &r);
+        a = do_kill(p, (int64_t)a1, a2, SI_TKILL, &r);
         break;
     case 109: r = 0; break;                     /* setpgid */
     case 121:                                   /* getpgid */

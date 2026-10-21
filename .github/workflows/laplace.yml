@@ -128,6 +128,8 @@ jobs:
         run: bash tests/qemu/sleep_gate.sh
       - name: fork, execve, wait, kill; rewind between fork and exec (in QEMU)
         run: bash tests/qemu/proc_gate.sh
+      - name: Signals, handlers, timers; a fault stops for gdb (in QEMU)
+        run: bash tests/qemu/signal_gate.sh
       - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
         run: python3 tests/qemu/timetravel_e2e.py
       - name: Power cut and resume on the IDE disk (in QEMU)

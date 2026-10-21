@@ -187,6 +187,8 @@ typedef struct process {
     uint64_t wait_aux;       /* a second operand, e.g. wait4's status pointer */
     /* A zombie's wait status (#248): exit code << 8, or the signal. */
     uint32_t wait_status;
+    /* Signal state (#250): include/core/ksig.h. */
+    void*    sig;
 } process_t;
 
 /* Process management functions */

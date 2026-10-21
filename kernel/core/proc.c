@@ -4,6 +4,7 @@
 #include "core/mm.h"
 #include "core/vm.h"
 #include "core/files.h"
+#include "core/ksig.h"
 #include "core/timetravel.h"
 #include "core/console.h"
 #include "process_manager.h"
@@ -36,6 +37,7 @@ extern const uint8_t user_image_musl_fileprobe[], user_image_musl_fileprobe_end[
 extern const uint8_t user_image_musl_inputprobe[], user_image_musl_inputprobe_end[];
 extern const uint8_t user_image_musl_sleeper[], user_image_musl_sleeper_end[];
 extern const uint8_t user_image_musl_forkexec[], user_image_musl_forkexec_end[];
+extern const uint8_t user_image_musl_sigprobe[], user_image_musl_sigprobe_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -53,6 +55,7 @@ static const lp_image_t g_images[] = {
     { "musl_inputprobe", user_image_musl_inputprobe, user_image_musl_inputprobe_end, true },
     { "musl_sleeper", user_image_musl_sleeper, user_image_musl_sleeper_end, true },
     { "musl_forkexec", user_image_musl_forkexec, user_image_musl_forkexec_end, true },
+    { "musl_sigprobe", user_image_musl_sigprobe, user_image_musl_sigprobe_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {
@@ -221,6 +224,7 @@ process_t* proc_alloc(uint32_t pid, const char* name) {
 
 void proc_destroy(process_t* p) {
     files_proc_gone(p);
+    ksig_proc_gone(p);
     int idx = proc_index(p);
     if (idx >= 0) {
         for (uint32_t i = (uint32_t)idx; i + 1 < g_count; i++) g_table[i] = g_table[i + 1];
@@ -469,6 +473,7 @@ process_t* proc_spawn_args(const lp_image_t* image, uint32_t argc, const char* c
     }
     p->exe_crc = proc_image_crc(image);
     files_proc_new(p);
+    ksig_proc_new(p);
     g_next_pid++;
     p->state = PROCESS_STATE_READY;
     proc_append(p);

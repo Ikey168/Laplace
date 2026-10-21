@@ -10,8 +10,7 @@
  * execve replaces the program through the loader (#240); close-on-exec
  * descriptors close. A process that exits while its parent lives becomes a
  * zombie until wait4 reaps it; a parent waiting for it is woken at once.
- * Orphans go to pid 1. kill ends the target (no handlers until #250;
- * SIGCHLD, SIGURG, SIGWINCH, and SIGCONT are ignored by default). pids stay
+ * Orphans go to pid 1. kill sends a signal (include/core/ksig.h). pids stay
  * deterministic: the counter is kernel state.
  */
 

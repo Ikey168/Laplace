@@ -26,6 +26,7 @@
 #include "core/kstate.h"
 #include "core/files.h"
 #include "core/kio.h"
+#include "core/ksig.h"
 #include "core/kfpages.h"
 #include "core/monitor.h"
 #include "core/clock.h"
@@ -438,6 +439,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     const lp_image_t* seed = proc_seed_module(g_opts.root);
     files_init(seed ? seed->start : 0, seed ? (uint64_t)(seed->end - seed->start) : 0,
                seed ? seed->name : "");
+    ksig_init();
     kdiverge_init();
     kdiverge_register_kernel_sources();
     checkpoint_init();

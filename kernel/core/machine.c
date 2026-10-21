@@ -17,6 +17,7 @@
 #include "core/kfpages.h"
 #include "core/kio.h"
 #include "core/pctl.h"
+#include "core/ksig.h"
 #include "core/files.h"
 #include "core/clock.h"
 #include "iorec.h"
@@ -329,6 +330,9 @@ static void end_process(process_t* p, uint32_t status) {
     p->wait_deadline = 0;
     p->wait_aux = 0;
     pctl_child_exited(p);
+    /* The parent hears of it (default: ignored). */
+    ksig_send(parent, SIG_SIGCHLD, (status & 0x7F) ? 2 /* CLD_KILLED */ : 1 /* CLD_EXITED */,
+              (uint64_t)p->pid);
 }
 
 void machine_terminate(process_t* p, int code) {
@@ -337,6 +341,31 @@ void machine_terminate(process_t* p, int code) {
 
 void machine_kill(process_t* p, uint32_t sig) {
     end_process(p, sig & 0x7F);
+}
+
+/* The signal a user fault raises (#250), with si_code and si_addr. */
+static uint32_t fault_signal(int32_t* code, uint64_t* addr) {
+    uint64_t rip = g_cur ? g_cur->context.rip : 0;
+    *addr = 0;
+    *code = SI_KERNEL;
+    switch (g_pending.vector) {
+    case 0:  *code = 1; *addr = rip; return SIG_SIGFPE;          /* #DE: FPE_INTDIV */
+    case 16: case 19: *code = 0; *addr = rip; return SIG_SIGFPE; /* #MF, #XM */
+    case 1: case 3: return SIG_SIGTRAP;                          /* #DB, int3 */
+    case 6:  *code = 2; *addr = rip; return SIG_SIGILL;          /* #UD: ILL_ILLOPN */
+    case 17: *code = 1; return SIG_SIGBUS;                       /* #AC: BUS_ADRALN */
+    case VEC_PAGE_FAULT:
+        *code = (g_pending.error & 1) ? 2 : 1;                   /* SEGV_ACCERR, SEGV_MAPERR */
+        *addr = g_pending.cr2;
+        return SIG_SIGSEGV;
+    default: return SIG_SIGSEGV;                                 /* #GP and the rest */
+    }
+}
+
+uint32_t machine_fault_signal(void) {
+    int32_t code;
+    uint64_t addr;
+    return fault_signal(&code, &addr);
 }
 
 /* ---- Blocking and idle (#246) ---- */
@@ -371,8 +400,16 @@ static bool any_deadline(void) {
     for (uint32_t i = 0; i < proc_count(); i++) {
         process_t* p = proc_at(i);
         if (p->state == PROCESS_STATE_BLOCKED && p->wait_deadline) return true;
+        uint64_t d;
+        if (ksig_next_deadline(p, &d)) return true;     /* a timer (#250) */
     }
     return false;
+}
+
+#define WAKE_SIGTIMER 2               /* kio_event nr: a signal timer fired */
+static uint64_t g_wake_step;
+static void journal_timer(uint32_t pid, uint32_t index) {
+    kio_event(IOREC_DEVICE, WAKE_SIGTIMER, (uint64_t)pid | ((uint64_t)index << 32), g_wake_step);
 }
 
 static bool any_blocked(void) {
@@ -388,24 +425,42 @@ static void deliver_wakes(uint64_t step) {
     if (g_mode == MACHINE_LIVE) {
         if (!any_deadline()) return;
         uint64_t now = clock_now_unrecorded();
+        g_wake_step = step;
         for (uint32_t i = 0; i < proc_count(); i++) {
             process_t* p = proc_at(i);
             if (p->state != PROCESS_STATE_BLOCKED || !p->wait_deadline || p->wait_deadline > now) continue;
             kio_event(IOREC_DEVICE, WAKE_TIMER, (uint64_t)p->pid, step);
             machine_wake(p, machine_timeout_result(p->wait_reason));
         }
+        g_wake_step = step;
+        for (uint32_t i = 0; i < proc_count(); i++) ksig_fire_due(proc_at(i), now, journal_timer);
         return;
     }
     uint32_t nr;
-    uint64_t pid;
-    while (kio_event_next(IOREC_DEVICE, step, &nr, &pid)) {
-        process_t* p = proc_by_pid((uint32_t)pid);
+    uint64_t arg;
+    while (kio_event_next(IOREC_DEVICE, step, &nr, &arg)) {
+        process_t* p = proc_by_pid((uint32_t)arg);
+        if (nr == WAKE_SIGTIMER && p) {
+            ksig_fire(p, (uint32_t)(arg >> 32));
+            continue;
+        }
         if (nr != WAKE_TIMER || !p || p->state != PROCESS_STATE_BLOCKED) machine_stop_diverged();
         machine_wake(p, machine_timeout_result(p->wait_reason));
     }
 }
 
 static stop_reason_t g_pick_stop = STOP_IDLE;
+
+/* A replay that stops where no entry arrives (everything waits, or a fatal
+ * signal): the recording ended here. It is the target if asked for, and
+ * the position is visited like an entry. */
+static stop_reason_t replay_stop_here(void) {
+    if (g_has_target && g_step == g_target_step && g_target_insn == 0) {
+        if (g_entry_hook) g_entry_hook(g_entry_hook_ctx, g_step);
+        return STOP_TARGET;
+    }
+    return STOP_END;
+}
 
 /* Recording, nothing runnable: halt until a wake (or a debugger's request).
  * No steps pass. */
@@ -441,8 +496,7 @@ static bool pick_next(void) {
             deliver_wakes(g_step);
             if (!proc_next_ready(0)) {
                 /* The recording stopped here, everything waiting. */
-                g_pick_stop = g_has_target && g_step == g_target_step && g_target_insn == 0
-                                  ? STOP_TARGET : STOP_END;
+                g_pick_stop = replay_stop_here();
                 return false;
             }
         }
@@ -579,8 +633,13 @@ static after_t handle_entry(void) {
             emulate(p, kind, len);
             return AFTER_CONTINUE;
         }
-        /* A fault that was reported (or replayed): the process dies of it. */
-        machine_kill(p, g_pending.vector == VEC_PAGE_FAULT ? 11 /* SIGSEGV */ : 4 /* SIGILL */);
+        /* A fault: the signal it raises, for a handler, or the process
+         * dies of it (#250). */
+        int32_t code;
+        uint64_t addr;
+        uint32_t sig = fault_signal(&code, &addr);
+        if (ksig_fault(p, sig, code, addr)) return AFTER_CONTINUE;
+        machine_kill(p, sig);
         return AFTER_SWITCHED;
     }
 
@@ -641,6 +700,32 @@ static bool want_stepping(void) {
 
 /* Complete the pending entry: handle it, decide preemption, advance the clock.
  * Returns false when no process is left to run. */
+static uint32_t g_stop_signal;
+
+/* Before a process runs: deliver its next pending signal (#250). False when
+ * the machine must stop: nothing left to run, or a core-dumping signal with
+ * no handler. */
+static bool deliver_signals(void) {
+    while (g_cur) {
+        uint32_t sig = 0;
+        ksig_result_t r = ksig_deliver(g_cur, &sig);
+        if (r == KSIG_NONE || r == KSIG_DELIVERED) return true;
+        if (r == KSIG_KILLED) {
+            if (!pick_next()) return false;
+            continue;
+        }
+        /* KSIG_STOP: as at an unhandled fault, the machine stops here. */
+        g_stop_signal = sig;
+        if (g_mode == MACHINE_LIVE) {
+            g_pick_stop = STOP_SIGNAL;
+        } else {
+            g_pick_stop = replay_stop_here();
+        }
+        return false;
+    }
+    return pick_next() && deliver_signals();
+}
+
 static void start_segment(void) {
     g_cur->state = PROCESS_STATE_RUNNING;
     g_at_entry = false;
@@ -657,6 +742,7 @@ static bool complete_entry(void) {
     g_insn = 1;
     g_seg_hits = 0;
     if (!pick_next()) return false;
+    if (!deliver_signals()) return false;
     start_segment();
     return true;
 }
@@ -693,8 +779,8 @@ static bool stop_at_entry(void) {
         stop_here(STOP_REQUEST, 0);
         return true;
     }
-    if (machine_entry_is_fault()) {
-        stop_here(STOP_FAULT, 0);
+    if (machine_entry_is_fault() && !ksig_fault_handled(g_cur, machine_fault_signal())) {
+        stop_here(STOP_FAULT, machine_fault_signal());
         return true;
     }
     if (g_pending.vector == VEC_SYSCALL && g_cur->context.rax == SYS_BREAK) {
@@ -724,8 +810,8 @@ void machine_start(void) {
 void machine_resume(void) {
     if (!g_cur) {
         /* Stopped while everything waited: wait again, then run. */
-        if (!pick_next()) {
-            stop_here(g_pick_stop, 0);
+        if (!pick_next() || !deliver_signals()) {
+            stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
             return;
         }
         start_segment();
@@ -750,7 +836,7 @@ void machine_resume(void) {
         return;
     }
     if (!complete_entry()) {
-        stop_here(g_pick_stop, 0);
+        stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
         return;
     }
     if (target_at_segment_start()) {
@@ -880,7 +966,7 @@ void trap_dispatch(trap_frame_t* f) {
     }
     if (stop_at_entry()) machine_exit();
     if (!complete_entry()) {
-        stop_here(g_pick_stop, 0);
+        stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
         machine_exit();
     }
     if (target_at_segment_start()) {

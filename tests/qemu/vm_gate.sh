@@ -40,7 +40,7 @@ out=$(timeout 300 "$QEMU" -m 256M -display none -no-reboot \
     -kernel build/laplace.elf -append "run=\"musl_vmprobe overflow\" selftest exit" \
     -serial stdio -serial null -serial null 2>&1 | tr -d '\r' || true)
 echo "$out" | grep -E "monitor: stopped|selftest: verify" | sed "s/^/  [overflow] /"
-check "$out" "stopped \(fault: pid 1 vector 14 error [46] address 7fffff7ef[0-9a-f]{3}\)" \
+check "$out" "stopped \(fault: pid 1 SIGSEGV \(vector 14 error [46] address 7fffff7ef[0-9a-f]{3}\)\)" \
       "a stack overflow faults just below the 8 MiB stack and stops the machine"
 check "$out" "selftest: verify rc=0: 1 epochs replayed, 0 diverged" "... and 8 MiB of stack growth replays"
 

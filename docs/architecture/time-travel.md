@@ -144,10 +144,27 @@ first, then the frame is unshared; a keyframe stores a shared frame in one
 pool slot. `execve` loads through the loader into a fresh address space,
 then closes close-on-exec descriptors. An exiting process with a living
 parent stays a zombie (pid and wait status) until `wait4` reaps it, and a
-parent already waiting is woken at once; orphans go to pid 1. `kill` ends
-the target with the signal's status until handlers arrive (#250). The pid
+parent already waiting is woken at once; orphans go to pid 1. The pid
 counter, the parent links, the zombies' statuses, and the wait4 operands are
 kernel state.
+
+**Signals** (#250, `include/core/ksig.h`). Each process has 64 actions, a
+blocked and a pending set (with each pending signal's siginfo), an alternate
+stack, and up to eight timers (`setitimer`/`alarm` and `timer_create`); all
+of it is the `signals` keyframe section and divergence component. Delivery
+happens only when a process is about to run after a kernel entry, so it is a
+function of the step. A handler gets a Linux x86-64 `rt_sigframe`
+(`sa_restorer` as its return address, a ucontext with the sigcontext and
+signal mask, the siginfo, and the x87/SSE/AVX state with the XSAVE markers),
+and `rt_sigreturn` restores from it. A process blocked in a wait that a
+signal interrupts returns `-EINTR`. Faults become signals at the faulting
+instruction (#PF/#GP -> SIGSEGV with `si_addr`, #DE/#MF/#XM -> SIGFPE, #UD
+-> SIGILL, int3 -> SIGTRAP, #AC -> SIGBUS). With no handler, a fault stops
+the machine for the debugger (gdb sees the signal and the faulting line), as
+does any other core-dumping signal (`abort()`); other fatal signals end the
+process with the signal as its wait status, and an exiting child sends its
+parent SIGCHLD. Timer expiries are inputs: noticed against the clock while
+recording, journaled with the step they are delivered at, and replayed there.
 
 **Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
 rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended

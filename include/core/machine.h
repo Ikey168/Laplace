@@ -44,7 +44,8 @@ typedef enum {
     STOP_END,           /* replay reached the end of the recording */
     STOP_IDLE,          /* nothing left to run */
     STOP_ERROR,         /* replay could not continue */
-    STOP_DIVERGED       /* replay: an input call is not the recorded one (#242) */
+    STOP_DIVERGED,      /* replay: an input call is not the recorded one (#242) */
+    STOP_SIGNAL         /* a signal whose default action dumps core (#250); code = signal */
 } stop_reason_t;
 
 typedef struct {
@@ -200,6 +201,8 @@ void machine_load_segment_bases(process_t* p);
 /* Terminate a process (fault or break handled, or exit). */
 void machine_terminate(process_t* p, int code);
 /* End p by a signal (wait status: the signal number). */
+/* The signal the pending fault raises (#250). */
+uint32_t   machine_fault_signal(void);
 void       machine_kill(process_t* p, uint32_t sig);
 
 #endif /* CORE_MACHINE_H */

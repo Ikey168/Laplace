@@ -1,6 +1,7 @@
 /* Laplace core: the debug monitor (#226). See include/core/monitor.h. */
 
 #include "core/monitor.h"
+#include "core/ksig.h"
 #include "core/gdb_target.h"
 #include "core/timetravel.h"
 #include "core/kstate.h"
@@ -32,9 +33,14 @@ void monitor_live_stopped(void) {
         sig = 6;
         break;
     case STOP_FAULT:
-        ksnprintf(g_stop_text, sizeof(g_stop_text), "fault: pid %u vector %lu error %lx address %lx",
-                  st->pid, st->vector, st->error, st->cr2);
-        sig = st->vector == 6 ? 4 : st->vector == 0 ? 8 : 11;
+        ksnprintf(g_stop_text, sizeof(g_stop_text), "fault: pid %u %s (vector %lu error %lx address %lx)",
+                  st->pid, ksig_name((uint32_t)st->code), st->vector, st->error, st->cr2);
+        sig = (int)st->code;
+        break;
+    case STOP_SIGNAL:
+        ksnprintf(g_stop_text, sizeof(g_stop_text), "signal: pid %u got %s with no handler",
+                  st->pid, ksig_name((uint32_t)st->code));
+        sig = (int)st->code;
         break;
     case STOP_EXITED:
         ksnprintf(g_stop_text, sizeof(g_stop_text), "exit: pid %u is the last process and is exiting",

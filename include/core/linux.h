@@ -122,7 +122,9 @@
 
 /* What the machine does after a call: keep running the caller, or the call
  * itself changed the running process (exit, yield). */
-typedef enum { LX_CONTINUE = 0, LX_SWITCHED } lx_after_t;
+/* After a call: continue (rax = the result), the process gave up the CPU or
+ * its registers were replaced (rax stands), or continue with rax already set. */
+typedef enum { LX_CONTINUE = 0, LX_SWITCHED, LX_CONTINUE_KEEP } lx_after_t;
 
 lx_after_t linux_syscall(process_t* p);
 
