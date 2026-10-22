@@ -69,6 +69,7 @@ typedef struct {
 } ofile_t;
 
 typedef struct {
+    uint32_t users;          /* processes sharing it: a thread group (#251) */
     uint32_t cwd;
     uint32_t umask;
     uint32_t nfd;
@@ -149,6 +150,7 @@ static fdt_t* fdt_new(void) {
     fdt_t* t = (fdt_t*)kzalloc(sizeof(fdt_t));
     if (!t) return 0;
     for (uint32_t i = 0; i < MAX_FDS; i++) t->of[i] = -1;
+    t->users = 1;
     t->cwd = MEMFS_ROOT;
     t->umask = 022;
     return t;
@@ -168,6 +170,10 @@ void files_proc_new(process_t* p) {
 void files_proc_gone(process_t* p) {
     fdt_t* t = fdt(p);
     if (!t) return;
+    if (--t->users) {
+        p->files = 0;            /* the rest of the group keeps it */
+        return;
+    }
     for (int64_t fd = 0; fd < MAX_FDS; fd++) {
         if (t->of[fd] >= 0) fd_close(p, fd);
     }
@@ -189,6 +195,16 @@ void files_fork(process_t* parent, process_t* child) {
             g_of[pt->of[fd]].refs++;
         }
     }
+    child->files = t;
+}
+
+void files_share(process_t* parent, process_t* child) {
+    fdt_t* t = fdt(parent);
+    if (!t) {
+        files_proc_new(child);
+        return;
+    }
+    t->users++;
     child->files = t;
 }
 
@@ -1071,6 +1087,17 @@ static void files_save(ksf_writer_t* w, void* ctx) {
         process_t* p = proc_at(i);
         fdt_t* t = fdt(p);
         ksf_put_u32(w, (uint32_t)p->pid);
+        /* v2: a table shared with an earlier process (a thread, #251) is
+         * written once and named by that process's pid. */
+        uint32_t first = i;
+        for (uint32_t k = 0; t && k < i; k++) {
+            if (fdt(proc_at(k)) == t) { first = k; break; }
+        }
+        if (t && first != i) {
+            ksf_put_u32(w, 2);
+            ksf_put_u32(w, (uint32_t)proc_at(first)->pid);
+            continue;
+        }
         ksf_put_u32(w, t ? 1 : 0);
         if (!t) continue;
         ksf_put_u32(w, t->cwd);
@@ -1088,7 +1115,7 @@ static void files_save(ksf_writer_t* w, void* ctx) {
 
 static int files_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
     (void)ctx;
-    if (version != 1) return -1;
+    if (version < 1 || version > 2) return -1;
     /* The process table was rebuilt without descriptor tables; descriptions
      * are rebuilt here, and the inodes' open counts came with the tree. */
     if (g_of) memset(g_of, 0, (uint64_t)g_nof * sizeof(ofile_t));
@@ -1117,8 +1144,15 @@ static int files_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
     uint32_t nproc = ksf_get_u32(r);
     for (uint32_t k = 0; k < nproc && r->ok; k++) {
         process_t* p = proc_by_pid(ksf_get_u32(r));
-        bool has = ksf_get_u32(r) != 0;
+        uint32_t has = ksf_get_u32(r);
         if (!p) return -1;
+        if (has == 2) {
+            process_t* o = proc_by_pid(ksf_get_u32(r));
+            if (!o || !fdt(o)) return -1;
+            fdt(o)->users++;
+            p->files = o->files;
+            continue;
+        }
         if (!has) continue;
         fdt_t* t = fdt_new();
         if (!t) return -1;
@@ -1151,6 +1185,13 @@ static uint32_t files_sum(void* ctx) {
     for (uint32_t i = 0; i < proc_count(); i++) {
         fdt_t* t = fdt(proc_at(i));
         if (!t) continue;
+        bool again = false;
+        for (uint32_t k = 0; k < i; k++) again |= fdt(proc_at(k)) == t;
+        if (again) {
+            uint32_t head[2] = { (uint32_t)proc_at(i)->pid, t->users };
+            crc = divergence_checksum(crc, head, sizeof(head));
+            continue;
+        }
         uint32_t head[3] = { (uint32_t)proc_at(i)->pid, t->cwd, t->umask };
         crc = divergence_checksum(crc, head, sizeof(head));
         for (uint32_t fd = 0; fd < MAX_FDS; fd++) {
@@ -1181,7 +1222,7 @@ void files_init(const uint8_t* seed, uint64_t len, const char* seed_name) {
                 len, g_fs.seed_crc);
     }
     static const ksf_subsys_t fs = { KS_ID_FS, "fs", 1, fs_save, fs_restore, fs_sum, 0 };
-    static const ksf_subsys_t files = { KS_ID_FILES, "files", 1, files_save, files_restore, files_sum, 0 };
+    static const ksf_subsys_t files = { KS_ID_FILES, "files", 2, files_save, files_restore, files_sum, 0 };
     if (kstate_register(&fs) != KSF_OK || kstate_register(&files) != KSF_OK) {
         panic("files: cannot register keyframe sections");
     }

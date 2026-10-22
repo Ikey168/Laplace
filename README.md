@@ -33,7 +33,7 @@ stopped:
 
 - **gdb**: stock gdb attaches with `target remote` and debugs the recorded
   machine in both directions: `reverse-stepi`, `reverse-continue`, hardware
-  watchpoints and breakpoints, registers, memory, one thread per process.
+  watchpoints and breakpoints, registers, memory, and every thread of every process as a gdb thread.
 - **MCP**: an MCP client (an AI agent) connects through `tools/laplace-mcp` and
   gets tools like `watch_last_write`, `rewind_to`, `reverse_stepi`,
   `read_memory`, and `verify_replay`. Agents are bad at exactly what this is
@@ -201,6 +201,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Files: a seed image, then a program's own files, in keyframes and checksums; unmodified Lua 5.4 runs a script from the image, writes a file and reads it back, and replays byte-exact; a recording refuses another seed | `tests/qemu/files_gate.sh` |
 | Inputs (clock reads, entropy, and later console and network) are one journaled record with payloads of any size: 10 MiB read in one epoch replays byte-exact; a replay whose input call differs from the recording stops at that step and is reported | `tests/qemu/input_gate.sh` |
 | Processes: 50 children fork (copy-on-write), exec, exit, and are reaped with their statuses; kill ends a child; rewinding between a fork and its exec shows both processes in gdb and MCP | `tests/qemu/proc_gate.sh` |
+| Threads: unmodified musl pthreads (mutexes, condition variables, join) record and replay byte-exact; two threads racing on a counter lose updates while recording, replay the same losses, and MCP's watch_last_write traces the overwritten update to the other thread's store | `tests/qemu/threads_gate.sh` |
 | Preemption at any instruction without a counter: two loops with no system call interleave, a loop where only memory changes and `rep movsb` copies are preempted, a spin gets its timer's signals, and each replays byte-exact | `tests/qemu/preempt_gate.sh` |
 | Signals: SIGALRM from a timer interrupts a loop at journaled points with FPU state saved in the frame; a SIGSEGV handler recovers; masks, pending, sigsuspend, sigaltstack; every run replays byte-exact; an unhandled fault or abort() stops the machine and gdb shows the signal and the faulting line | `tests/qemu/signal_gate.sh` |
 | Blocking: a sleeping process and a working one replay byte-exact with each timer wake at its journaled step; a 10 s idle adds no steps and replays without waiting; a debugger stops the machine while everything waits | `tests/qemu/sleep_gate.sh` |

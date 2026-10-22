@@ -12,6 +12,19 @@
  * zombie until wait4 reaps it; a parent waiting for it is woken at once.
  * Orphans go to pid 1. kill sends a signal (include/core/ksig.h). pids stay
  * deterministic: the counter is kernel state.
+ *
+ * Threads (#251): clone with CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD
+ * (what musl's pthread_create passes) adds a scheduling unit to the
+ * caller's thread group: its own registers, extended state, FS base, signal
+ * mask, and pending signals; the group's address space, descriptor table,
+ * and handlers. getpid is the group's id (the leader's pid), gettid the
+ * thread's. exit ends one thread (clearing and waking its
+ * CLONE_CHILD_CLEARTID word, for pthread_join); exit_group, a fatal
+ * signal, or the last thread's exit ends the process. A leader whose own
+ * thread exits stays in the table, parked, holding the group's pid and
+ * address space. futex WAIT/WAKE (and the private, bitset, and requeue
+ * variants) block in WAIT_FUTEX on (address space, address); waiters wake
+ * in table order, so wakeups replay.
  */
 
 #ifndef CORE_PCTL_H

@@ -192,6 +192,7 @@ uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len);
 #define WAIT_INPUT  4         /* console read (#249) */
 #define WAIT_POLL   5         /* poll, select (#249) */
 #define WAIT_SIGNAL 6         /* pause, sigsuspend (#250) */
+#define WAIT_GROUP  7         /* a thread group's leader whose own thread exited (#251) */
 void machine_block(process_t* p, uint32_t reason, uint64_t obj, uint64_t deadline_ns);
 /* Make a blocked process runnable; its system call returns `ret`. */
 void machine_wake(process_t* p, int64_t ret);
@@ -204,8 +205,12 @@ void machine_yield(process_t* p);
 /* Load p's FS/GS base into the MSRs (#238). */
 void machine_load_segment_bases(process_t* p);
 
-/* Terminate a process (fault or break handled, or exit). */
+/* Terminate a process, all of its threads (fault or break handled, exit,
+ * exit_group). */
 void machine_terminate(process_t* p, int code);
+/* One thread exits (#251): the group goes on while others run; the last
+ * one ends the process. */
+void machine_thread_exit(process_t* p, int code);
 /* End p by a signal (wait status: the signal number). */
 /* The signal the pending fault raises (#250). */
 uint32_t   machine_fault_signal(void);

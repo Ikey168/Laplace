@@ -62,8 +62,8 @@ static uint32_t sum_proctable(void* ctx) {
         crc = divergence_checksum(crc, &alive, sizeof(alive));
         crc = divergence_checksum(crc, p->name, sizeof(p->name));
         /* Scheduling state and the wait (#246). */
-        uint64_t wait[7] = { (uint64_t)p->state, p->wait_reason, p->wait_obj, p->wait_deadline,
-                             p->wait_aux, p->wait_status, (uint64_t)p->ppid };
+        uint64_t wait[8] = { (uint64_t)p->state, p->wait_reason, p->wait_obj, p->wait_deadline,
+                             p->wait_aux, p->wait_status, (uint64_t)p->ppid, p->tgid };
         crc = divergence_checksum(crc, wait, sizeof(wait));
         /* The address space's layout (#239): regions and the break. */
         for (vm_region_t* r = p->address_space ? p->address_space->regions : 0; r; r = r->next) {
@@ -108,6 +108,7 @@ static uint32_t sum_user_pages(void* ctx) {
     page_sum_t s = { 0, 0 };
     for (uint32_t i = 0; i < proc_count(); i++) {
         process_t* p = proc_at(i);
+        if (!proc_space_owner(p)) continue;   /* a thread: its group's pages count once (#251) */
         uint32_t pid = (uint32_t)p->pid;
         s.pid = pid;
         s.crc = divergence_checksum(s.crc, &pid, sizeof(pid));

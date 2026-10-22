@@ -65,6 +65,8 @@ void ksig_proc_new(process_t* p);
 void ksig_proc_gone(process_t* p);
 void ksig_fork(process_t* parent, process_t* child);
 void ksig_exec(process_t* p);
+/* A new thread (#251): the group's handlers and the creator's mask. */
+void ksig_thread(process_t* parent, process_t* child);
 
 bool ksig_syscall(process_t* p, uint64_t nr, lx_after_t* after);
 

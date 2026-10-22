@@ -204,10 +204,6 @@ lx_after_t linux_syscall(process_t* p) {
     /* Signals and timers (#250). */
     if (ksig_syscall(p, nr, &after)) return after == LX_CONTINUE_KEEP ? LX_CONTINUE : after;
     switch (nr) {
-    case LX_exit:
-    case LX_exit_group:
-        machine_terminate(p, (int)a0);
-        return LX_SWITCHED;
     case LX_sched_yield:
         c->rax = 0;
         machine_yield(p);
@@ -218,9 +214,6 @@ lx_after_t linux_syscall(process_t* p) {
     case LX_clock_nanosleep:
         if (sys_clock_nanosleep(p, a0, a1, a2, &r) == LX_SWITCHED) return LX_SWITCHED;
         break;
-    case LX_getpid:
-    case LX_gettid:          r = p->pid; break;
-    case LX_getppid:         r = p->ppid; break;
     case LX_getuid: case LX_geteuid: case LX_getgid: case LX_getegid:
                              r = 0; break;
     case LX_uname:           r = sys_uname(p, a0); break;

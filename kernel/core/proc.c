@@ -39,6 +39,7 @@ extern const uint8_t user_image_musl_sleeper[], user_image_musl_sleeper_end[];
 extern const uint8_t user_image_musl_forkexec[], user_image_musl_forkexec_end[];
 extern const uint8_t user_image_musl_sigprobe[], user_image_musl_sigprobe_end[];
 extern const uint8_t user_image_musl_spinner[], user_image_musl_spinner_end[];
+extern const uint8_t user_image_musl_threads[], user_image_musl_threads_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -58,6 +59,7 @@ static const lp_image_t g_images[] = {
     { "musl_forkexec", user_image_musl_forkexec, user_image_musl_forkexec_end, true },
     { "musl_sigprobe", user_image_musl_sigprobe, user_image_musl_sigprobe_end, true },
     { "musl_spinner", user_image_musl_spinner, user_image_musl_spinner_end, true },
+    { "musl_threads", user_image_musl_threads, user_image_musl_threads_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {
@@ -213,6 +215,7 @@ process_t* proc_alloc(uint32_t pid, const char* name) {
         return 0;
     }
     p->pid = (pid_t)pid;
+    p->tgid = pid;
     for (int i = 0; name && name[i] && i < MAX_PROCESS_NAME - 1; i++) p->name[i] = name[i];
     p->state = PROCESS_STATE_NEW;
     p->address_space = vmm_create_address_space(pid);
@@ -233,9 +236,27 @@ void proc_destroy(process_t* p) {
         g_count--;
     }
     machine_fpu_forget(p);
-    vmm_destroy_address_space(p->address_space);
+    /* A thread leaves its group's address space to the others (#251). */
+    bool shared = false;
+    for (uint32_t i = 0; i < g_count; i++) shared |= g_table[i]->address_space == p->address_space;
+    if (!shared) vmm_destroy_address_space(p->address_space);
     kfree(p->arch_block);
     kfree(p);
+}
+
+bool proc_space_owner(const process_t* p) {
+    for (uint32_t i = 0; i < g_count && g_table[i] != p; i++) {
+        if (g_table[i]->address_space == p->address_space) return false;
+    }
+    return true;
+}
+
+uint32_t proc_group_size(uint32_t tgid) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_count; i++) {
+        n += g_table[i]->tgid == tgid && g_table[i]->state != PROCESS_STATE_ZOMBIE;
+    }
+    return n;
 }
 
 void proc_destroy_all(void) {

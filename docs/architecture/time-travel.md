@@ -149,6 +149,18 @@ parent already waiting is woken at once; orphans go to pid 1. The pid
 counter, the parent links, the zombies' statuses, and the wait4 operands are
 kernel state.
 
+**Threads** (#251, `include/core/pctl.h`). A thread is a process-table
+entry of its own (registers, extended state, FS base, signal mask and
+pending set) in its group, whose leader's pid is the group's; the threads
+share the leader's address space, descriptor table, and handlers. Keyframes
+list a shared address space's pages once (under the first table entry that
+uses it), the procs section records each thread's group and restores the
+threads into one space, and the "files" section writes a shared table once.
+Preemption between threads at any instruction is #245's, so a lost update
+between two threads is recorded and replayed like any other interleaving.
+futex waits block in WAIT_FUTEX on (address space, address) and wake in
+table order.
+
 **Signals** (#250, `include/core/ksig.h`). Each process has 64 actions, a
 blocked and a pending set (with each pending signal's siginfo), an alternate
 stack, and up to eight timers (`setitimer`/`alarm` and `timer_create`); all

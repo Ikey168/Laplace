@@ -189,6 +189,10 @@ typedef struct process {
     uint32_t wait_status;
     /* Signal state (#250): include/core/ksig.h. */
     void*    sig;
+    /* Thread group (#251): the leader's pid; the leader's own pid for a
+     * process with one thread. Threads share the leader's address space,
+     * descriptor table, and signal handlers. */
+    uint32_t tgid;
 } process_t;
 
 /* Process management functions */

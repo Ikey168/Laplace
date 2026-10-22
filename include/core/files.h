@@ -38,6 +38,8 @@ void files_proc_new(process_t* p);
 void files_proc_gone(process_t* p);
 /* fork: the child shares the parent's open descriptions (#248). */
 void files_fork(process_t* parent, process_t* child);
+/* A thread (#251): the child uses the parent's descriptor table. */
+void files_share(process_t* parent, process_t* child);
 /* execve: close the close-on-exec descriptors. */
 void files_exec(process_t* p);
 

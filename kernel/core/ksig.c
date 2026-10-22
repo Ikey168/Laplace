@@ -122,6 +122,25 @@ void ksig_fork(process_t* parent, process_t* child) {
     /* Pending signals and timers are the parent's own. */
 }
 
+void ksig_thread(process_t* parent, process_t* child) {
+    ksig_proc_new(child);
+    if (!parent->sig) return;
+    sigstate_t* c = st(child);
+    memcpy(c->act, st(parent)->act, sizeof(c->act));
+    c->blocked = st(parent)->blocked;
+    /* No alternate stack, pending signals, or timers of its own yet. */
+}
+
+/* Handlers belong to the thread group (#251): every thread's copy changes. */
+static void set_action(process_t* p, uint32_t sig, const ksigaction_t* a) {
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* t = proc_at(i);
+        if (t->tgid != p->tgid || !t->sig) continue;
+        st(t)->act[sig] = *a;
+        if (ignored(st(t), sig)) st(t)->pending &= ~BIT(sig);
+    }
+}
+
 void ksig_exec(process_t* p) {
     sigstate_t* s = st(p);
     if (!s) return;
@@ -136,6 +155,14 @@ void ksig_exec(process_t* p) {
 /* ---- Sending ---- */
 
 void ksig_send(process_t* t, uint32_t sig, int32_t code, uint64_t val) {
+    if (t && t->state == PROCESS_STATE_BLOCKED && t->wait_reason == WAIT_GROUP) {
+        /* A leader whose thread exited: another thread of its group takes
+         * the signal (#251). */
+        for (uint32_t i = 0; i < proc_count(); i++) {
+            process_t* o = proc_at(i);
+            if (o->tgid == t->tgid && o != t && o->state != PROCESS_STATE_ZOMBIE) { t = o; break; }
+        }
+    }
     if (!t || sig == 0 || sig > NSIG || t->state == PROCESS_STATE_ZOMBIE) return;
     if (sig == SIG_SIGKILL) {
         machine_kill(t, SIG_SIGKILL);
@@ -268,7 +295,11 @@ static bool build_frame(process_t* p, uint32_t sig) {
     if (!(a->flags & SA_NODEFER)) mask |= BIT(sig);
     s->blocked = mask & ~UNBLOCKABLE;
     s->in_suspend = 0;
-    if (a->flags & SA_RESETHAND) memset(a, 0, sizeof(*a));
+    if (a->flags & SA_RESETHAND) {
+        ksigaction_t dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        set_action(p, sig, &dfl);
+    }
     return true;
 }
 
@@ -381,8 +412,7 @@ static int64_t sys_rt_sigaction(process_t* p, uint64_t sig, uint64_t act, uint64
     ksigaction_t a;
     if (!uaccess_read(p->address_space, act, &a, sizeof(a))) return err(LX_EFAULT);
     a.mask &= ~UNBLOCKABLE;
-    s->act[sig] = a;
-    if (ignored(s, sig)) s->pending &= ~BIT(sig);     /* discarded now */
+    set_action(p, sig, &a);                           /* ignored: discarded now */
     return 0;
 }
 

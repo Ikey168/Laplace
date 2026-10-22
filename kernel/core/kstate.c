@@ -35,6 +35,7 @@ uint64_t kstate_restored_now_ns(void) { return g_restored_now_ns; }
 /* ---- procs ---- */
 
 #define REGION_NAME 16
+#define SHARES_SPACE 0xFFFFFFFFu
 
 static void procs_save(ksf_writer_t* w, void* ctx) {
     (void)ctx;
@@ -52,6 +53,11 @@ static void procs_save(ksf_writer_t* w, void* ctx) {
         ksf_put_u64(w, p->wait_deadline);
         ksf_put_u64(w, p->wait_aux);             /* v3: wait4's status pointer, */
         ksf_put_u32(w, p->wait_status);          /*     a zombie's status (#248) */
+        ksf_put_u32(w, p->tgid);                 /* v4: the thread group (#251) */
+        if (!proc_space_owner(p)) {
+            ksf_put_u32(w, SHARES_SPACE);        /* the space of an earlier thread */
+            continue;
+        }
         ksf_put_u32(w, p->address_space->region_count);
         for (vm_region_t* r = p->address_space->regions; r; r = r->next) {
             char name[REGION_NAME];
@@ -68,7 +74,7 @@ static void procs_save(ksf_writer_t* w, void* ctx) {
 
 static int procs_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
     (void)ctx;
-    if (version < 1 || version > 3) return -1;
+    if (version < 1 || version > 4) return -1;
     vmm_switch_address_space(0);
     proc_destroy_all();
     uint32_t n = ksf_get_u32(r);
@@ -96,7 +102,24 @@ static int procs_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
             p->wait_aux = ksf_get_u64(r);
             p->wait_status = ksf_get_u32(r);
         }
+        if (version >= 4) p->tgid = ksf_get_u32(r);
         uint32_t nreg = ksf_get_u32(r);
+        if (nreg == SHARES_SPACE) {
+            /* A thread: its group's address space, restored with an earlier
+             * thread of the group (#251). */
+            process_t* owner = 0;
+            for (uint32_t k = 0; k < proc_count() && !owner; k++) {
+                if (proc_at(k)->tgid == p->tgid) owner = proc_at(k);
+            }
+            if (!owner) {
+                proc_destroy(p);
+                return -1;
+            }
+            vmm_destroy_address_space(p->address_space);
+            p->address_space = owner->address_space;
+            proc_append(p);
+            continue;
+        }
         for (uint32_t k = 0; k < nreg && r->ok; k++) {
             uint64_t start = ksf_get_u64(r), end = ksf_get_u64(r);
             uint32_t flags = ksf_get_u32(r), type = ksf_get_u32(r);
@@ -212,7 +235,7 @@ static uint32_t probe_sum(void* ctx) {
 
 void kstate_init(void) {
     static const ksf_subsys_t builtin[] = {
-        { KS_ID_PROCS,   "procs",   3, procs_save,   procs_restore,   0, 0 },
+        { KS_ID_PROCS,   "procs",   4, procs_save,   procs_restore,   0, 0 },
         { KS_ID_CPUID,   "cpuid",   1, cpuid_save,   cpuid_restore,   0, 0 },
         { KS_ID_CLOCK,   "clock",   1, clock_save,   clock_restore,   0, 0 },
         { KS_ID_MACHINE, "machine", 1, machine_save, machine_restore, 0, 0 },

@@ -50,8 +50,13 @@ void     proc_register_modules(const uint32_t* mbi);
 const lp_image_t* proc_seed_module(const char* root);
 uint32_t proc_image_crc(const lp_image_t* image);
 
-/* Remove a process from the table and free it (address space included). */
+/* Remove a process from the table and free it (address space included,
+ * unless a thread of its group still uses it). */
 void proc_destroy(process_t* p);
+/* Threads (#251): p is the first in the table with its address space (the
+ * one whose pages keyframes list), and the live threads of a group. */
+bool     proc_space_owner(const process_t* p);
+uint32_t proc_group_size(uint32_t tgid);
 void proc_destroy_all(void);
 
 uint32_t   proc_count(void);

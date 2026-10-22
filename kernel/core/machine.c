@@ -393,12 +393,76 @@ static void end_process(process_t* p, uint32_t status) {
               (uint64_t)p->pid);
 }
 
+/* ---- Thread groups (#251) ---- */
+
+static bool parked(const process_t* t) {
+    return t->state == PROCESS_STATE_BLOCKED && t->wait_reason == WAIT_GROUP;
+}
+
+/* The group's threads that still run (not its parked leader, not zombies). */
+static uint32_t running_threads(uint32_t tgid) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* t = proc_at(i);
+        n += t->tgid == tgid && t->state != PROCESS_STATE_ZOMBIE && !parked(t);
+    }
+    return n;
+}
+
+/* Remove a thread that is not its group's leader. */
+static void drop_thread(process_t* t) {
+    if (g_cur == t) {
+        process_t* next = proc_next_ready(t);
+        g_cur = next == t ? 0 : next;
+    }
+    proc_destroy(t);
+}
+
+/* The whole group ends with `status`: its other threads go, the leader
+ * exits (and waits as a zombie for its parent). */
+static void end_group(process_t* p, uint32_t status) {
+    process_t* leader = proc_by_pid(p->tgid);
+    for (uint32_t i = 0; i < proc_count();) {
+        process_t* t = proc_at(i);
+        if (t->tgid == p->tgid && t != leader) {
+            if (g_cur == t) g_cur = leader;   /* end_process moves past the leader */
+            proc_destroy(t);
+            continue;
+        }
+        i++;
+    }
+    if (!leader) return;
+    if (g_cur == 0) g_cur = leader;
+    end_process(leader, status);
+}
+
 void machine_terminate(process_t* p, int code) {
-    end_process(p, ((uint32_t)code & 0xFF) << 8);
+    end_group(p, ((uint32_t)code & 0xFF) << 8);
 }
 
 void machine_kill(process_t* p, uint32_t sig) {
-    end_process(p, sig & 0x7F);
+    end_group(p, sig & 0x7F);
+}
+
+void machine_thread_exit(process_t* p, int code) {
+    uint32_t status = ((uint32_t)code & 0xFF) << 8;
+    if (running_threads(p->tgid) <= 1) {
+        end_group(p, status);              /* the last thread: the process ends */
+        return;
+    }
+    if (p->pid == (pid_t)p->tgid) {
+        /* The leader's thread ends, the group goes on: the leader stays,
+         * holding the group's pid and address space, until the last. */
+        process_t* next = proc_next_ready(p);
+        p->state = PROCESS_STATE_BLOCKED;
+        p->wait_reason = WAIT_GROUP;
+        p->wait_obj = 0;
+        p->wait_deadline = 0;
+        p->wait_status = status;
+        if (g_cur == p) g_cur = next == p ? 0 : next;
+        return;
+    }
+    drop_thread(p);
 }
 
 /* The signal a user fault raises (#250), with si_code and si_addr. */
@@ -576,6 +640,21 @@ static bool entry_is_exit(void) {
     if (g_pending.vector == VEC_SYSCALL) return g_cur->context.rax == SYS_EXIT;
     if (g_pending.vector == VEC_LINUX_SYSCALL) return linux_is_exit(g_cur->context.rax);
     return false;
+}
+
+/* The pending exit ends the last process: everything else that lives is
+ * the exiting thread's group, and the exit takes all of it (exit_group, or
+ * the group's last running thread). */
+static bool exit_ends_machine(void) {
+    if (!entry_is_exit()) return false;
+    bool group = g_pending.vector == VEC_SYSCALL || g_cur->context.rax != LX_exit ||
+                 running_threads(g_cur->tgid) <= 1;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* t = proc_at(i);
+        if (t->state == PROCESS_STATE_ZOMBIE || t == g_cur) continue;
+        if (t->tgid != g_cur->tgid || !group) return false;
+    }
+    return true;
 }
 
 /* SYS_WRITE: copy out of user memory in chunks and print (unless replaying). */
@@ -856,7 +935,7 @@ static bool stop_at_entry(void) {
         stop_here(STOP_BREAK, g_cur->context.rdi);
         return true;
     }
-    if (entry_is_exit() && proc_live_count() == 1) {
+    if (exit_ends_machine()) {
         stop_here(STOP_EXITED, g_cur->context.rdi);
         return true;
     }

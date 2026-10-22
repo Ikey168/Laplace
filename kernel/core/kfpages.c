@@ -304,6 +304,7 @@ static uint32_t sorted_procs(process_t** out, uint32_t cap) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < proc_count() && n < cap; i++) {
         process_t* p = proc_at(i);
+        if (!proc_space_owner(p)) continue;    /* a thread: its group's pages are listed once */
         uint32_t k = n++;
         while (k > 0 && out[k - 1]->pid > p->pid) {
             out[k] = out[k - 1];
@@ -508,6 +509,7 @@ void kfp_harvest(void) {
     if (g_ref < 0) return;
     uint64_t count = 0;
     for (uint32_t i = 0; i < proc_count(); i++) {
+        if (!proc_space_owner(proc_at(i))) continue;
         harv_ctx_t h = { (uint32_t)proc_at(i)->pid, 0, false, proc_at(i)->address_space };
         vmm_for_each_pte(h.space, harvest_one, &h);
         count += h.count;
@@ -521,6 +523,7 @@ void kfp_harvest(void) {
     if (!g_harv_mem) return;   /* no reuse this time; the pages are reread */
     ps_cache_init(&g_harv, cap, g_harv_mem);
     for (uint32_t i = 0; i < proc_count(); i++) {
+        if (!proc_space_owner(proc_at(i))) continue;
         harv_ctx_t h = { (uint32_t)proc_at(i)->pid, 0, true, proc_at(i)->address_space };
         vmm_for_each_pte(h.space, harvest_one, &h);
     }
