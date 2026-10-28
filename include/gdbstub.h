@@ -56,13 +56,30 @@ typedef struct {
     int (*stop_reply)(void* ctx, char* out, uint32_t cap);
     /* qRcmd ("monitor <cmd>" in gdb): write the text reply; returns its length. */
     int (*monitor)(void* ctx, const char* cmd, char* out, uint32_t cap);
+
+    /* #252: the program thread group `pid` runs (0: the current thread's), as
+     * a path the file operations below open: qXfer:exec-file:read, so gdb
+     * finds the binary itself. Returns the path's length, or -1. */
+    int (*exec_file)(void* ctx, uint32_t pid, char* out, uint32_t cap);
+    /* Host I/O (vFile) over the machine's programs: open by path (a handle,
+     * or -1), its size, read at an offset (bytes read, or -1), close. */
+    int     (*file_open)(void* ctx, const char* path);
+    int64_t (*file_size)(void* ctx, int handle);
+    int     (*file_pread)(void* ctx, int handle, uint64_t off, uint8_t* buf, uint32_t len);
+    void    (*file_close)(void* ctx, int handle);
 } gdbstub_ops_t;
 
-/* gdb's amd64 register file without a target description: rax..r15, rip
- * (8 bytes each), eflags, cs, ss, ds, es, fs, gs (4 each), st0-7 (10 each),
- * eight x87 control registers (4 each), xmm0-15 (16 each), mxcsr (4). */
-#define GDBSTUB_NUM_REGS    57
-#define GDBSTUB_REGS_BYTES  536
+/* The register file, in the order of the target description the stub serves
+ * (qXfer:features:read, #252): gdb's amd64 core and SSE registers (rax..r15,
+ * rip at 8 bytes each; eflags, cs, ss, ds, es, fs, gs at 4; st0-7 at 10;
+ * eight x87 control registers at 4; xmm0-15 at 16; mxcsr at 4), then
+ * orig_rax, fs_base, gs_base (8 each), and the upper halves of ymm0-15 (16
+ * each). The first 536 bytes are gdb's layout without a description. */
+#define GDBSTUB_NUM_REGS    76
+#define GDBSTUB_REGS_BYTES  816
+#define GDBSTUB_REG_ORIG_RAX 57
+#define GDBSTUB_REG_FS_BASE  58
+#define GDBSTUB_REG_YMM0H    60
 
 /* Largest packet payload the stub accepts or produces (qSupported PacketSize). */
 #define GDBSTUB_PACKET_MAX  4096
@@ -100,6 +117,9 @@ int gdbstub_handle(const gdbstub_ops_t* ops, const char* packet, uint32_t plen,
  * return GDBSTUB_NO_REPLY. */
 int gdbstub_handle_session(const gdbstub_ops_t* ops, gdbstub_session_t* s,
                            const char* packet, uint32_t plen, char* out, uint32_t outcap);
+
+/* The target description the stub serves (target.xml). */
+const char* gdbstub_target_xml(void);
 
 /* Offset and size of register `regno` in the 'g' layout; false if out of range. */
 bool gdbstub_reg_slot(uint32_t regno, uint32_t* offset, uint32_t* size);

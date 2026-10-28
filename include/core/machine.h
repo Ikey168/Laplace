@@ -121,7 +121,7 @@ void machine_request_stop(void);
 #define MACHINE_MAX_HWBP 4
 typedef struct {
     bool     active;
-    uint32_t pid;       /* 0: any process */
+    uint32_t pid;       /* the thread group (every thread of the address space); 0: any */
     uint64_t addr;
     uint8_t  kind;      /* 0 exec, 1 write, 3 read/write */
     uint8_t  len;       /* 1, 2, 4, 8 */

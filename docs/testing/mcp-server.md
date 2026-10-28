@@ -33,13 +33,13 @@ moment after it was handled, k after k-1 further instructions.
 |------|-----------|--------------|
 | `where` | | Position, current process, rip, and why the machine stopped |
 | `list_checkpoints` | | The retained keyframe window (rewind horizon) |
-| `list_processes` | | Processes alive at the current position |
+| `list_processes` | | Threads alive at the current position: `pid` (a thread id), and `thread_of=` the process for every thread but a process's first |
 | `rewind_to` | `epoch`, `offset`, `insn`? | Reconstruct that moment by re-executing |
 | `reverse_step` / `step_forward` | | One kernel entry back / forward |
 | `reverse_stepi` / `stepi` | | One instruction back / forward |
 | `read_memory` | `pid`, `addr` (number or `"0x..."`), `len` (≤256) | Bytes at the current position |
-| `get_registers` | `pid` | Registers at the current position |
-| `watch_last_write` | `pid`, `addr`, `len` (1-8) | Land where those bytes last changed, at or before now: the instruction after the store, or the system call that wrote them |
+| `get_registers` | `pid` (a thread id) | Registers at the current position: the general registers, `fs_base`, `gs_base`, `mxcsr`, and `xmm0`-`xmm15` |
+| `watch_last_write` | `pid`, `addr`, `len` (1-8) | Land where those bytes last changed, at or before now, in any thread of that address space: the instruction after the store, or the system call that wrote them; `where`'s `pid` names the thread |
 | `verify_replay` | | Re-execute every retained epoch and compare checksums of memory, registers, process table, and scheduler |
 | `resume` | | Leave history and run live (recording) until the next stop |
 

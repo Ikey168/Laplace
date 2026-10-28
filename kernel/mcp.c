@@ -296,9 +296,11 @@ static const tool_t g_tools[] = {
       "{\"type\":\"object\",\"properties\":{\"pid\":{\"type\":\"integer\"},\"addr\":{\"type\":[\"integer\",\"string\"],"
       "\"description\":\"address, e.g. 1073746176 or \\\"0x40001100\\\"\"},\"len\":{\"type\":\"integer\"}},"
       "\"required\":[\"pid\",\"addr\",\"len\"]}" },
-    { "get_registers", "A process's registers at the current position.",
+    { "get_registers", "A thread's registers at the current position: general registers, fs_base and "
+      "gs_base, mxcsr, and xmm0-15.",
       "{\"type\":\"object\",\"properties\":{\"pid\":{\"type\":\"integer\"}},\"required\":[\"pid\"]}" },
-    { "list_processes", "Processes alive at the current position.", NO_ARGS },
+    { "list_processes", "Threads alive at the current position, each with its pid (a thread id) and, "
+      "for a thread other than its process's first, thread_of=<the process>.", NO_ARGS },
     { "watch_last_write",
       "Find where len bytes at addr in process pid last changed, at or before the current position, "
       "and land there: the exact instruction after the write (or the system call that wrote them).",
@@ -438,6 +440,22 @@ static int tool_call(const mcp_ops_t* ops, sb_t* s, const rid_t* id, const char*
             sb_putc(s, '=');
             sb_put_hex(s, v[i]);
         }
+        sb_put(s, " fs_base="); sb_put_hex(s, r.fs_base);
+        sb_put(s, " gs_base="); sb_put_hex(s, r.gs_base);
+        if (r.has_vector) {
+            /* xmmN=0x<128-bit value, most significant digit first> */
+            static const char hexd[] = "0123456789abcdef";
+            sb_put(s, " mxcsr="); sb_put_hex(s, r.mxcsr);
+            for (int x = 0; x < 16; x++) {
+                sb_put(s, " xmm");
+                sb_put_u64(s, (uint64_t)x);
+                sb_put(s, "=0x");
+                for (int b = 15; b >= 0; b--) {
+                    sb_putc(s, hexd[r.xmm[x][b] >> 4]);
+                    sb_putc(s, hexd[r.xmm[x][b] & 15]);
+                }
+            }
+        }
         end_text_result(s, false);
         return finish(s);
     }
@@ -450,6 +468,9 @@ static int tool_call(const mcp_ops_t* ops, sb_t* s, const rid_t* id, const char*
         for (uint32_t i = 0; i < n; i++) {
             if (i) sb_put(s, "\\n");
             sb_put(s, "pid="); sb_put_u64(s, procs[i].pid);
+            if (procs[i].tgid && procs[i].tgid != procs[i].pid) {
+                sb_put(s, " thread_of="); sb_put_u64(s, procs[i].tgid);
+            }
             sb_put(s, " name="); sb_put_esc(s, procs[i].name);
             if (procs[i].current) sb_put(s, " current");
         }

@@ -52,10 +52,16 @@ typedef struct {
     uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
     uint64_t rip, rflags;
+    /* #252: the TLS bases and the vector registers (when has_vector). */
+    uint64_t fs_base, gs_base;
+    bool     has_vector;
+    uint32_t mxcsr;
+    uint8_t  xmm[16][16];      /* little-endian, as in memory */
 } mcp_regs_t;
 
 typedef struct {
-    uint32_t pid;
+    uint32_t pid;              /* a thread id (#251) */
+    uint32_t tgid;             /* its process (thread group); 0: the same as pid */
     char     name[32];
     bool     current;
 } mcp_proc_t;

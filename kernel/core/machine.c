@@ -231,7 +231,7 @@ static void load_hwbps(const process_t* p) {
     } else {
         for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
             const machine_hwbp_t* b = &g_hwbp[i];
-            if (!g_hwbp_armed || !b->active || (b->pid && p && b->pid != (uint32_t)p->pid)) continue;
+            if (!g_hwbp_armed || !b->active || (b->pid && p && b->pid != p->tgid)) continue;
             write_dr(i, b->addr);
             uint64_t rw = b->kind & 3;
             uint64_t ln = b->len == 8 ? 2 : b->len == 4 ? 3 : b->len == 2 ? 1 : 0;
@@ -1097,6 +1097,12 @@ static bool on_debug(trap_frame_t* f) {
         if (g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, f->rip);
     }
     if (dr6 & 0xF) {
+        /* QEMU's TCG keeps a data watchpoint's hit flag until the watchpoint
+         * is set again (writing its address register), and would report it
+         * with every later single step. */
+        for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
+            if (dr6 & (1ULL << i)) write_dr(i, g_hwbp[i].addr);
+        }
         g_seg_hits++;
         g_bp_reported = true;
         g_bp_rip = f->rip;

@@ -84,12 +84,16 @@ static int f_regs(void* c, uint32_t pid, mcp_regs_t* r) {
     uint64_t* v = &r->rax;
     for (int i = 0; i < 18; i++) v[i] = 0;
     r->rax = 7; r->rip = 0x400000b3;
+    r->fs_base = 0x4000a000; r->gs_base = 0;
+    r->has_vector = true; r->mxcsr = 0x1f80;
+    for (int x = 0; x < 16; x++) for (int b = 0; b < 16; b++) r->xmm[x][b] = 0;
+    r->xmm[0][0] = 0x01; r->xmm[0][15] = 0xab;      /* xmm0 = 0xab00...0001 */
     return 0;
 }
 static uint32_t f_procs(void* c, mcp_proc_t* out, uint32_t max) {
     (void)c; (void)max;
-    out[0].pid = 1; out[0].current = true;
-    out[1].pid = 2; out[1].current = false;
+    out[0].pid = 1; out[0].tgid = 1; out[0].current = true;
+    out[1].pid = 2; out[1].tgid = 1; out[1].current = false;     /* a thread of process 1 */
     const char* a = "heisenbug"; const char* b = "noise";
     int i = 0; while (a[i]) { out[0].name[i] = a[i]; i++; } out[0].name[i] = 0;
     i = 0; while (b[i]) { out[1].name[i] = b[i]; i++; } out[1].name[i] = 0;
@@ -234,11 +238,14 @@ int main(void) {
         n = mcp_handle(&ops, r, slen(r), out, sizeof(out));
         CHECK(contains(out, (uint32_t)n, "rip=0x400000b3") && contains(out, (uint32_t)n, "rax=0x7"),
               "get_registers lists the registers");
+        CHECK(contains(out, (uint32_t)n, "fs_base=0x4000a000") && contains(out, (uint32_t)n, "mxcsr=0x1f80") &&
+              contains(out, (uint32_t)n, "xmm0=0xab000000000000000000000000000001"),
+              "get_registers gives fs_base, mxcsr, and the xmm registers");
 
         r = "{\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"list_processes\"}}";
         n = mcp_handle(&ops, r, slen(r), out, sizeof(out));
-        CHECK(contains(out, (uint32_t)n, "pid=1 name=heisenbug current\\npid=2 name=noise"),
-              "list_processes names the processes and the current one");
+        CHECK(contains(out, (uint32_t)n, "pid=1 name=heisenbug current\\npid=2 thread_of=1 name=noise"),
+              "list_processes names the threads, their process, and the current one");
 
         r = "{\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"watch_last_write\","
             "\"arguments\":{\"pid\":1,\"addr\":1073746176,\"len\":4}}}";

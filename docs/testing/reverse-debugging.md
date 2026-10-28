@@ -47,9 +47,40 @@ byte-exact: 14 epochs re-executed from their keyframes
 
 This transcript is what `tests/qemu/timetravel_e2e.py` runs and checks in CI.
 
+A threaded program, with no file argument (what `tests/qemu/threads_gate.sh`
+checks):
+
+```
+$ gdb -ex 'target remote :1235'
+Reading symbols from target:/musl_threads...
+(gdb) watch -l g_race
+(gdb) reverse-continue
+Thread 2 hit Hardware watchpoint 1: -location g_race
+Old value = 390330
+New value = 390329
+0x00000000004013bc in racer (arg=0x0) at user/linux/threads.c:79
+(gdb) info threads
+  1    Thread 1 (musl_threads (pid 1)) 0x0000000000407d1d in __syscall_cp_c ()
+* 2    Thread 2 (musl_threads (pid 2)) 0x00000000004013bc in racer (arg=0x0) at user/linux/threads.c:79
+```
+
+Not offered yet: the multiprocess extensions and fork/exec stop events. Every
+process's threads appear as threads of one inferior; each reads its own
+address space.
+
 ## What gdb sees
 
-- **Threads** are processes (`info threads`); a stop names the current one.
+- **Threads**: every Laplace thread of every process is a gdb thread
+  (`info threads`, `thread N`); a stop names the thread it happened in.
+- **The program** comes from the target: gdb asks for the stopped thread's
+  executable (`qXfer:exec-file:read`) and reads it over host I/O (`vFile`),
+  so `target remote :1235` needs no file argument ("Reading symbols from
+  target:/musl_threads").
+- **The register file** follows a target description (`qXfer:features:read`):
+  amd64 GNU/Linux with x87, SSE, AVX (`info registers xmm0`, `$ymm0`),
+  `orig_rax`, and `$fs_base`/`$gs_base`.
+- **Signals**: a stop at an unhandled fault or abort reports its signal
+  (`T0b` for SIGSEGV), so gdb says "received signal SIGSEGV".
 - **Registers and memory** are read from the machine as reconstructed at the
   current position. Recorded history is read-only: writes are refused.
 - **`stepi` / `reverse-stepi`** move one instruction. Laplace reaches an
@@ -58,7 +89,8 @@ This transcript is what `tests/qemu/timetravel_e2e.py` runs and checks in CI.
   kernel entry first counts the previous segment's instructions.
 - **`continue` / `reverse-continue`** run to the next or previous hit of a
   breakpoint or watchpoint (up to four: they are the CPU's debug registers,
-  scoped to the process gdb had selected when they were inserted), or to the end
+  scoped to the process gdb had selected when they were inserted, every thread
+  of it), or to the end
   or start of the recording, which gdb reports as "No more reverse-execution
   history". A watchpoint found going backward stops before the write, with the
   old value still in memory, which is what gdb expects.

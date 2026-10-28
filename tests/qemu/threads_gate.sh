@@ -10,7 +10,11 @@
 #  3. The same race, debugged over MCP. At a point where one thread is about
 #     to store a value it loaded before it was preempted, watch_last_write on
 #     the counter lands right after the other thread's store: the update the
-#     first one is about to overwrite.
+#     first one is about to overwrite. list_processes names the threads, and
+#     get_registers gives fs_base and the vector registers.
+#  4. The same race in stock gdb, which reads the program from the target
+#     (no file argument), shows xmm0 and $fs_base, and reverse-continues to a
+#     watchpoint on the counter, written by a racing thread.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -148,12 +152,46 @@ try:
         print(f"  [mcp] watch_last_write(pid={victim}, counter): {hit.strip()[:140]}")
         report(field(hit, "pid") == other and field(hit, "rip") == after_store,
                f"the last write to the counter is thread {other}'s store, which thread {victim} is about to overwrite")
+        procs = tool("list_processes")
+        print("  [mcp] list_processes: " + procs.replace("\n", " | ")[:200])
+        report(f"pid={other} thread_of=1" in procs, "list_processes names the threads and their process (#252)")
+        regs = tool("get_registers", pid=other)
+        print("  [mcp] get_registers: " + regs[:120] + " ...")
+        report("fs_base=0x" in regs and "xmm0=0x" in regs and "xmm15=0x" in regs,
+               "get_registers gives fs_base and the vector registers (#252)")
     bridge.kill()
 finally:
     q.kill()
     q.wait()
 sys.exit(0 if ok else 1)
 PY
+
+# 4. The same race in stock gdb, with no file argument (#252): gdb reads the
+#    program from the target, lists the threads, shows a vector register, and
+#    a reverse-continue to a watchpoint on the counter stops in a racing
+#    thread at its store.
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+console=$(mktemp)
+"$QEMU" -m 256M -display none -no-reboot -kernel build/laplace.elf \
+    -append 'run="musl_threads race 300000" interval=10 keyframes=64' -serial "file:$console" \
+    -serial "tcp:127.0.0.1:$port,server,nowait" -serial null &
+qpid=$!
+for _ in $(seq 1200); do grep -q "monitor: stopped" "$console" 2>/dev/null && break; sleep 0.5; done
+gdir=$(mktemp -d)
+gdbout=$(cd "$gdir" && timeout 600 gdb -batch -nx -ex "target remote 127.0.0.1:$port" \
+    -ex 'info registers xmm0' -ex 'p/x $fs_base' -ex 'watch -l g_race' -ex 'reverse-continue' \
+    -ex 'info threads' -ex 'thread 1' -ex 'bt 1' 2>&1 || true)
+kill $qpid 2>/dev/null || true
+wait $qpid 2>/dev/null || true
+rm -rf "$console" "$gdir"
+echo "$gdbout" | grep -E "Reading symbols|xmm0|hit Hardware|Old value|New value|racer|Thread|^\\$" | cut -c1-140 | sed "s/^/  [gdb] /"
+check "$gdbout" "Reading symbols from target:/musl_threads" "gdb loads the program's symbols from the target, with no file argument"
+check "$gdbout" "xmm0 +\{v4_float" "info registers xmm0 shows the vector register"
+check "$gdbout" '\$1 = 0x[0-9a-f]+' '$fs_base reads'
+check "$gdbout" "Thread [23] hit Hardware watchpoint 1: -location g_race" \
+      "reverse-continue stops on the counter's watchpoint in a racing thread"
+check "$gdbout" "in racer \(arg=0x[01]\) at user/linux/threads.c" "... at the racer's store, with source"
+check "$gdbout" "Thread 1 \(musl_threads \(pid 1\)\)" "info threads lists the main thread too"
 
 if [ $fail -ne 0 ]; then echo "FAILED"; exit 1; fi
 echo "PASSED: pthreads programs record and replay, and a lost update is traced to the other thread's store"

@@ -14,6 +14,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 extern int printf(const char*, ...);
+extern int snprintf(char*, unsigned long, const char*, ...);
+extern void* memcpy(void*, const void*, unsigned long);
+extern unsigned long strlen(const char*);
+extern int strcmp(const char*, const char*);
+extern char* strstr(const char*, const char*);
 
 #include "gdbstub.h"
 
@@ -97,6 +102,31 @@ static int sim_monitor(void* c, const char* cmd, char* out, uint32_t cap) {
     out[0] = 'o'; out[1] = 'k'; out[2] = '\n';
     return 3;
 }
+/* A program image for exec-file and vFile (#252): bytes 0..299 with a
+ * '#' and a '}' that must be escaped. */
+static uint8_t g_img[300];
+static int sim_exec(void* c, uint32_t pid, char* out, uint32_t cap) {
+    (void)c; (void)cap;
+    const char* p = pid == 7 ? "/other" : "/bin/prog";
+    int n = 0;
+    while (p[n]) { out[n] = p[n]; n++; }
+    return n;
+}
+static int sim_open(void* c, const char* path) {
+    (void)c;
+    return path[0] == '/' && path[1] == 'b' ? 3 : -1;
+}
+static int64_t sim_size(void* c, int h) { (void)c; return h == 3 ? (int64_t)sizeof(g_img) : -1; }
+static int sim_pread(void* c, int h, uint64_t off, uint8_t* buf, uint32_t len) {
+    (void)c;
+    if (h != 3) return -1;
+    uint32_t n = 0;
+    while (n < len && off + n < sizeof(g_img)) { buf[n] = g_img[off + n]; n++; }
+    return (int)n;
+}
+static int g_closed = -1;
+static void sim_close(void* c, int h) { (void)c; g_closed = h; }
+
 static int mock_step(void* c) { ((rev_t*)c)->steps++; return 0; }
 static int mock_cont(void* c) { ((rev_t*)c)->continues++; return 0; }
 
@@ -159,6 +189,8 @@ int main(void) {
             .step = sim_step, .cont = sim_cont, .read_regs = sim_regs, .read_mem = sim_mem,
             .threads = sim_threads, .current_thread = sim_cur, .thread_name = sim_name,
             .breakpoint = sim_bp, .stop_reply = sim_stop, .monitor = sim_monitor,
+            .exec_file = sim_exec, .file_open = sim_open, .file_size = sim_size,
+            .file_pread = sim_pread, .file_close = sim_close,
         };
         gdbstub_session_t ses = { 0 };
         static char out[8192];
@@ -230,8 +262,57 @@ int main(void) {
 
         uint32_t off, sz;
         CHECK(gdbstub_reg_slot(16, &off, &sz) && off == 128 && sz == 8, "rip at offset 128");
-        CHECK(gdbstub_reg_slot(56, &off, &sz) && off == 532 && sz == 4, "mxcsr is the last register");
-        CHECK(!gdbstub_reg_slot(57, &off, &sz), "no register 57");
+        CHECK(gdbstub_reg_slot(56, &off, &sz) && off == 532 && sz == 4, "mxcsr after the xmm registers");
+        CHECK(gdbstub_reg_slot(58, &off, &sz) && off == 544 && sz == 8, "fs_base after orig_rax");
+        CHECK(gdbstub_reg_slot(75, &off, &sz) && off == 800 && sz == 16, "ymm15h is the last register");
+        CHECK(!gdbstub_reg_slot(76, &off, &sz), "no register 76");
+
+        /* --- 5. Real programs (#252): the target description, the program
+         *        itself, host I/O --- */
+        n = gdbstub_handle_session(&ops, &ses, "qSupported", 10, out, sizeof(out));
+        CHECK(contains(out, (uint32_t)n, "qXfer:features:read+") && contains(out, (uint32_t)n, "qXfer:exec-file:read+"),
+              "qSupported offers the target description and the exec file");
+        char whole[16384];
+        uint32_t got = 0;
+        for (;;) {
+            char req[64];
+            int rl = snprintf(req, sizeof(req), "qXfer:features:read:target.xml:%x,200", got);
+            n = gdbstub_handle_session(&ops, &ses, req, (uint32_t)rl, out, sizeof(out));
+            if (n < 1 || (out[0] != 'm' && out[0] != 'l')) break;
+            memcpy(whole + got, out + 1, (unsigned long)n - 1);
+            got += (uint32_t)n - 1;
+            if (out[0] == 'l') break;
+        }
+        whole[got] = 0;
+        CHECK(got == strlen(gdbstub_target_xml()) && strcmp(whole, gdbstub_target_xml()) == 0,
+              "target.xml reads back whole in chunks");
+        CHECK(strstr(whole, "org.gnu.gdb.i386.avx") && strstr(whole, "name=\"fs_base\"") &&
+              strstr(whole, "regnum=\"60\""), "it has AVX, fs_base, and the numbering");
+        n = gdbstub_handle_session(&ops, &ses, "qXfer:exec-file:read::0,fff", 27, out, sizeof(out));
+        CHECK(streq(out, (uint32_t)n, "l/bin/prog"), "exec-file names the current program");
+        n = gdbstub_handle_session(&ops, &ses, "qXfer:exec-file:read:7:0,fff", 28, out, sizeof(out));
+        CHECK(streq(out, (uint32_t)n, "l/other"), "... or another process's");
+        n = gdbstub_handle_session(&ops, &ses, "vFile:setfs:0", 13, out, sizeof(out));
+        CHECK(streq(out, (uint32_t)n, "F0"), "vFile:setfs");
+        n = gdbstub_handle_session(&ops, &ses, "vFile:open:2f62696e2f70726f67,0,0", 34, out, sizeof(out));
+        CHECK(streq(out, (uint32_t)n, "F3"), "vFile:open /bin/prog");
+        n = gdbstub_handle_session(&ops, &ses, "vFile:open:2f6e6f6e65,0,0", 25, out, sizeof(out));
+        CHECK(streq(out, (uint32_t)n, "F-1,2"), "a missing file is ENOENT");
+        n = gdbstub_handle_session(&ops, &ses, "vFile:fstat:3", 13, out, sizeof(out));
+        CHECK(n == 4 + 64 && out[0] == 'F' && (uint8_t)out[4 + 35] == 0x2C && (uint8_t)out[4 + 34] == 0x01,
+              "vFile:fstat gives the size (300) big-endian");
+        for (uint32_t i = 0; i < sizeof(g_img); i++) g_img[i] = (uint8_t)i;
+        n = gdbstub_handle_session(&ops, &ses, "vFile:pread:3,40,10", 19, out, sizeof(out));
+        /* 64 bytes from 16: '#' (0x23), '$' (0x24), and '*' (0x2a) are escaped. */
+        CHECK(n == 3 + 1 + 64 + 3 && out[0] == 'F' && out[1] == '4' && out[2] == '0' && out[3] == ';',
+              "vFile:pread returns 64 bytes, three of them escaped");
+        bool esc = false;
+        for (int i = 4; i + 1 < n; i++) esc |= out[i] == '}' && (uint8_t)out[i + 1] == (0x23 ^ 0x20);
+        CHECK(esc, "'#' is sent as '}' and 0x03");
+        n = gdbstub_handle_session(&ops, &ses, "vFile:pread:3,40,12c", 20, out, sizeof(out));
+        CHECK(streq(out, (uint32_t)n, "F0;"), "reading at the end gives 0 bytes");
+        n = gdbstub_handle_session(&ops, &ses, "vFile:close:3", 13, out, sizeof(out));
+        CHECK(streq(out, (uint32_t)n, "F0") && g_closed == 3, "vFile:close");
     }
 
     if (failures == 0) {

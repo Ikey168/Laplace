@@ -66,27 +66,40 @@ static void avx_sum(uint64_t n, double out[4]) {
         : "rax", "xmm8", "xmm9", "memory", "cc");
 }
 
+/* The report is one line, written at once: the two copies preempt each
+ * other at any instruction (#245), and must not interleave their words. */
+static char g_line[160];
+static unsigned long g_len;
+static void l_puts(const char* t) { while (*t && g_len < sizeof(g_line)) g_line[g_len++] = *t++; }
+static void l_u64(uint64_t v) {
+    char d[20];
+    int k = 0;
+    do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (k && g_len < sizeof(g_line)) g_line[g_len++] = d[--k];
+}
+
 int main(void) {
     const uint64_t n = 200000;
     double s = sse_sum(n);
     uint64_t want = int_sum_halves(n);
-    u_puts("fpuprobe: pid ");
-    u_put_u64((uint64_t)sys_getpid());
-    u_puts(" sse sum*2 ");
-    u_put_u64((uint64_t)(s * 2.0));
+    l_puts("fpuprobe: pid ");
+    l_u64((uint64_t)sys_getpid());
+    l_puts(" sse sum*2 ");
+    l_u64((uint64_t)(s * 2.0));
     u_assert((uint64_t)(s * 2.0) == want, 0xF0);
     if (have_avx()) {
         double v[4];
         avx_sum(50000, v);
-        u_puts(" avx ");
+        l_puts(" avx ");
         for (int i = 0; i < 4; i++) {
-            u_put_u64((uint64_t)v[i]);
-            u_puts(i < 3 ? "," : "");
+            l_u64((uint64_t)v[i]);
+            l_puts(i < 3 ? "," : "");
             u_assert((uint64_t)v[i] == 50000ULL * (uint64_t)(i + 1), 0xF0);
         }
     } else {
-        u_puts(" (no AVX)");
+        l_puts(" (no AVX)");
     }
-    u_puts(" ok\n");
+    l_puts(" ok\n");
+    sys_write(g_line, g_len);
     return 0;
 }
