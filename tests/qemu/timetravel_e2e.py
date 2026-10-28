@@ -174,6 +174,8 @@ def main():
                 if "monitor: stopped" in text:
                     break
         stop = re.search(r"monitor: stopped \((.*)\) at epoch (\d+) step (\d+)", text)
+        if stop is None:
+            say("[boot] console so far:\n" + text.replace("\r", "")[-3000:])
         check(stop is not None, "the machine stopped for the debugger")
         say(f"[run ] {stop.group(1)} at epoch {stop.group(2)}, step {stop.group(3)}")
         check("asserted (code bad)" in stop.group(1), "the heisenbug's assertion fired (code 0xbad)")

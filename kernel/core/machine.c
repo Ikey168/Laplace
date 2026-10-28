@@ -176,6 +176,7 @@ void machine_set_norecord(bool on) {
     if (g_mode == MACHINE_LIVE) sched_record_set_mode(&g_sr, on ? SCHED_REC_OFF : SCHED_REC_RECORD);
 }
 bool machine_norecord(void) { return g_norecord; }
+void machine_set_step_over_tf(bool tf) { g_rf_per_block = tf; }
 
 void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step) {
     g_has_target = true;
@@ -352,11 +353,24 @@ static void load_current(trap_frame_t* f) {
     if (g_stepping || g_pm_stepping) f->rflags |= RFLAGS_TF;
 }
 
+/* Inside machine_enter: machine_exit returns to the monitor stack. */
+static bool g_in_machine;
+/* Replay: the segment about to run starts at its own preemption point, and
+ * the state there matches (set by start_segment). */
+static bool g_point_at_start;
+static bool take_points_at_start(void);
+/* A divergence noticed outside it (an entry handled by machine_resume, a
+ * replayed wake): the entry path stops there instead. */
+static bool g_diverged;
+
 static void enter(void) {
+    if (!take_points_at_start()) return;
     trap_frame_t* f = frame_slot();
     load_current(f);
     g_cur->state = PROCESS_STATE_RUNNING;
+    g_in_machine = true;
     machine_enter(f);
+    g_in_machine = false;
     /* Back on the monitor stack: the machine stopped. */
     vmm_switch_address_space(0);
 }
@@ -365,6 +379,10 @@ static void enter(void) {
 
 void machine_stop_diverged(void) {
     stop_here(STOP_DIVERGED, 0);
+    if (!g_in_machine) {
+        g_diverged = true;               /* the caller returns; complete_entry stops */
+        return;
+    }
     machine_exit();
     for (;;) {}
 }
@@ -657,6 +675,10 @@ static bool pick_next(void) {
             if (!idle_until_wake()) return false;
         } else {
             deliver_wakes(g_step, true);
+            if (g_diverged) {
+                g_pick_stop = STOP_DIVERGED;
+                return false;
+            }
             if (!proc_next_ready(0)) {
                 /* The recording stopped here, everything waiting. */
                 g_pick_stop = replay_stop_here();
@@ -906,6 +928,17 @@ static bool deliver_signals(void) {
     return pick_next() && deliver_signals();
 }
 
+/* Replay: the process is about to execute c->rip; is that its armed
+ * preemption point, in the recorded state? A string instruction's earlier
+ * iterations are run first (#245). */
+static bool at_armed_point(process_context_t* c) {
+    uint64_t rip;
+    if (g_mode != MACHINE_REPLAY || !preempt_armed_for(g_cur, &rip) || c->rip != rip) return false;
+    pm_verdict_t v = preempt_check(g_cur, c);
+    if (v == PM_STEP && preempt_rep_forward(g_cur, c)) v = preempt_check(g_cur, c);
+    return v == PM_MATCH;
+}
+
 /* The current process starts its segment. Replay: arm the next entry's
  * preemption point if it is one (#245); false (STOP_DIVERGED) when the
  * journal's point is not this process's. */
@@ -919,6 +952,10 @@ static bool start_segment(void) {
         g_pick_stop = STOP_DIVERGED;
         return false;
     }
+    /* A point at the very instruction the segment starts with (#245): not
+     * every CPU reports a breakpoint there (QEMU 10's TCG does not on the
+     * first instruction after an IRET), so its state is checked now. */
+    g_point_at_start = at_armed_point(&g_cur->context);
     if (g_stepping && g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, g_cur->context.rip);
     return true;
 }
@@ -927,7 +964,11 @@ static bool complete_entry(void) {
     uint64_t step = g_step;
     deliver_wakes(step, false);           /* before the entry: same order in a replay */
     trace_entry(step);
-    if (handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
+    if (!g_diverged && handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
+    if (g_diverged) {
+        g_pick_stop = STOP_DIVERGED;
+        return false;
+    }
     g_step = step + 1;
     g_insn = 1;
     g_seg_hits = 0;
@@ -1007,9 +1048,30 @@ static bool entry_at_preemption_point(void) {
     return !stop_at_entry();
 }
 
+/* A segment that would start at its own preemption point takes that entry
+ * now, without running (again if the next one does too). False (g_stop
+ * filled) when the machine stops. */
+static bool take_points_at_start(void) {
+    while (g_point_at_start) {
+        g_point_at_start = false;
+        if (!entry_at_preemption_point()) return false;
+        if (!complete_entry()) {
+            stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
+            return false;
+        }
+        if (target_at_segment_start()) {
+            stop_here(STOP_TARGET, 0);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ---- Public run entry points (monitor stack) ---- */
 
 void machine_start(void) {
+    g_diverged = false;
+    g_point_at_start = false;
     g_cur = proc_next_ready(0);
     if (!g_cur) {
         stop_here(STOP_IDLE, 0);
@@ -1021,6 +1083,8 @@ void machine_start(void) {
 }
 
 void machine_resume(void) {
+    g_diverged = false;
+    g_point_at_start = false;
     /* Console input typed while the machine was stopped is not delivered. */
     if (g_mode == MACHINE_LIVE) tty_discard_pending();
     if (!g_cur) {
@@ -1108,6 +1172,13 @@ static bool async_entry_wanted(void) {
 }
 
 static void kernel_trap(trap_frame_t* f) {
+    /* The words at the top of the kernel stack: after a call through a bad
+     * pointer, the first is the caller's return address. */
+    const uint64_t* sp = (const uint64_t*)f->rsp;
+    if (f->rsp >= LP_KERNEL_VMA || f->rsp >= LP_DIRECT_MAP) {
+        kprintf("kernel stack at %lx: %lx %lx %lx %lx %lx %lx\n", f->rsp, sp[0], sp[1], sp[2], sp[3],
+                sp[4], sp[5]);
+    }
     panic("trap %lu in kernel mode: err %lx rip %lx cr2 %lx",
           f->vector, f->error, f->rip, read_cr2());
 }
@@ -1211,22 +1282,35 @@ target_check:
 }
 
 /* Replay: f is exactly at the armed preemption point (#245). */
-static bool preemption_point_here(const trap_frame_t* f) {
-    uint64_t rip;
-    if (g_mode != MACHINE_REPLAY || !preempt_armed_for(g_cur, &rip) || f->rip != rip) return false;
+/* The process resumes at f->rip without a breakpoint having been checked
+ * there (after a transparent fault, or an interrupt that is not an entry):
+ * is it the armed point? A string instruction's earlier iterations run here,
+ * as on_debug runs them. */
+static bool preemption_point_here(trap_frame_t* f) {
     process_context_t c;
     ctx_from_frame(&c, f);
-    return preempt_check(g_cur, &c) == PM_MATCH;
+    bool here = at_armed_point(&c);
+    f->rcx = c.rcx;
+    f->rsi = c.rsi;
+    f->rdi = c.rdi;
+    return here;
 }
 
 void trap_dispatch(trap_frame_t* f) {
     bool from_user = (f->cs & 3) == 3;
     uint64_t vector = f->vector, error = f->error;
+    bool irq_at_point = false;
     if (f->vector == VEC_TIMER) {
         on_timer();
         /* In user mode, the interrupted instruction becomes an entry when
-         * the machine wants one (#245). */
-        if (!from_user || !async_entry_wanted()) return;
+         * the machine wants one (#245). A replay resumes it, unless it is
+         * the armed point (no breakpoint is checked on the instruction an
+         * IRET returns to, on QEMU 10's TCG). */
+        if (!from_user) return;
+        if (!async_entry_wanted()) {
+            if (g_mode != MACHINE_REPLAY || !preemption_point_here(f)) return;
+            irq_at_point = true;
+        }
         error = 0;
     } else if (f->vector >= VEC_IRQ_BASE && f->vector < VEC_IRQ_BASE + 16) {
         pic_eoi((uint8_t)(f->vector - VEC_IRQ_BASE));
@@ -1244,7 +1328,7 @@ void trap_dispatch(trap_frame_t* f) {
         kernel_trap(f);
     }
 
-    bool preempted = false;
+    bool preempted = irq_at_point;
     bool handled = false;
     if (f->vector == VEC_PAGE_FAULT && (f->error & 0x3) == 0x3) {
         /* A user write to a present page: a snapshot-COW capture is invisible
@@ -1325,5 +1409,6 @@ void trap_dispatch(trap_frame_t* f) {
         stop_here(STOP_TARGET, 0);
         machine_exit();
     }
+    if (!take_points_at_start()) machine_exit();
     load_current(f);
 }

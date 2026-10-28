@@ -19,7 +19,10 @@ cd "$(dirname "$0")/../.."
 
 QEMU=${QEMU:-qemu-system-x86_64}
 ACCEL=()
-if [ "${QEMU_ACCEL:-tcg}" = kvm ]; then ACCEL=(-enable-kvm -cpu host); fi
+# KVM runs the loops far faster than TCG: more work, so they still span
+# several 1 ms slices.
+K=1 KR=1
+if [ "${QEMU_ACCEL:-tcg}" = kvm ]; then ACCEL=(-enable-kvm -cpu host); K=8 KR=20; fi
 fail=0
 
 check() {  # check <output> <pattern> <description>
@@ -39,7 +42,7 @@ show() {   # show <tag> <output>
 
 recorded() { echo "$1" | sed -nE 's/.*preemption points: ([0-9]+) recorded.*/\1/p'; }
 
-out=$(boot 'run="musl_spinner compute A 1000000","musl_spinner compute B 1000000" interval=10 keyframes=64')
+out=$(boot "run=\"musl_spinner compute A $((1000000 * K))\",\"musl_spinner compute B $((1000000 * K))\" interval=10 keyframes=64")
 show compute "$out"
 first_done=$(echo "$out" | grep -nE "spinner [AB]: done" | head -1 | cut -d: -f1)
 last_start=$(echo "$out" | grep -nE "spinner [AB]: start" | tail -1 | cut -d: -f1)
@@ -60,7 +63,7 @@ n=$(recorded "$out")
 if [ -n "$n" ] && [ "$n" -gt 0 ]; then echo "[ok] $n preemption points recorded"; else echo "[FAIL] no preemption points"; fail=1; fi
 check "$out" "selftest: verify rc=0: [0-9]+ epochs replayed, 0 diverged" "a loop where only memory changes replays byte-exact"
 
-out=$(boot 'run="musl_spinner rep A 200","musl_spinner compute B 300000" interval=10 keyframes=64')
+out=$(boot "run=\"musl_spinner rep A $((200 * KR))\",\"musl_spinner compute B $((300000 * K))\" interval=10 keyframes=64")
 show rep "$out"
 reps=$(echo "$out" | sed -nE 's/.*\(([0-9]+) inside string instructions, [0-9]+ pages.*/\1/p')
 found=$(echo "$out" | sed -nE 's/.*found [0-9]+ by state \(([0-9]+) inside string.*/\1/p')

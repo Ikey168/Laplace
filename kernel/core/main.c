@@ -23,6 +23,8 @@
  *                  reverse-stepi times) instead of the self-test (#255);
  *                  bench=run: the run line only
  *   norecord       run without recording (with bench: the baseline run time)
+ *   stepover=tf|rf step over execution breakpoints with RF and a single step,
+ *                  or RF alone (default: tf under QEMU's TCG, rf elsewhere)
  */
 
 #include "core/cpu.h"
@@ -72,6 +74,7 @@ typedef struct {
     bool     bench;
     bool     bench_run_only;
     bool     norecord;
+    int      stepover;           /* 0 default, 1 tf, 2 rf */
 } boot_options_t;
 
 static boot_options_t g_opts;
@@ -138,6 +141,10 @@ static void parse_cmdline(const char* cmd) {
             g_opts.bench_run_only = true;
         } else if (len == 8 && strncmp(tok, "norecord", 8) == 0) {
             g_opts.norecord = true;
+        } else if (len == 11 && strncmp(tok, "stepover=tf", 11) == 0) {
+            g_opts.stepover = 1;
+        } else if (len == 11 && strncmp(tok, "stepover=rf", 11) == 0) {
+            g_opts.stepover = 2;
         } else if (len == 14 && strncmp(tok, "sabotage=clock", 14) == 0) {
             kio_sabotage(KIO_SABOTAGE_CLOCK);
         } else if (len == 16 && strncmp(tok, "sabotage=entropy", 16) == 0) {
@@ -557,6 +564,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     g_rdrand = cpu_has_rdrand();
     kentropy_set_source(entropy_source, 0);
     machine_init();
+    if (g_opts.stepover) machine_set_step_over_tf(g_opts.stepover == 1);
     kstate_init();
     kio_init();
     const lp_image_t* seed = proc_seed_module(g_opts.root);

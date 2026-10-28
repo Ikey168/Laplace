@@ -118,6 +118,11 @@ void machine_set_lenient(bool on);
  * preemption points are kept, inputs are read live and dropped, and the
  * schedule is not recorded; nothing can be replayed. Set before the start. */
 void machine_set_norecord(bool on);
+
+/* How an execution breakpoint is stepped over: with RF and a single step
+ * (needed under QEMU's TCG; the default there), or with RF alone (the
+ * default elsewhere). Set after machine_init. */
+void machine_set_step_over_tf(bool tf);
 bool machine_norecord(void);
 
 /* Ask a live machine to stop at its next kernel entry. */
