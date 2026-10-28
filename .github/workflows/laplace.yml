@@ -148,9 +148,13 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           test -w /dev/kvm
           QEMU_ACCEL=kvm bash tests/qemu/preempt_gate.sh
+          make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
+          QEMU_ACCEL=kvm python3 tests/qemu/timetravel_e2e.py
       - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
         run: python3 tests/qemu/timetravel_e2e.py
       - name: Power cut and resume on the IDE disk (in QEMU)
         run: bash scripts/test/qemu_persistence_demo.sh
+      - name: Power cut and resume on an AHCI (SATA) disk (in QEMU)
+        run: LAPLACE_DISK=ahci bash scripts/test/qemu_persistence_demo.sh
       - name: Bootable ISO (GRUB, BIOS)
         run: make iso

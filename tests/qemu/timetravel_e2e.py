@@ -34,6 +34,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 KERNEL = os.path.join(ROOT, "build", "laplace.elf")
 ELF = os.path.join(ROOT, "build", "user", "heisenbug.elf")
 QEMU = os.environ.get("QEMU", "qemu-system-x86_64")
+# QEMU_ACCEL=kvm runs the guest under KVM with the host CPU (#236).
+ACCEL = ["-enable-kvm", "-cpu", "host"] if os.environ.get("QEMU_ACCEL") == "kvm" else []
 GDB = os.environ.get("GDB", "gdb")
 
 failures = 0
@@ -156,7 +158,7 @@ def main():
     say("=== Laplace: a heisenbug recorded in the booted OS, debugged backward ===")
     say(f"[boot] QEMU: IDE disk, console on COM1, gdb on :{gdb_port} (COM2), MCP on :{mcp_port} (COM3)")
     qemu = subprocess.Popen(
-        [QEMU, "-m", "256M", "-display", "none", "-no-reboot", "-kernel", KERNEL,
+        [QEMU, *ACCEL, "-m", "256M", "-display", "none", "-no-reboot", "-kernel", KERNEL,
          "-drive", f"file={disk},format=raw,if=ide,index=0",
          "-serial", f"file:{console}",
          "-serial", f"tcp:127.0.0.1:{gdb_port},server,nowait",

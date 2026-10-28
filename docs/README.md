@@ -22,6 +22,8 @@ Start with the root [`README.md`](../README.md) for the project overview and the
 - [Time-travel debugging (design + module map)](architecture/time-travel.md) the
   deterministic replay core and the MCP interface, with a table mapping every
   stage to the module that ships it.
+- [Platforms (TCG, KVM, bare metal)](architecture/hardware.md) PMU detection
+  at boot, the AHCI disk, and what each platform has been checked to do.
 - [Reverse debugging with gdb (how-to)](testing/reverse-debugging.md) drive
   `reverse-stepi` / `reverse-continue` against a running Laplace over the serial
   port.

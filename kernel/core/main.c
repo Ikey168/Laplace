@@ -31,6 +31,8 @@
 #include "core/kio.h"
 #include "core/ksig.h"
 #include "core/preempt.h"
+#include "core/ahci.h"
+#include "core/pmu.h"
 #include "core/kfpages.h"
 #include "core/monitor.h"
 #include "core/clock.h"
@@ -432,6 +434,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
 
     cpu_init();
     cpu_cpuid_init();
+    pmu_init();
     mm_init(mbi);
     proc_register_modules(mbi);
     pic_init();
@@ -463,14 +466,17 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     checkpoint_init();
     checkpoint_set_context_fn(proc_context_record);
 
-    /* Durable store: the first IDE drive, else a volatile RAM disk. */
+    /* Durable store: the first IDE drive, else the first AHCI (SATA) disk
+     * (#236), else a volatile RAM disk. */
     fat_block_device_t* dev = checkpoint_ide_boot_bind();
     if (dev) {
         kprintf("boot: recording to the IDE disk (%u sectors)\n", dev->total_sectors);
+    } else if ((dev = ahci_boot_bind()) != 0) {
+        kprintf("boot: recording to the AHCI disk (%u sectors)\n", dev->total_sectors);
     } else {
         dev = tt_ram_device(tt_required_sectors(g_opts.keyframes, g_opts.pool_mib));
         if (!dev) panic("no disk and no memory for a RAM disk");
-        kprintf("boot: no IDE disk; recording to a RAM disk (lost at power-off)\n");
+        kprintf("boot: no IDE or AHCI disk; recording to a RAM disk (lost at power-off)\n");
     }
     tt_config_t cfg = { g_opts.interval, g_opts.keyframes, g_opts.stop_after, g_opts.dirty };
     bool had_keyframe = false;

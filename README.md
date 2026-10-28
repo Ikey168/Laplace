@@ -191,7 +191,8 @@ Everything in this table runs in the booted kernel and is exercised in CI
 |------------|-----------|
 | **Practical targets**, each recorded to its end, verified byte-exact, caught when replay is sabotaged (`sabotage=clock`: every clock read a tick late; `sabotage=entropy`: one random bit flipped), and debugged backward over MCP (`watch_last_write`) and stock gdb with no file argument (reverse-continue to a breakpoint): hello world; Lua 5.4 running a script from the seed image (floats, tables, the collector, file I/O); the SQLite 3.44 shell creating, filling, indexing, and querying a database file; a pthreads lost-update race | `tests/qemu/targets_gate.py`, `tests/qemu/threads_gate.sh` |
 | Multiboot boot (QEMU `-kernel`, GRUB ISO), long mode, paging, ring-3 processes, system calls | every QEMU job; `make iso` |
-| Recording: keyframes with deferred copy-on-write writeback, one journal per keyframe, on the IDE disk | `make selftest`, e2e |
+| Recording: keyframes with deferred copy-on-write writeback, one journal per keyframe, on an IDE or AHCI (SATA) disk | `make selftest`, e2e, `LAPLACE_DISK=ahci qemu_persistence_demo.sh` |
+| Under KVM (`-enable-kvm -cpu host`) as under TCG: the selftest, preemption, and e2e gates; the boot log reports the PMU (none on hosted runners) | CI KVM step; [`docs/architecture/hardware.md`](docs/architecture/hardware.md) |
 | Replay by re-executing the processes to any (epoch, step, instruction) | e2e, `make selftest` |
 | Byte-exact verification of every retained epoch; a perturbed replay is caught | `make selftest`, `verify_replay`, `monitor verify` |
 | Raw `rdtsc`/`rdtscp`/`cpuid` in user code replay exactly; a divergence names the instruction that caused it | `tests/qemu/determinism_gate.sh` |
@@ -248,6 +249,9 @@ Limits, stated plainly:
   ENOSYS and are logged once. Programs must be static: no dynamic linker
   yet (#254), no console input, pipes, or `poll` (#249), no sockets (#253).
 - Recorded history is read-only from the debuggers.
+- Platforms: QEMU TCG and KVM are tested. No real machine has been booted
+  yet; the console and debug channels need COM ports, and the only disks are
+  IDE and AHCI (no NVMe). See [`docs/architecture/hardware.md`](docs/architecture/hardware.md).
 
 ## The machine
 
@@ -289,7 +293,7 @@ Kernel command line (`make run APPEND="..."`):
 | `fresh` | ignore a recording on the disk and cold-boot |
 | `stop_after=N` | stop for the debugger after N keyframes |
 | `dirty=N` | also take a keyframe once an epoch dirties N pages (default 8192) |
-| `pool=N` | without an IDE disk: the RAM disk's page pool in MiB (default 64) |
+| `pool=N` | without an IDE or AHCI disk: the RAM disk's page pool in MiB (default 64) |
 | `sabotage=clock` / `sabotage=entropy` | test hook: every replayed clock read one tick late, or one bit of every replayed random payload flipped; `selftest` must report divergence |
 
 | Target | Description |
@@ -339,8 +343,9 @@ included) is tracked in #235. Its main steps:
 
 - Console input, pipes, and `poll`, so interactive programs can be recorded
   (#249); networking (#253); dynamically linked binaries (#254)
-- A branch counter, where a CPU has one, to skip most of the breakpoint hits
-  a replay of a preempted hot loop takes (#245, #236)
+- A branch counter, where the boot-time probe finds an exact one, to skip
+  most of the breakpoint hits a replay of a preempted hot loop takes (#245);
+  a bare-metal machine, NVMe, and a debug channel without COM ports (#236)
 - Overhead benchmarks (#255)
 - SMP-safe deterministic replay
 - Repair or remove the legacy subsystems (#233)
@@ -350,6 +355,7 @@ included) is tracked in #235. Its main steps:
 Full index: [`docs/README.md`](docs/README.md).
 
 - [Time-travel debugging: design, module map, limits](docs/architecture/time-travel.md)
+- [Platforms: TCG, KVM, PMU detection, the AHCI disk, bare metal](docs/architecture/hardware.md)
 - [Reverse debugging with gdb](docs/testing/reverse-debugging.md)
 - [Driving time travel from MCP](docs/testing/mcp-server.md)
 - [Orthogonal persistence](docs/architecture/orthogonal-persistence.md) and

@@ -169,6 +169,25 @@ static void extend_direct_map(void) {
     }
 }
 
+void* mm_mmio(uint64_t phys, uint64_t len) {
+    /* Device registers through the direct map, uncached (PCD|PWT), 2 MiB at a
+     * time: the boot map covers them as cached RAM, or not at all above it. */
+    for (uint64_t a = phys & ~((1ULL << 21) - 1); a < phys + len; a += 1ULL << 21) {
+        uint64_t g = a >> 30;
+        if (g >= 512) return 0;
+        if (!(boot_pdpt_direct[g] & PAGE_PRESENT)) {
+            uint64_t pd = pmm_alloc();
+            if (!pd) return 0;
+            boot_pdpt_direct[g] = pd | PAGE_PRESENT | PAGE_WRITABLE;
+        }
+        uint64_t* e = (uint64_t*)P2V(boot_pdpt_direct[g] & LP_PTE_ADDR_MASK);
+        e[(a >> 21) & 511] = a | PAGE_PRESENT | PAGE_WRITABLE | LARGE_PAGE | PAGE_CACHEDISABLE |
+                             PAGE_WRITETHROUGH;
+        invlpg((uint64_t)P2V(a));
+    }
+    return P2V(phys);
+}
+
 void mm_init(const uint32_t* mbi) {
     memset(g_frame_used, 0xFF, sizeof(g_frame_used));
     g_free_frames = 0;

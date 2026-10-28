@@ -45,6 +45,10 @@ void     pmm_free(uint64_t phys);
 uint64_t pmm_free_frames(void);
 uint64_t pmm_max_phys(void);        /* end of the highest usable RAM */
 
+/* Device registers at `phys` (`len` bytes), mapped uncached; NULL if they
+ * cannot be. */
+void* mm_mmio(uint64_t phys, uint64_t len);
+
 void* kmalloc(size_t size);
 void  kfree(void* ptr);
 void* kzalloc(size_t size);

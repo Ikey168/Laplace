@@ -37,7 +37,7 @@ CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
             kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
-            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c kernel/core/kio.c kernel/core/pctl.c kernel/core/ksig.c kernel/core/preempt.c \
+            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c kernel/core/kio.c kernel/core/pctl.c kernel/core/ksig.c kernel/core/preempt.c kernel/core/ahci.c kernel/core/pmu.c \
             kernel/core/kfpages.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
