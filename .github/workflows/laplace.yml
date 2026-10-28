@@ -148,7 +148,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          test -w /dev/kvm
+          sudo chmod 666 /dev/kvm
           QEMU_ACCEL=kvm bash tests/qemu/preempt_gate.sh
           make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
           QEMU_ACCEL=kvm python3 tests/qemu/timetravel_e2e.py
@@ -182,6 +182,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
           QEMU_ACCEL=kvm python3 scripts/bench/overhead.py --out bench-kvm.md
       - name: Table
         if: always()

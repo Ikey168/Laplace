@@ -35,6 +35,7 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QEMU = os.environ.get("QEMU", "qemu-system-x86_64")
 ACCEL = ["-enable-kvm", "-cpu", "host"] if os.environ.get("QEMU_ACCEL") == "kvm" else []
+TIMEOUT = int(os.environ.get("BENCH_TIMEOUT", "1800"))     # per boot, seconds
 
 
 def seed_image(adds):
@@ -73,8 +74,13 @@ def boot(initrd, append, nav=True):
     if initrd:
         args += ["-initrd", initrd]
     args += ["-append", append + (" bench exit" if nav else " bench=run exit")]
-    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=3600, cwd=ROOT)
-    text = r.stdout.decode(errors="replace").replace("\r", "")
+    try:
+        r = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=TIMEOUT, cwd=ROOT)
+        out = r.stdout
+    except subprocess.TimeoutExpired as e:
+        out = (e.output or b"") + f"\n(no result after {TIMEOUT} s)\n".encode()
+    text = out.decode(errors="replace").replace("\r", "")
     vals = {}
     for line in text.splitlines():
         words = line.split()

@@ -1,7 +1,8 @@
 name: KVM probe (throwaway)
 
-# One-off run on the development branch for #236 and #255: the KVM gates and
-# the overhead table under KVM. Removed once the results are in.
+# One-off runs on the development branch for #236 and #255: the KVM gates,
+# the overhead table under KVM, and why TCG boots hang on the runners' QEMU.
+# Removed once the results are in.
 
 on:
   push:
@@ -16,21 +17,35 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm musl-tools qemu-system-x86 gdb
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -w /dev/kvm
+          qemu-system-x86_64 --version
+          sudo chmod 666 /dev/kvm
       - name: Build
         run: make
+      - name: TCG boots, time-limited, console shown
+        if: always()
+        run: |
+          for cpu in qemu64 max Skylake-Client; do
+            for extra in "" "norecord bench=run"; do
+              echo "=== -cpu $cpu, $extra"
+              timeout 90 qemu-system-x86_64 -cpu $cpu -m 256M -display none -no-reboot \
+                -device isa-debug-exit,iobase=0xf4,iosize=0x04 -kernel build/laplace.elf \
+                -append "run=musl_hello selftest exit $extra" \
+                -serial stdio -serial null -serial null < /dev/null 2>&1 | tr -d '\r' | head -60 || true
+            done
+          done
+      - name: KVM boot log
+        if: always()
+        run: |
+          timeout 120 qemu-system-x86_64 -enable-kvm -cpu host -m 256M -display none -no-reboot \
+            -device isa-debug-exit,iobase=0xf4,iosize=0x04 -kernel build/laplace.elf \
+            -append "run=musl_hello selftest exit" -serial stdio -serial null -serial null < /dev/null 2>&1 \
+            | tr -d '\r' | head -40 || true
       - name: Self-test under KVM
-        run: make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
+        if: always()
+        run: timeout 600 make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
       - name: Preemption gate under KVM
-        run: QEMU_ACCEL=kvm bash tests/qemu/preempt_gate.sh
+        if: always()
+        run: QEMU_ACCEL=kvm timeout 1200 bash tests/qemu/preempt_gate.sh
       - name: e2e under KVM
-        run: QEMU_ACCEL=kvm python3 tests/qemu/timetravel_e2e.py
-      - name: Overhead under KVM
         if: always()
-        run: QEMU_ACCEL=kvm python3 scripts/bench/overhead.py --out bench-kvm.md && cat bench-kvm.md
-      - name: Overhead under TCG
-        if: always()
-        run: python3 scripts/bench/overhead.py --out bench-tcg.md && cat bench-tcg.md
+        run: QEMU_ACCEL=kvm timeout 1200 python3 tests/qemu/timetravel_e2e.py
