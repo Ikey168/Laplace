@@ -61,8 +61,23 @@ QEMU 8.2 TCG, `-m 512M`, on a 2.1 GHz Xeon development host (not a CI runner):
 
 ## KVM
 
-Not measured yet: this sandbox has no `/dev/kvm`. The table will come from a
-GitHub-hosted runner (AMD EPYC, no PMU) with `QEMU_ACCEL=kvm`.
+QEMU 10.2 with `-enable-kvm -cpu host` on a GitHub-hosted runner (Intel Xeon
+6973P-C, no PMU exposed), measured by CI at commit d9e64f7:
+
+| workload | run ms | recorded ms | keyframes | other disk | verify ms | replay ms | rewind ms | rstepi ms |
+|---|---|---|---|---|---|---|---|---|
+| hello: hello world (musl) | 3.2 | 3.3 (1.04x) | 1, 11.7 MiB/s | 29.8 MiB/s | 0.3 (1 epochs, 0 diverged) | 0.2 (0.1x) | 0.0 | 5.9 / 20.0 |
+| lua: Lua 5.4: the gate script | 41.2 | 44.5 (1.08x) | 6, 32.3 MiB/s | 5.2 MiB/s | 1770 (6 epochs, 0 diverged) | 1749 (39.3x) | 0.1 | 6.3 / 12.0 |
+| sqlite: SQLite shell: 20000 rows, an index, queries | 71.6 | 76.2 (1.06x) | 7, 46.7 MiB/s | 3.5 MiB/s | 88.1 (7 epochs, 0 diverged) | 85.1 (1.1x) | 0.1 | 22.9 / 41.4 |
+| threads: pthreads: 2 threads, 300000 racy increments | 43.3 | 51.8 (1.20x) | 6, 2.2 MiB/s | 8.5 MiB/s | 3890 (7 epochs, 0 diverged) | 3847 (74.2x) | 0.1 | 3142 / 5666 |
+| cpu: compute-bound: a sieve, 4 rounds | 56.7 | 58.9 (1.04x) | 6, 10.7 MiB/s | 3.9 MiB/s | 69097 (7 epochs, 0 diverged) | 69588 (1182.0x) | 0.1 | 25.5 / 45.8 |
+| alloc: allocation-heavy: 100000 malloc/free | 141 | 187 (1.33x) | 11, 229.8 MiB/s | 2.1 MiB/s | 138 (11 epochs, 0 diverged) | 103 (0.6x) | 0.4 | 6.9 / 12.6 |
+
+Recording costs less under KVM than under TCG (1.04 to 1.33x), and rewinding
+is under a millisecond. Replaying a preempted hot loop costs more: every
+breakpoint check is a #DB that KVM intercepts (a VM exit), so the cpu and
+threads rows replay 74 to 1182 times slower than they ran, and Lua, whose
+interpreter loop is preempted too, 39 times.
 
 ## What the numbers say
 
@@ -95,11 +110,13 @@ GitHub-hosted runner (AMD EPYC, no PMU) with `QEMU_ACCEL=kvm`.
 The first numbers set these budgets. A regression past one should be
 explained:
 
-- Recording overhead for lua and sqlite: at most 1.5x under TCG.
-- Recording overhead for alloc: at most 2x under TCG.
-- Rewind to the oldest keyframe: at most 10 ms.
+- Recording overhead for lua and sqlite: at most 1.5x under TCG, 1.2x under
+  KVM.
+- Recording overhead for alloc: at most 2x under TCG, 1.5x under KVM.
+- Rewind to the oldest keyframe: at most 10 ms (TCG), 1 ms (KVM).
 - Replay of programs that make system calls (lua, sqlite, alloc): at most 5x
-  the recorded run.
+  the recorded run under TCG. Under KVM a preempted interpreter loop makes
+  Lua's replay 39x; it has no KVM budget yet, like the hot loops.
 - Hot-loop replay (threads, cpu) has no budget until a branch counter exists.
   These rows are tracked so an improvement shows.
 
