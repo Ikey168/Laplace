@@ -378,7 +378,14 @@ This section is the spike deliverable for the catalog. Every source that can mak
 diverge must be either recorded and replayed, virtualized, or gated to a deterministic
 point. Each entry below is grounded in the current code.
 
-#### Spike findings (current code)
+#### Spike findings (the IKOS-era code)
+
+> These findings describe the IKOS-era kernel this plan started from. Its
+> files (`kernel/scheduler.c`, `kernel/interrupts.c`, `kernel/auth_core.c`,
+> and the rest named below) were never part of the bootable kernel and were
+> removed in #233. What the booted kernel journals today, and where, is in
+> "Inputs" and the module map above.
+
 
 A read of the kernel established the facts that shape the plan:
 

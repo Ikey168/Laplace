@@ -280,11 +280,10 @@ processes loaded from embedded ELF images, Laplace (`int 0x80`) and Linux
 (`syscall`) system calls, and a round-robin scheduler. The kernel runs with interrupts disabled, so a kernel entry is an atomic, deterministic step; a process that waits (`nanosleep`, and later children, futexes, input) blocks, and when nothing can run the kernel idles with `hlt` (#246); the whole
 time-travel stack (`kernel/*.c`, host-tested under `tests/`) sits on top of it.
 
-The project was formerly named IKOS, and the tree carries a broad scaffold of a
-general-purpose OS from that era (GUI, USB, networking, audio, daemons, a
-multi-stage boot sector). That code is **not** in the bootable kernel and does
-not compile today; `make legacy` runs its old build. Issue #233 tracks either
-repairing or removing it.
+The project was formerly named IKOS. The general-purpose OS scaffold of that
+era (GUI, USB, audio, daemons, a multi-stage boot sector, an earlier network
+stack and VFS) never compiled into the bootable kernel and was removed (#233);
+everything in the tree is built or tested.
 
 ## Getting started
 
@@ -323,7 +322,6 @@ Kernel command line (`make run APPEND="..."`):
 | `make selftest` | in-kernel verification, exits QEMU with the result |
 | `make test` | `selftest` plus the in-QEMU end-to-end gates |
 | `make iso` | GRUB rescue ISO for BIOS machines |
-| `make legacy` | the old IKOS wildcard build (does not compile; #233) |
 
 ## Testing
 
@@ -331,8 +329,10 @@ CI (`.github/workflows/laplace.yml`) builds the kernel with `-Werror`, runs the
 host unit tests of every time-travel and persistence module, runs the host
 harnesses (`scripts/test/{persistence,timetravel,scrub,mcp_heisenbug,timetravel_live}_demo.sh`,
 which exercise the modules outside the kernel), then boots the kernel in QEMU
-for `make selftest`, `tests/qemu/timetravel_e2e.py`, the power-cut demo, and
-`make iso`.
+for `make selftest`, every gate under `tests/qemu/`, the power-cut demos (IDE
+and AHCI), and `make iso`; under KVM it reruns the self-test, the preemption
+gate, and the e2e gate. Pushes to main also measure the overhead table
+(`scripts/bench/overhead.py`).
 
 ## Project structure
 
@@ -343,16 +343,19 @@ Laplace/
                       restore, replay, navigation), monitor, gdb_target, main
   kernel/*.c          the time-travel and persistence modules (checkpoint,
                       snapshot/keyframe/journal stores, record wrappers, replay,
-                      divergence, rewind/reverse/revbreak, gdbstub, mcp), plus
-                      the legacy IKOS subsystems (not built)
+                      divergence, rewind/reverse/revbreak, gdbstub, mcp, memfs,
+                      page store, kernel-state format), host-tested
   include/            headers (include/core/ for the kernel core)
   user/laplace/       the recorded programs: heisenbug, noise, counter, hello
-  user/linux/         unmodified Linux programs built with musl (probes, bigmem)
+  user/linux/         unmodified Linux programs built with musl (probes, threads,
+                      pipelines, an HTTP server, benchmarks)
   rootfs/             the machine filesystem's seed image (packed to build/rootfs.cpio)
   tests/              host unit tests; tests/qemu/ the booted end-to-end gates
   tools/              laplace-mcp (MCP stdio bridge), record-cast, mkcpio
   scripts/test/       host harnesses and the QEMU power-cut demo
-  scripts/build/      third-party programs for the gates (Lua)
+  scripts/build/      third-party programs for the gates (Lua, SQLite, the
+                      dynamically linked programs)
+  scripts/bench/      the overhead table
   docs/               architecture and how-tos
 ```
 
@@ -365,7 +368,6 @@ included) is tracked in #235. Its main steps:
   most of the breakpoint hits a replay of a preempted hot loop takes (#245);
   a bare-metal machine, NVMe, and a debug channel without COM ports (#236)
 - SMP-safe deterministic replay
-- Repair or remove the legacy subsystems (#233)
 
 ## Documentation
 

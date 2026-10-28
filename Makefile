@@ -6,7 +6,7 @@
 #   make selftest   boot, record the heisenbug, verify the replay, and exit
 #   make iso        build a GRUB rescue ISO (build/laplace.iso) for BIOS machines
 #   make test       the self-test plus the in-QEMU end-to-end gates
-#   make legacy     the pre-Laplace wildcard build (does not compile; see #233)
+#   make      the pre-Laplace wildcard build (does not compile; see #233)
 #
 # Needs gcc, GNU ld, nasm, musl-gcc (musl-tools), and (to boot) qemu-system-x86_64.
 
@@ -76,7 +76,7 @@ UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
 ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -z noexecstack \
             -T user/laplace/user.ld
 
-.PHONY: all kernel user run selftest test iso clean legacy
+.PHONY: all kernel user run selftest test iso clean
 
 all: kernel $(BUILD)/rootfs.cpio
 
@@ -164,18 +164,19 @@ test: all selftest
 	bash tests/qemu/signal_gate.sh
 	bash tests/qemu/preempt_gate.sh
 	bash tests/qemu/threads_gate.sh
+	python3 tests/qemu/console_gate.py
+	python3 tests/qemu/net_gate.py
 	python3 tests/qemu/targets_gate.py
+	python3 tests/qemu/dynamic_gate.py
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
+	LAPLACE_DISK=ahci bash scripts/test/qemu_persistence_demo.sh
 
 iso: kernel
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(BUILD)/laplace.elf $(BUILD)/iso/boot/laplace.elf
 	printf 'set timeout=0\nset default=0\nmenuentry "Laplace" {\n  multiboot /boot/laplace.elf\n  boot\n}\n' > $(BUILD)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD)/laplace.iso $(BUILD)/iso
-
-legacy:
-	$(MAKE) -f Makefile.legacy all
 
 clean:
 	rm -rf $(BUILD)

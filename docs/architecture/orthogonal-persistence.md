@@ -1,5 +1,12 @@
 # IKOS Orthogonal Persistence - Design Doc
 
+> A design document from the IKOS era. The files it names outside
+> `kernel/checkpoint*.c`, `kernel/snapshot_store.c`, and `kernel/ramdisk.c`
+> (`kernel/scheduler.c`, `kernel/demand_paging.c`, `kernel/process_manager.c`,
+> and others) were never part of the bootable kernel and were removed in
+> #233; the booted kernel's persistence is described in the root README and
+> `include/core/timetravel.h`.
+
 Tracking issue: #110 (epic: #121)
 
 ## Overview
