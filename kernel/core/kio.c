@@ -19,6 +19,9 @@ static kio_mismatch_t g_mis;
 static bool           g_perturb, g_perturb_on, g_perturb_applied;
 static bool           g_perturb_rec, g_perturb_rec_on, g_perturb_rec_applied;
 static kio_stats_t    g_stats;
+static uint32_t       g_sabotage;
+
+void kio_sabotage(uint32_t kind) { g_sabotage = kind; }
 
 const kio_stats_t* kio_stats(void) { return &g_stats; }
 void kio_perturb_record_next(bool on) {
@@ -85,7 +88,7 @@ uint64_t kio_time(uint64_t (*live)(void)) {
     }
     iorec_t r;
     next(IOREC_TIME, 0, 0, &r);
-    return (uint64_t)r.ret + (g_perturb_on ? 1000000 : 0);
+    return (uint64_t)r.ret + (g_perturb_on ? 1000000 : 0) + (g_sabotage == KIO_SABOTAGE_CLOCK ? 1000000 : 0);
 }
 
 int kio_entropy(void* buf, uint32_t len, int (*live)(void* ctx, void* buf, uint32_t len), void* ctx) {
@@ -101,6 +104,7 @@ int kio_entropy(void* buf, uint32_t len, int (*live)(void* ctx, void* buf, uint3
     if (g_perturb_on) {
         for (uint32_t i = 0; i < len; i++) ((uint8_t*)buf)[i] ^= 0x5A;
     }
+    if (g_sabotage == KIO_SABOTAGE_ENTROPY && len) ((uint8_t*)buf)[0] ^= 1;
     return 0;
 }
 

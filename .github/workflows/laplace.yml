@@ -133,8 +133,14 @@ jobs:
         run: bash tests/qemu/signal_gate.sh
       - name: Preemption at any instruction, found again by state (in QEMU, TCG, no PMU)
         run: bash tests/qemu/preempt_gate.sh
-      - name: pthreads; a lost update traced to the other thread's store over MCP (in QEMU, TCG)
+      - name: "Target: a pthreads lost-update race, traced to the other thread's store (MCP + gdb)"
         run: bash tests/qemu/threads_gate.sh
+      - name: "Target: hello world (record, verify, sabotage caught, MCP + gdb backward)"
+        run: python3 tests/qemu/targets_gate.py hello
+      - name: "Target: Lua 5.4 running a script from the seed image"
+        run: python3 tests/qemu/targets_gate.py lua
+      - name: "Target: the SQLite shell creating, filling, and querying a database file"
+        run: python3 tests/qemu/targets_gate.py sqlite
       - name: The same under KVM (the runner's CPU exposes no PMU)
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules

@@ -6,7 +6,8 @@
 #     are joined. The run records and replays byte-exact.
 #  2. Two threads add to a shared counter without atomics. Preempted between
 #     a load and a store (#245), they lose updates; the run replays
-#     byte-exact, the same lost updates included.
+#     byte-exact, the same lost updates included; replays with a clock read
+#     one tick late, or one random bit flipped, are caught (#256).
 #  3. The same race, debugged over MCP. At a point where one thread is about
 #     to store a value it loaded before it was preempted, watch_last_write on
 #     the counter lands right after the other thread's store: the update the
@@ -47,6 +48,15 @@ else
     echo "[FAIL] no lost updates ('${lost}')"; fail=1
 fi
 check "$out" "selftest: verify rc=0: [0-9]+ epochs replayed, 0 diverged" "the race replays byte-exact"
+for kind in clock entropy; do
+    bad=$(boot "run=\"musl_threads race 300000\" interval=10 keyframes=64 sabotage=$kind")
+    echo "$bad" | grep -E "selftest: (verify rc|first divergence)" | sed "s/^/  [sabotage=$kind] /"
+    if echo "$bad" | grep -qE "selftest: verify rc=[-0-9]+: [0-9]+ epochs replayed, [1-9][0-9]* diverged"; then
+        echo "[ok] a replay with sabotage=$kind is caught (#256)"
+    else
+        echo "[FAIL] a replay with sabotage=$kind went unnoticed"; fail=1
+    fi
+done
 
 # 3. The race over MCP.
 elf=build/user/musl_threads.elf

@@ -18,6 +18,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/random.h>
+#include <time.h>
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
@@ -31,6 +33,9 @@ static long g_consumed_sum;
 /* The racy counter: volatile so every update is a load, an add, and a store. */
 volatile long g_race;
 static long g_tids[2];
+/* Journaled inputs, kept (#256): a sabotaged replay of them ends elsewhere. */
+static struct timespec g_started;
+static unsigned char g_noise[8];
 
 static void* adder(void* arg) {
     (void)arg;
@@ -99,6 +104,8 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "race") == 0) {
         pthread_t t[2];
+        clock_gettime(CLOCK_MONOTONIC, &g_started);
+        getrandom(g_noise, sizeof(g_noise), 0);
         printf("race: two threads, %ld unsynchronized increments each; the counter is at %p\n", g_iters,
                (void*)&g_race);
         fflush(stdout);

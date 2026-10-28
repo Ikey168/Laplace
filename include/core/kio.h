@@ -90,6 +90,11 @@ bool     kio_perturb_applied(void);
 void     kio_perturb_record_next(bool on);
 bool     kio_perturb_record_applied(void);   /* the epoch had a record to change */
 
+/* Test hook (#256): every replay from now on gets its inputs wrong. */
+#define KIO_SABOTAGE_CLOCK   1    /* each clock read one tick (1 ms) late */
+#define KIO_SABOTAGE_ENTROPY 2    /* one bit of each random payload flipped */
+void     kio_sabotage(uint32_t kind);
+
 /* Inputs recorded since boot. */
 typedef struct {
     uint64_t records;

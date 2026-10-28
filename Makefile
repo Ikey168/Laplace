@@ -159,6 +159,7 @@ test: all selftest
 	bash tests/qemu/signal_gate.sh
 	bash tests/qemu/preempt_gate.sh
 	bash tests/qemu/threads_gate.sh
+	python3 tests/qemu/targets_gate.py
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
 

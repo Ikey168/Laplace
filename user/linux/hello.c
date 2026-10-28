@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 static __thread int tls_counter = 41;
+volatile int g_greeted;   /* set before the greeting: a store the gates find backward (#256) */
 
 int main(int argc, char** argv) {
     struct utsname u;
@@ -19,6 +20,7 @@ int main(int argc, char** argv) {
     unsigned char r[8];
     ssize_t n = getrandom(r, sizeof(r), 0);
     tls_counter++;
+    g_greeted = 1;
     printf("hello from %s on %s %s (argc %d, pid %d, tls %d, getrandom %zd, clock %s)\n",
            argv[0], u.sysname, u.machine, argc, (int)getpid(), tls_counter, n,
            ts.tv_sec >= 0 ? "ok" : "bad");

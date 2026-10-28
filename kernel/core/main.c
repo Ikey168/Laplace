@@ -15,6 +15,9 @@
  *   selftest       after the machine stops, verify the recording and halt
  *   exit           with selftest: leave QEMU through isa-debug-exit (port 0xF4)
  *                  with status 1 on success, 3 on failure
+ *   sabotage=clock|entropy  every replay is wrong on purpose (#256): each
+ *                  replayed clock read one tick (1 ms) late, or one bit of
+ *                  each replayed random payload flipped; verify must notice
  */
 
 #include "core/cpu.h"
@@ -117,6 +120,10 @@ static void parse_cmdline(const char* cmd) {
             g_opts.selftest = true;
         } else if (len == 4 && strncmp(tok, "exit", 4) == 0) {
             g_opts.exit = true;
+        } else if (len == 14 && strncmp(tok, "sabotage=clock", 14) == 0) {
+            kio_sabotage(KIO_SABOTAGE_CLOCK);
+        } else if (len == 16 && strncmp(tok, "sabotage=entropy", 16) == 0) {
+            kio_sabotage(KIO_SABOTAGE_ENTROPY);
         }
     }
     if (g_opts.interval == 0) g_opts.interval = 1;

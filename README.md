@@ -189,6 +189,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 
 | Capability | Tested by |
 |------------|-----------|
+| **Practical targets**, each recorded to its end, verified byte-exact, caught when replay is sabotaged (`sabotage=clock`: every clock read a tick late; `sabotage=entropy`: one random bit flipped), and debugged backward over MCP (`watch_last_write`) and stock gdb with no file argument (reverse-continue to a breakpoint): hello world; Lua 5.4 running a script from the seed image (floats, tables, the collector, file I/O); the SQLite 3.44 shell creating, filling, indexing, and querying a database file; a pthreads lost-update race | `tests/qemu/targets_gate.py`, `tests/qemu/threads_gate.sh` |
 | Multiboot boot (QEMU `-kernel`, GRUB ISO), long mode, paging, ring-3 processes, system calls | every QEMU job; `make iso` |
 | Recording: keyframes with deferred copy-on-write writeback, one journal per keyframe, on the IDE disk | `make selftest`, e2e |
 | Replay by re-executing the processes to any (epoch, step, instruction) | e2e, `make selftest` |
@@ -206,8 +207,8 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Signals: SIGALRM from a timer interrupts a loop at journaled points with FPU state saved in the frame; a SIGSEGV handler recovers; masks, pending, sigsuspend, sigaltstack; every run replays byte-exact; an unhandled fault or abort() stops the machine and gdb shows the signal and the faulting line | `tests/qemu/signal_gate.sh` |
 | Blocking: a sleeping process and a working one replay byte-exact with each timer wake at its journaled step; a 10 s idle adds no steps and replays without waiting; a debugger stops the machine while everything waits | `tests/qemu/sleep_gate.sh` |
 | Incremental keyframes: 256 MiB resident records at about 90 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
-| gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
-| MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
+| gdb: registers (x87, SSE, AVX, fs_base by a target description), memory, every thread, the program read from the target, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e, `tests/qemu/threads_gate.sh` |
+| MCP: protocol handshake, 13 tools (threads, vector registers), stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
 | Power cut and resume from the disk | `qemu_persistence_demo.sh` |
 
@@ -241,8 +242,11 @@ Limits, stated plainly:
   `read`/`write` and their `p`/`v` forms, `lseek`, `stat` and `statx`,
   `getdents64`, `mkdir`, `unlink`, `rename`, links, `ftruncate`, `fcntl`,
   `dup`, `getcwd`/`chdir`, private file `mmap`, and `/dev/null`, `/dev/zero`,
-  `/dev/urandom`; and processes (#248): `fork`, `vfork`, `clone` without
-  `CLONE_VM`, `execve`, `wait4`, `kill`, zombies and orphans. Unimplemented calls return ENOSYS and are logged once.
+  `/dev/urandom`; processes (#248): `fork`, `vfork`, `execve`, `wait4`,
+  `kill`, zombies and orphans; threads (#251): `clone` for pthreads,
+  `futex`, `gettid`, `tgkill`; and signals (#250). Unimplemented calls return
+  ENOSYS and are logged once. Programs must be static: no dynamic linker
+  yet (#254), no console input, pipes, or `poll` (#249), no sockets (#253).
 - Recorded history is read-only from the debuggers.
 
 ## The machine
@@ -286,6 +290,7 @@ Kernel command line (`make run APPEND="..."`):
 | `stop_after=N` | stop for the debugger after N keyframes |
 | `dirty=N` | also take a keyframe once an epoch dirties N pages (default 8192) |
 | `pool=N` | without an IDE disk: the RAM disk's page pool in MiB (default 64) |
+| `sabotage=clock` / `sabotage=entropy` | test hook: every replayed clock read one tick late, or one bit of every replayed random payload flipped; `selftest` must report divergence |
 
 | Target | Description |
 |--------|-------------|
@@ -332,14 +337,11 @@ Laplace/
 The plan for running real programs (unmodified static Linux binaries, threads
 included) is tracked in #235. Its main steps:
 
-- Incremental keyframes that write only dirtied pages, so keyframes scale to
-  real memory sizes (#244)
-- Journal device input (keyboard, disk completions) so interactive programs
-  can be recorded (#242, #249)
-- Preemption at any instruction, recorded as a register-and-memory state that
-  replay finds with a breakpoint, so it works without a hardware branch counter
-  (QEMU TCG, and CI runners without a PMU), with the counter as a speed-up where
-  present (#245)
+- Console input, pipes, and `poll`, so interactive programs can be recorded
+  (#249); networking (#253); dynamically linked binaries (#254)
+- A branch counter, where a CPU has one, to skip most of the breakpoint hits
+  a replay of a preempted hot loop takes (#245, #236)
+- Overhead benchmarks (#255)
 - SMP-safe deterministic replay
 - Repair or remove the legacy subsystems (#233)
 
