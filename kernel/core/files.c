@@ -13,6 +13,7 @@
 #include "core/console.h"
 #include "core/tty.h"
 #include "core/ksig.h"
+#include "core/net.h"
 #include "memfs.h"
 #include "entropy_record.h"
 #include "divergence.h"
@@ -67,6 +68,7 @@ static int64_t would_block(uint32_t reason, uint64_t obj) {
 #define AT_EMPTY_PATH       0x1000
 
 #define S_IFIFO  0010000
+#define S_IFSOCK 0140000
 #define S_IFCHR  0020000
 #define S_IFDIR  0040000
 #define S_IFREG  0100000
@@ -76,7 +78,8 @@ static int64_t would_block(uint32_t reason, uint64_t obj) {
 
 /* ---- Open file descriptions ---- */
 
-enum { OF_FREE = 0, OF_CONSOLE, OF_FILE, OF_DIR, OF_NULL, OF_ZERO, OF_RANDOM, OF_PIPE_R, OF_PIPE_W };
+enum { OF_FREE = 0, OF_CONSOLE, OF_FILE, OF_DIR, OF_NULL, OF_ZERO, OF_RANDOM, OF_PIPE_R, OF_PIPE_W,
+       OF_SOCKET, OF_EPOLL };
 
 typedef struct {
     uint32_t refs;
@@ -143,6 +146,44 @@ static int32_t pipe_alloc(void) {
     return (int32_t)id;
 }
 
+/* ---- epoll (#253) ---- */
+
+#define EP_MAX 64
+
+typedef struct {
+    int32_t  fd;
+    uint32_t events;
+    uint64_t data;
+} ep_item_t;
+
+typedef struct {
+    bool      used;
+    uint32_t  n;
+    ep_item_t it[EP_MAX];
+} epoll_t;
+
+static epoll_t* g_ep;
+static uint32_t g_nep;
+
+static int32_t epoll_alloc(void) {
+    uint32_t id = 0;
+    while (id < g_nep && g_ep[id].used) id++;
+    if (id == g_nep) {
+        uint32_t cap = g_nep ? g_nep * 2 : 8;
+        epoll_t* n = (epoll_t*)kzalloc((uint64_t)cap * sizeof(epoll_t));
+        if (!n) return -1;
+        if (g_ep) {
+            memcpy(n, g_ep, (uint64_t)g_nep * sizeof(epoll_t));
+            kfree(g_ep);
+        }
+        g_ep = n;
+        g_nep = cap;
+    }
+    memset(&g_ep[id], 0, sizeof(epoll_t));
+    g_ep[id].used = true;
+    return (int32_t)id;
+}
+
 static void pipe_end_closed(uint32_t id, bool write_end) {
     pipe_t* q = &g_pipes[id];
     if (write_end) q->wr = false; else q->rd = false;
@@ -183,6 +224,11 @@ static void of_put(int32_t id) {
     if (--o->refs) return;
     if (o->kind == OF_FILE || o->kind == OF_DIR) memfs_open_ref(&g_fs, o->ino, -1);
     if (o->kind == OF_PIPE_R || o->kind == OF_PIPE_W) pipe_end_closed(o->ino, o->kind == OF_PIPE_W);
+    if (o->kind == OF_SOCKET) {
+        net_close((int32_t)o->ino);
+        g_changed = true;
+    }
+    if (o->kind == OF_EPOLL) memset(&g_ep[o->ino], 0, sizeof(epoll_t));
     memset(o, 0, sizeof(*o));
 }
 
@@ -385,6 +431,74 @@ static int64_t pipe_write(process_t* p, ofile_t* o, uint64_t buf, uint64_t len) 
     return (int64_t)n;
 }
 
+/* ---- Sockets (#253): user memory in and out of core/net.h ---- */
+
+#define MSG_PEEK     0x2
+#define MSG_DONTWAIT 0x40
+#define MSG_NOSIGNAL 0x4000
+static uint8_t g_sockbuf[65536];
+
+static int64_t sock_wait(ofile_t* o, uint32_t flags) {
+    if ((o->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) return err(LX_EAGAIN);
+    return would_block(WAIT_NET, o->ino | (net_external((int32_t)o->ino) ? 1ULL << 32 : 0));
+}
+
+static bool get_sockaddr(process_t* p, uint64_t ua, uint64_t alen, net_addr_t* a, int64_t* e) {
+    uint8_t sa[16];
+    if (alen < 16 || !uaccess_read(p->address_space, ua, sa, 16)) {
+        *e = alen < 16 ? err(LX_EINVAL) : err(LX_EFAULT);
+        return false;
+    }
+    if ((sa[0] | sa[1] << 8) != 2) {                          /* AF_INET */
+        *e = err(97);                                         /* EAFNOSUPPORT */
+        return false;
+    }
+    a->port = (uint16_t)(sa[2] << 8 | sa[3]);
+    a->ip = (uint32_t)sa[4] << 24 | (uint32_t)sa[5] << 16 | (uint32_t)sa[6] << 8 | sa[7];
+    return true;
+}
+
+/* Write a sockaddr_in to (ua, *ualen) as accept/recvfrom/getsockname do. */
+static int64_t put_sockaddr(process_t* p, uint64_t ua, uint64_t ualen, net_addr_t a) {
+    if (!ua || !ualen) return 0;
+    uint32_t cap;
+    if (!uaccess_read(p->address_space, ualen, &cap, 4)) return err(LX_EFAULT);
+    uint8_t sa[16] = { 2, 0, (uint8_t)(a.port >> 8), (uint8_t)a.port,
+                       (uint8_t)(a.ip >> 24), (uint8_t)(a.ip >> 16), (uint8_t)(a.ip >> 8), (uint8_t)a.ip };
+    uint32_t n = cap < 16 ? cap : 16, full = 16;
+    if (!uaccess_write(p->address_space, ua, sa, n) || !uaccess_write(p->address_space, ualen, &full, 4)) {
+        return err(LX_EFAULT);
+    }
+    return 0;
+}
+
+static int64_t sock_send(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, uint32_t flags,
+                         uint64_t ua, uint64_t alen) {
+    net_addr_t to;
+    int64_t e;
+    if (ua && !get_sockaddr(p, ua, alen, &to, &e)) return e;
+    if (len > sizeof(g_sockbuf)) len = sizeof(g_sockbuf);
+    if (len && !uaccess_read(p->address_space, buf, g_sockbuf, len)) return err(LX_EFAULT);
+    int64_t r = net_send((int32_t)o->ino, g_sockbuf, (uint32_t)len, ua ? &to : 0);
+    g_changed |= net_changed();
+    if (r == NET_EBLOCK) return sock_wait(o, flags);
+    if (r == err(LX_EPIPE) && !(flags & MSG_NOSIGNAL)) ksig_send(p, SIG_SIGPIPE, 0, 0);
+    return r;
+}
+
+static int64_t sock_recv(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, uint32_t flags,
+                         uint64_t ua, uint64_t ualen) {
+    net_addr_t from = { 0, 0 };
+    if (len > sizeof(g_sockbuf)) len = sizeof(g_sockbuf);
+    int64_t r = net_recv((int32_t)o->ino, g_sockbuf, (uint32_t)len, &from, (flags & MSG_PEEK) != 0);
+    g_changed |= net_changed();
+    if (r == NET_EBLOCK) return sock_wait(o, flags);
+    if (r < 0) return r;
+    if (r && !uaccess_write(p->address_space, buf, g_sockbuf, (uint64_t)r)) return err(LX_EFAULT);
+    int64_t e = put_sockaddr(p, ua, ualen, from);
+    return e < 0 ? e : r;
+}
+
 /* Read `len` bytes at `off` (or the description's offset if off < 0). */
 static int64_t do_read(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, int64_t off) {
     if ((o->flags & O_ACCMODE) == O_WRONLY) return err(LX_EBADF);
@@ -397,6 +511,8 @@ static int64_t do_read(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, int
     }
     case OF_PIPE_R:
         return pipe_read(p, o, buf, len);
+    case OF_SOCKET:
+        return sock_recv(p, o, buf, len, 0, 0, 0);
     case OF_NULL:
         return 0;
     case OF_ZERO: {
@@ -441,10 +557,11 @@ static int64_t do_read(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, int
 }
 
 static int64_t do_write(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, int64_t off) {
-    if ((o->flags & O_ACCMODE) == 0 && o->kind != OF_CONSOLE) return err(LX_EBADF);
+    if ((o->flags & O_ACCMODE) == 0 && o->kind != OF_CONSOLE && o->kind != OF_SOCKET) return err(LX_EBADF);
     switch (o->kind) {
     case OF_CONSOLE: return write_console(p, buf, len);
     case OF_PIPE_W: return pipe_write(p, o, buf, len);
+    case OF_SOCKET: return sock_send(p, o, buf, len, 0, 0, 0);
     case OF_NULL: case OF_ZERO: case OF_RANDOM: return (int64_t)len;
     case OF_DIR: return err(LX_EISDIR);
     case OF_FILE: break;
@@ -592,7 +709,7 @@ static void dev_stat(uint32_t kind, uint64_t out[18]) {
     out[1] = 1000 + kind;
     out[2] = 1;
     bool fifo = kind == OF_PIPE_R || kind == OF_PIPE_W;
-    out[3] = fifo ? S_IFIFO | 0600 : S_IFCHR | 0666;
+    out[3] = kind == OF_SOCKET ? S_IFSOCK | 0777 : fifo ? S_IFIFO | 0600 : S_IFCHR | 0666;
     out[5] = fifo ? 0 : kind == OF_CONSOLE ? 0x0501 : 0x0103;
     out[7] = 4096;
 }
@@ -700,7 +817,9 @@ static int64_t sys_statx(process_t* p, int64_t dirfd, uint64_t upath, uint64_t f
 static int64_t sys_lseek(process_t* p, int64_t fd, int64_t off, uint64_t whence) {
     ofile_t* o = of_get(p, fd);
     if (!o) return err(LX_EBADF);
-    if (o->kind == OF_CONSOLE || o->kind == OF_PIPE_R || o->kind == OF_PIPE_W) return err(LX_ESPIPE);
+    if (o->kind == OF_CONSOLE || o->kind == OF_PIPE_R || o->kind == OF_PIPE_W || o->kind == OF_SOCKET) {
+        return err(LX_ESPIPE);
+    }
     if (o->kind != OF_FILE && o->kind != OF_DIR) return 0;
     memfs_stat_t st;
     memfs_stat(&g_fs, o->ino, &st);
@@ -1075,12 +1194,20 @@ static uint32_t ready_mask(ofile_t* o) {
         pipe_t* q = &g_pipes[o->ino];
         return (q->len < PIPE_CAP ? POLLOUT | POLLWRNORM : 0) | (q->rd ? 0 : POLLERR);
     }
+    case OF_SOCKET:
+        return net_ready((int32_t)o->ino);
+    case OF_EPOLL:
+        return 0;                                    /* an epoll set in a poll: not ready */
     default:
         return POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM;
     }
 }
 
-static bool on_console(ofile_t* o) { return o && o->kind == OF_CONSOLE; }
+/* A wait on it may end by input from outside: the console, or a socket on
+ * the network card (#253). */
+static bool on_console(ofile_t* o) {
+    return o && (o->kind == OF_CONSOLE || (o->kind == OF_SOCKET && net_external((int32_t)o->ino)));
+}
 
 /* The wait object of a poll or select: bit 0 when it watches the console,
  * which keeps an idle machine waiting for input. */
@@ -1180,6 +1307,39 @@ static int64_t read_timeout(process_t* p, uint64_t u, uint64_t ns_scale, int64_t
     return 0;
 }
 
+/* epoll_wait: the interest list's ready entries (level-triggered; EPOLLET
+ * is treated as level, EPOLLONESHOT disarms an entry once reported). */
+static int64_t do_epoll_wait(process_t* p, int64_t epfd, uint64_t uev, int64_t maxev, int64_t timeout_ns,
+                             bool retry) {
+    ofile_t* eo = of_get(p, epfd);
+    if (!eo || eo->kind != OF_EPOLL) return err(eo ? LX_EINVAL : LX_EBADF);
+    if (maxev <= 0) return err(LX_EINVAL);
+    epoll_t* e = &g_ep[eo->ino];
+    int64_t ready = 0;
+    bool outside = false;
+    for (uint32_t i = 0; i < e->n && ready < maxev; i++) {
+        ep_item_t* it = &e->it[i];
+        ofile_t* o = of_get(p, it->fd);
+        if (!o) continue;
+        outside |= on_console(o);
+        uint32_t want = it->events & 0xFFFF;
+        uint32_t m = ready_mask(o) & (want | POLLERR | POLLHUP);
+        if (!m || !want) continue;
+        uint8_t ev[12];
+        memcpy(ev, &m, 4);
+        memcpy(ev + 4, &it->data, 8);
+        if (!uaccess_write(p->address_space, uev + 12 * (uint64_t)ready, ev, 12)) return err(LX_EFAULT);
+        if (it->events & (1u << 30)) it->events &= ~0xFFFFu;          /* EPOLLONESHOT */
+        ready++;
+    }
+    if (ready || timeout_ns == 0) return ready;
+    if (!retry) {
+        would_block(WAIT_POLL, outside ? POLL_CONSOLE : 0);
+        if (timeout_ns > 0) g_block_deadline = clock_monotonic_ns() + (uint64_t)timeout_ns;
+    }
+    return err(E_BLOCK);
+}
+
 /* The poll-family calls, by number, from a process's registers. */
 static int64_t poll_call(process_t* p, uint64_t nr, bool retry) {
     process_context_t* c = &p->context;
@@ -1192,6 +1352,12 @@ static int64_t poll_call(process_t* p, uint64_t nr, bool retry) {
     case 271:                                                     /* ppoll; the mask is not applied */
         if ((r = read_timeout(p, c->rdx, 1, &to)) < 0) return r;
         return do_poll(p, c->rdi, c->rsi, to, retry);
+    case 232: case 281:                                           /* epoll_wait, epoll_pwait */
+        to = (int32_t)c->r10 < 0 ? -1 : (int64_t)(int32_t)c->r10 * 1000000LL;
+        return do_epoll_wait(p, (int64_t)c->rdi, c->rsi, (int64_t)(int32_t)c->rdx, to, retry);
+    case 441:                                                     /* epoll_pwait2 */
+        if ((r = read_timeout(p, c->r10, 1, &to)) < 0) return r;
+        return do_epoll_wait(p, (int64_t)c->rdi, c->rsi, (int64_t)(int32_t)c->rdx, to, retry);
     case 23:                                                      /* select */
     case 270: {                                                   /* pselect6; the mask is not applied */
         if ((r = read_timeout(p, c->r8, nr == 23 ? 1000 : 1, &to)) < 0) return r;
@@ -1218,13 +1384,179 @@ void files_poll_timed_out(process_t* p) {
     }
 }
 
+static bool is_poll_call(uint64_t nr) {
+    return nr == 7 || nr == 271 || nr == 23 || nr == 270 || nr == 232 || nr == 281 || nr == 441;
+}
+
+/* ---- Socket calls (#253) ---- */
+
+#define SOCK_NONBLOCK 04000
+#define SOCK_CLOEXEC  02000000
+
+static ofile_t* sock_of(process_t* p, int64_t fd, int64_t* e) {
+    ofile_t* o = of_get(p, fd);
+    *e = !o ? err(LX_EBADF) : o->kind != OF_SOCKET ? err(88 /* ENOTSOCK */) : 0;
+    return *e ? 0 : o;
+}
+
+static int64_t install_socket(process_t* p, int32_t id, uint64_t flags) {
+    int32_t of = of_alloc(OF_SOCKET, (uint32_t)id, O_RDWR | ((flags & SOCK_NONBLOCK) ? O_NONBLOCK : 0));
+    if (of < 0) {
+        net_close(id);
+        return err(LX_ENOMEM);
+    }
+    int64_t fd = fd_install(p, of, 0, (flags & SOCK_CLOEXEC) != 0);
+    if (fd < 0) of_put(of);
+    return fd;
+}
+
+static int64_t sys_socket(process_t* p, uint64_t domain, uint64_t type, uint64_t proto) {
+    (void)proto;
+    if (domain != 2) return err(97);                                /* EAFNOSUPPORT: AF_INET only */
+    int32_t id = net_socket((int)(type & 0xF));
+    if (id < 0) return id;
+    return install_socket(p, id, type);
+}
+
+static int64_t sys_bind_connect(process_t* p, int64_t fd, uint64_t ua, uint64_t alen, bool connect) {
+    int64_t e;
+    ofile_t* o = sock_of(p, fd, &e);
+    if (!o) return e;
+    net_addr_t a;
+    if (!get_sockaddr(p, ua, alen, &a, &e)) return e;
+    int64_t r = connect ? net_connect((int32_t)o->ino, a, (o->flags & O_NONBLOCK) != 0)
+                        : net_bind((int32_t)o->ino, a);
+    g_changed |= net_changed();
+    if (r == NET_EBLOCK) return sock_wait(o, 0);
+    return r;
+}
+
+static int64_t sys_accept(process_t* p, int64_t fd, uint64_t ua, uint64_t ualen, uint64_t flags) {
+    int64_t e;
+    ofile_t* o = sock_of(p, fd, &e);
+    if (!o) return e;
+    int32_t ns;
+    net_addr_t peer;
+    int64_t r = net_accept((int32_t)o->ino, &ns, &peer);
+    g_changed |= net_changed();
+    if (r == NET_EBLOCK) return sock_wait(o, 0);
+    if (r < 0) return r;
+    int64_t nfd = install_socket(p, ns, flags);
+    if (nfd < 0) return nfd;
+    e = put_sockaddr(p, ua, ualen, peer);
+    return e < 0 ? e : nfd;
+}
+
+/* sendmsg / recvmsg: the iovecs through the same paths, one at a time. */
+static int64_t sys_msg(process_t* p, int64_t fd, uint64_t umsg, uint64_t flags, bool send) {
+    int64_t e;
+    ofile_t* o = sock_of(p, fd, &e);
+    if (!o) return e;
+    uint64_t m[7];                                                  /* struct msghdr */
+    if (!uaccess_read(p->address_space, umsg, m, sizeof(m))) return err(LX_EFAULT);
+    uint64_t name = m[0], namelen = (uint32_t)m[1], iov = m[2], iovlen = m[3];
+    if (iovlen > 1024) return err(LX_EINVAL);
+    int64_t total = 0;
+    for (uint64_t i = 0; i < iovlen; i++) {
+        uint64_t v[2];
+        if (!uaccess_read(p->address_space, iov + 16 * i, v, 16)) return total ? total : err(LX_EFAULT);
+        if (!v[1]) continue;
+        int64_t n = send ? sock_send(p, o, v[0], v[1], (uint32_t)flags, total ? 0 : name, namelen)
+                         : sock_recv(p, o, v[0], v[1], (uint32_t)flags, total ? 0 : name,
+                                     total || !name ? 0 : umsg + 8);
+        if (n < 0) return total ? total : n;
+        total += n;
+        if ((uint64_t)n < v[1] || (!send && net_type((int32_t)o->ino) == NET_SOCK_DGRAM)) break;
+    }
+    if (!send) {
+        uint64_t zero = 0;
+        uaccess_write(p->address_space, umsg + 40, &zero, 8);          /* msg_controllen */
+        uaccess_write(p->address_space, umsg + 48, &zero, 4);          /* msg_flags */
+    }
+    return total;
+}
+
+static int64_t sys_sockopt(process_t* p, int64_t fd, uint64_t level, uint64_t opt, uint64_t uval,
+                           uint64_t ulen, bool get) {
+    int64_t e;
+    ofile_t* o = sock_of(p, fd, &e);
+    if (!o) return e;
+    if (!get) return 0;                                             /* accepted, not applied */
+    int32_t v = 0;
+    if (level == 1) {                                               /* SOL_SOCKET */
+        if (opt == 4) v = net_take_error((int32_t)o->ino);          /* SO_ERROR */
+        else if (opt == 3) v = net_type((int32_t)o->ino);           /* SO_TYPE */
+        else if (opt == 7 || opt == 8) v = 65536;                   /* SO_SNDBUF, SO_RCVBUF */
+        else if (opt == 39) v = 2;                                  /* SO_DOMAIN */
+    }
+    uint32_t len = 4;
+    if (!uaccess_write(p->address_space, uval, &v, 4) || !uaccess_write(p->address_space, ulen, &len, 4)) {
+        return err(LX_EFAULT);
+    }
+    return 0;
+}
+
+static int64_t sys_sockname(process_t* p, int64_t fd, uint64_t ua, uint64_t ualen, bool peer) {
+    int64_t e;
+    ofile_t* o = sock_of(p, fd, &e);
+    if (!o) return e;
+    net_addr_t a;
+    int64_t r = net_name((int32_t)o->ino, peer, &a);
+    return r < 0 ? r : put_sockaddr(p, ua, ualen, a);
+}
+
+static int64_t sys_epoll_create(process_t* p, uint64_t flags) {
+    int32_t id = epoll_alloc();
+    if (id < 0) return err(LX_ENOMEM);
+    int32_t of = of_alloc(OF_EPOLL, (uint32_t)id, O_RDWR);
+    if (of < 0) {
+        g_ep[id].used = false;
+        return err(LX_ENOMEM);
+    }
+    int64_t fd = fd_install(p, of, 0, (flags & O_CLOEXEC) != 0);
+    if (fd < 0) of_put(of);
+    return fd;
+}
+
+static int64_t sys_epoll_ctl(process_t* p, int64_t epfd, uint64_t op, int64_t fd, uint64_t uev) {
+    ofile_t* eo = of_get(p, epfd);
+    if (!eo || eo->kind != OF_EPOLL) return err(eo ? LX_EINVAL : LX_EBADF);
+    if (!of_get(p, fd) || fd == epfd) return err(LX_EBADF);
+    epoll_t* e = &g_ep[eo->ino];
+    uint32_t i = 0;
+    while (i < e->n && e->it[i].fd != fd) i++;
+    uint8_t ev[12];
+    if (op != 2 && !uaccess_read(p->address_space, uev, ev, 12)) return err(LX_EFAULT);
+    switch (op) {
+    case 1:                                                         /* EPOLL_CTL_ADD */
+        if (i < e->n) return err(LX_EEXIST);
+        if (e->n == EP_MAX) return err(LX_ENOMEM);
+        e->n++;
+        /* fall through */
+    case 3:                                                         /* EPOLL_CTL_MOD */
+        if (i == e->n) return err(LX_ENOENT);
+        e->it[i].fd = (int32_t)fd;
+        memcpy(&e->it[i].events, ev, 4);
+        memcpy(&e->it[i].data, ev + 4, 8);
+        return 0;
+    case 2:                                                         /* EPOLL_CTL_DEL */
+        if (i == e->n) return err(LX_ENOENT);
+        memmove(&e->it[i], &e->it[i + 1], (e->n - i - 1) * sizeof(ep_item_t));
+        e->n--;
+        return 0;
+    default:
+        return err(LX_EINVAL);
+    }
+}
+
 /* ---- Blocked calls, retried (#249) ---- */
 
 static int64_t dispatch(process_t* p, uint64_t nr, bool* handled);
 
 static bool retryable(const process_t* p) {
     if (p->state != PROCESS_STATE_BLOCKED) return false;
-    return p->wait_reason == WAIT_INPUT || p->wait_reason == WAIT_PIPE || p->wait_reason == WAIT_POLL;
+    return p->wait_reason == WAIT_INPUT || p->wait_reason == WAIT_PIPE || p->wait_reason == WAIT_POLL ||
+           p->wait_reason == WAIT_NET;
 }
 
 /* A pipe or the console changed: every blocked read, write, and poll tries
@@ -1239,7 +1571,7 @@ void files_retry_waiters(void) {
             if (!retryable(p) || !fdt(p)) continue;
             uint64_t nr = p->wait_aux;
             int64_t r;
-            if (nr == 7 || nr == 271 || nr == 23 || nr == 270) {
+            if (is_poll_call(nr)) {
                 r = poll_call(p, nr, true);
             } else {
                 bool handled;
@@ -1249,15 +1581,17 @@ void files_retry_waiters(void) {
             machine_wake(p, r);
             woke = true;
         }
+        g_changed |= net_changed();
         if (!woke && !g_changed) return;
     }
 }
 
-bool files_console_waited(void) {
+bool files_input_waited(void) {
     for (uint32_t i = 0; i < proc_count(); i++) {
         process_t* p = proc_at(i);
         if (p->state != PROCESS_STATE_BLOCKED) continue;
-        if (p->wait_reason == WAIT_INPUT || (p->wait_reason == WAIT_POLL && (p->wait_obj & POLL_CONSOLE))) {
+        if (p->wait_reason == WAIT_INPUT || (p->wait_reason == WAIT_POLL && (p->wait_obj & POLL_CONSOLE)) ||
+            (p->wait_reason == WAIT_NET && (p->wait_obj >> 32))) {
             return true;
         }
     }
@@ -1360,6 +1694,46 @@ static int64_t dispatch(process_t* p, uint64_t nr, bool* handled) {
     case 280: r = sys_utimensat(p, (int64_t)a0, a1, a2, a3); break;
     case 137: r = sys_statfs(p, a1); break;                                      /* statfs */
     case 138: r = of_get(p, (int64_t)a0) ? sys_statfs(p, a1) : err(LX_EBADF); break;
+    case 41:  r = sys_socket(p, a0, a1, a2); break;
+    case 42:  r = sys_bind_connect(p, (int64_t)a0, a1, a2, true); break;          /* connect */
+    case 49:  r = sys_bind_connect(p, (int64_t)a0, a1, a2, false); break;         /* bind */
+    case 50: {                                                                   /* listen */
+        int64_t e;
+        ofile_t* o = sock_of(p, (int64_t)a0, &e);
+        r = o ? net_listen((int32_t)o->ino, (int)a1) : e;
+        break;
+    }
+    case 43:  r = sys_accept(p, (int64_t)a0, a1, a2, 0); break;
+    case 288: r = sys_accept(p, (int64_t)a0, a1, a2, a3); break;                 /* accept4 */
+    case 44: {                                                                   /* sendto */
+        int64_t e;
+        ofile_t* o = sock_of(p, (int64_t)a0, &e);
+        r = o ? sock_send(p, o, a1, a2, (uint32_t)a3, a4, a5) : e;
+        break;
+    }
+    case 45: {                                                                   /* recvfrom */
+        int64_t e;
+        ofile_t* o = sock_of(p, (int64_t)a0, &e);
+        r = o ? sock_recv(p, o, a1, a2, (uint32_t)a3, a4, a5) : e;
+        break;
+    }
+    case 46:  r = sys_msg(p, (int64_t)a0, a1, a2, true); break;                  /* sendmsg */
+    case 47:  r = sys_msg(p, (int64_t)a0, a1, a2, false); break;                 /* recvmsg */
+    case 48: {                                                                   /* shutdown */
+        int64_t e;
+        ofile_t* o = sock_of(p, (int64_t)a0, &e);
+        r = o ? net_shutdown((int32_t)o->ino, (int)a1) : e;
+        g_changed |= net_changed();
+        break;
+    }
+    case 51:  r = sys_sockname(p, (int64_t)a0, a1, a2, false); break;            /* getsockname */
+    case 52:  r = sys_sockname(p, (int64_t)a0, a1, a2, true); break;             /* getpeername */
+    case 53:  r = err(97); break;                                                /* socketpair: AF_UNIX */
+    case 54:  r = sys_sockopt(p, (int64_t)a0, a1, a2, a3, a4, false); break;     /* setsockopt */
+    case 55:  r = sys_sockopt(p, (int64_t)a0, a1, a2, a3, a4, true); break;      /* getsockopt */
+    case 213: r = (int64_t)a0 <= 0 ? err(LX_EINVAL) : sys_epoll_create(p, 0); break;
+    case 291: r = sys_epoll_create(p, a0); break;                                /* epoll_create1 */
+    case 233: r = sys_epoll_ctl(p, (int64_t)a0, a1, (int64_t)a2, a3); break;
     case 22:  r = sys_pipe2(p, a0, 0); break;                                    /* pipe */
     case 293: r = sys_pipe2(p, a0, a1); break;                                   /* pipe2 */
     default:
@@ -1372,7 +1746,7 @@ static int64_t dispatch(process_t* p, uint64_t nr, bool* handled) {
 bool files_syscall(process_t* p, uint64_t nr, int64_t* ret) {
     if (!fdt(p)) return false;
     bool handled = true;
-    int64_t r = (nr == 7 || nr == 271 || nr == 23 || nr == 270) ? poll_call(p, nr, false)
+    int64_t r = is_poll_call(nr) ? poll_call(p, nr, false)
                                                                  : dispatch(p, nr, &handled);
     if (!handled) return false;
     if (r == err(E_BLOCK)) {
@@ -1530,6 +1904,42 @@ static void files_save(ksf_writer_t* w, void* ctx) {
         ksf_put(w, q->buf + q->head, first);
         ksf_put(w, q->buf, q->len - first);
     }
+    /* v4: epoll sets (#253). */
+    uint32_t neps = 0;
+    for (uint32_t i = 0; i < g_nep; i++) neps += g_ep[i].used;
+    ksf_put_u32(w, neps);
+    for (uint32_t i = 0; i < g_nep; i++) {
+        if (!g_ep[i].used) continue;
+        ksf_put_u32(w, i);
+        ksf_put_u32(w, g_ep[i].n);
+        ksf_put(w, g_ep[i].it, g_ep[i].n * sizeof(ep_item_t));
+    }
+}
+
+static int epolls_restore(ksf_reader_t* r) {
+    if (g_ep) memset(g_ep, 0, (uint64_t)g_nep * sizeof(epoll_t));
+    uint32_t n = ksf_get_u32(r);
+    for (uint32_t k = 0; k < n && r->ok; k++) {
+        uint32_t id = ksf_get_u32(r);
+        if (id > 4096) return -1;
+        while (id >= g_nep) {
+            uint32_t cap = g_nep ? g_nep * 2 : 8;
+            epoll_t* nn = (epoll_t*)kzalloc((uint64_t)cap * sizeof(epoll_t));
+            if (!nn) return -1;
+            if (g_ep) {
+                memcpy(nn, g_ep, (uint64_t)g_nep * sizeof(epoll_t));
+                kfree(g_ep);
+            }
+            g_ep = nn;
+            g_nep = cap;
+        }
+        epoll_t* e = &g_ep[id];
+        e->used = true;
+        e->n = ksf_get_u32(r);
+        if (e->n > EP_MAX) return -1;
+        ksf_get(r, e->it, e->n * sizeof(ep_item_t));
+    }
+    return r->ok ? 0 : -1;
 }
 
 static void pipes_clear(void) {
@@ -1572,7 +1982,7 @@ static int pipes_restore(ksf_reader_t* r) {
 
 static int files_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
     (void)ctx;
-    if (version < 1 || version > 3) return -1;
+    if (version < 1 || version > 4) return -1;
     pipes_clear();
     /* The process table was rebuilt without descriptor tables; descriptions
      * are rebuilt here, and the inodes' open counts came with the tree. */
@@ -1629,6 +2039,7 @@ static int files_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
         }
     }
     if (version >= 3 && pipes_restore(r) != 0) return -1;
+    if (version >= 4 && epolls_restore(r) != 0) return -1;
     return r->ok ? 0 : -1;
 }
 
@@ -1668,6 +2079,11 @@ static uint32_t files_sum(void* ctx) {
         crc = divergence_checksum(crc, q->buf + q->head, first);
         crc = divergence_checksum(crc, q->buf, q->len - first);
     }
+    for (uint32_t i = 0; i < g_nep; i++) {
+        if (!g_ep[i].used) continue;
+        crc = divergence_checksum(crc, &i, sizeof(i));
+        crc = divergence_checksum(crc, g_ep[i].it, g_ep[i].n * sizeof(ep_item_t));
+    }
     return crc;
 }
 
@@ -1690,7 +2106,7 @@ void files_init(const uint8_t* seed, uint64_t len, const char* seed_name) {
                 len, g_fs.seed_crc);
     }
     static const ksf_subsys_t fs = { KS_ID_FS, "fs", 1, fs_save, fs_restore, fs_sum, 0 };
-    static const ksf_subsys_t files = { KS_ID_FILES, "files", 3, files_save, files_restore, files_sum, 0 };
+    static const ksf_subsys_t files = { KS_ID_FILES, "files", 4, files_save, files_restore, files_sum, 0 };
     if (kstate_register(&fs) != KSF_OK || kstate_register(&files) != KSF_OK) {
         panic("files: cannot register keyframe sections");
     }

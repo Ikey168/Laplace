@@ -59,8 +59,9 @@ bool files_syscall(process_t* p, uint64_t nr, int64_t* ret);
 
 /* Blocked reads, writes, and polls try again (the console got input). */
 void files_retry_waiters(void);
-/* Some process waits for console input (the idle machine must wait too). */
-bool files_console_waited(void);
+/* Some process waits for input from outside (the console, a socket on the
+ * network card): the idle machine must wait too. */
+bool files_input_waited(void);
 /* ^C and ^\ on the console: the signal to every process that has it open. */
 void files_console_signal(uint32_t sig);
 /* A poll or select's deadline passed (before it returns 0). */

@@ -37,7 +37,7 @@ CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
             kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
-            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c kernel/core/kio.c kernel/core/pctl.c kernel/core/ksig.c kernel/core/preempt.c kernel/core/ahci.c kernel/core/pmu.c kernel/core/tty.c \
+            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c kernel/core/kio.c kernel/core/pctl.c kernel/core/ksig.c kernel/core/preempt.c kernel/core/ahci.c kernel/core/pmu.c kernel/core/tty.c kernel/core/e1000.c kernel/core/net.c \
             kernel/core/kfpages.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
@@ -67,7 +67,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 
 # Linux programs (#238): plain C built against musl, unmodified.
 MUSL_CC     ?= musl-gcc
-LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads benchcpu benchalloc pipeline
+LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads benchcpu benchalloc pipeline httpd netloop
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \
@@ -128,9 +128,14 @@ $(BUILD)/rootfs.cpio: tools/mkcpio.py $(shell find rootfs)
 	@mkdir -p $(dir $@)
 	python3 tools/mkcpio.py rootfs $@
 
+# The machine's e1000 on QEMU's user-mode network; guest port 8080 is
+# forwarded to the host's (#253).
+NET_FLAGS ?= -nic user,model=e1000,hostfwd=tcp:127.0.0.1:$(HTTP_PORT)-:8080
+HTTP_PORT ?= 8080
+
 run: kernel $(DISK) $(BUILD)/rootfs.cpio
 	$(QEMU) $(QEMU_FLAGS) -kernel $(BUILD)/laplace.elf -initrd $(BUILD)/rootfs.cpio -append "$(APPEND)" \
-	    -drive file=$(DISK),format=raw,if=ide,index=0 \
+	    -drive file=$(DISK),format=raw,if=ide,index=0 $(NET_FLAGS) \
 	    -serial mon:stdio -serial tcp:127.0.0.1:$(GDB_PORT),server,nowait \
 	    -serial tcp:127.0.0.1:$(MCP_PORT),server,nowait
 

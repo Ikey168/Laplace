@@ -135,6 +135,8 @@ jobs:
         run: bash tests/qemu/preempt_gate.sh
       - name: A Lua session typed on the console and a pipeline replay byte-exact (in QEMU)
         run: python3 tests/qemu/console_gate.py
+      - name: An HTTP server answers the host while recording; it and a loopback pair replay byte-exact (in QEMU)
+        run: python3 tests/qemu/net_gate.py
       - name: "Target: a pthreads lost-update race, traced to the other thread's store (MCP + gdb)"
         run: bash tests/qemu/threads_gate.sh
       - name: "Target: hello world (record, verify, sabotage caught, MCP + gdb backward)"

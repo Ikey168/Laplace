@@ -306,8 +306,10 @@ the recording and continues live, still recording.
   point (no branch counter is used yet).
 - The journaled inputs are the ones programs can see today: preemption, time,
   entropy, and console input (#249: bytes typed on COM1, journaled with the
-  step they are delivered at, `kernel/core/tty.c`). There is no network to
-  journal yet.
+  step they are delivered at, `kernel/core/tty.c`), and network frames
+  (#253: each frame the e1000 received, journaled with the step it is
+  delivered at, `kernel/core/net.c`; what the stack transmits is suppressed
+  in a replay).
 - `rdrand`, `rdseed`, and `rdpid` cannot be trapped: the CPUID table hides
   them, and executing them anyway is a divergence that `verify` names. Without
   CPUID faulting (QEMU TCG), user `cpuid` runs natively: deterministic on one

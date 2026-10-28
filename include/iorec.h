@@ -63,6 +63,7 @@ typedef struct {
 #define IOREC_DEVICE   4     /* device input delivered to the machine */
 #define IOREC_PREEMPT  5     /* an asynchronous preemption point (#245): payload pmatch.h */
 #define IOREC_CONSOLE  6     /* bytes typed on the console (#249): the payload */
+#define IOREC_NET      7     /* a frame the network card received (#253): the payload */
 
 typedef struct {
     uint64_t step;

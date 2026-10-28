@@ -189,6 +189,7 @@ bool machine_quiet(void);
  * repeats an external side effect (#242). Returns the bytes accepted. */
 uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len);
 #define MACHINE_DEV_CONSOLE 0
+#define MACHINE_DEV_NET     1   /* a frame for the network card (#253) */
 
 /* Blocking (#246). A process that waits leaves the run queue with a reason,
  * the object it waits on, and an optional deadline (monotonic ns, 0: none).
@@ -205,6 +206,7 @@ uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len);
 #define WAIT_SIGNAL 6         /* pause, sigsuspend (#250) */
 #define WAIT_GROUP  7         /* a thread group's leader whose own thread exited (#251) */
 #define WAIT_PIPE   8         /* a pipe read or write (#249) */
+#define WAIT_NET    9         /* a socket call (#253) */
 void machine_block(process_t* p, uint32_t reason, uint64_t obj, uint64_t deadline_ns);
 /* Make a blocked process runnable; its system call returns `ret`. */
 void machine_wake(process_t* p, int64_t ret);

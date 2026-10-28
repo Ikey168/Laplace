@@ -94,7 +94,8 @@ bash scripts/test/qemu_persistence_demo.sh   # pull the power, boot, resume
 
 ```bash
 make run    # QEMU: console on stdio, gdb on :1235 (COM2), MCP on :1236 (COM3),
-            # recording to build/disk.img. APPEND="run=counter" picks programs.
+            # recording to build/disk.img, guest port 8080 on the host's :8080.
+            # APPEND="run=counter" picks programs (APPEND="run=musl_httpd": a web server).
 ```
 
 When the machine stops (an assertion, a fault, the last process exiting, or a
@@ -205,6 +206,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Inputs (clock reads, entropy, and later console and network) are one journaled record with payloads of any size: 10 MiB read in one epoch replays byte-exact; a replay whose input call differs from the recording stops at that step and is reported | `tests/qemu/input_gate.sh` |
 | Processes: 50 children fork (copy-on-write), exec, exit, and are reaped with their statuses; kill ends a child; rewinding between a fork and its exec shows both processes in gdb and MCP | `tests/qemu/proc_gate.sh` |
 | Threads: unmodified musl pthreads (mutexes, condition variables, join) record and replay byte-exact; two threads racing on a counter lose updates while recording, replay the same losses, and MCP's watch_last_write traces the overwritten update to the other thread's store | `tests/qemu/threads_gate.sh` |
+| Networking: an HTTP server (epoll, accept4) on the machine's e1000 answers requests from the host through QEMU's port forward while recording (one at a time, four at once, 64 KiB over many segments); the received frames are journaled, and the recording replays byte-exact with the link down; a loopback TCP/UDP client and server pair replays byte-exact | `tests/qemu/net_gate.py` |
 | Console input and pipes: a Lua REPL session typed on COM1 (with line editing) is journaled at the steps it is delivered and replays byte-exact with nothing attached; a shell-style `producer \| consumer` pipeline moves 300000 bytes through read, poll, and select with keyframes mid-pipeline; EOF, EAGAIN, poll timeouts, and EPIPE | `tests/qemu/console_gate.py` |
 | Preemption at any instruction without a counter: two loops with no system call interleave, a loop where only memory changes and `rep movsb` copies are preempted, a spin gets its timer's signals, and each replays byte-exact | `tests/qemu/preempt_gate.sh` |
 | Signals: SIGALRM from a timer interrupts a loop at journaled points with FPU state saved in the frame; a SIGSEGV handler recovers; masks, pending, sigsuspend, sigaltstack; every run replays byte-exact; an unhandled fault or abort() stops the machine and gdb shows the signal and the faulting line | `tests/qemu/signal_gate.sh` |
@@ -222,8 +224,13 @@ Limits, stated plainly:
   such point by trapping on its instruction: a preempted hot loop replays a
   trap or two per iteration slower (no branch counter is used yet), 100 to
   300x the recorded run under TCG ([`docs/benchmarks.md`](docs/benchmarks.md)).
-- The journaled inputs are preemption, clock, entropy, and bytes typed on the
-  console (COM1). There is no network yet (#253).
+- The journaled inputs are preemption, clock, entropy, bytes typed on the
+  console (COM1), and frames the network card received (#253).
+- The network stack (#253) is small: IPv4 only (10.0.2.15 on QEMU's
+  user-mode network), no fragments, TCP that takes segments in order and has
+  no retransmission timer (the virtual link does not lose frames), no
+  TIME_WAIT, AF_INET sockets only (no AF_UNIX, so no `socketpair`), and epoll
+  is level-triggered (`EPOLLET` behaves like level).
 - User `rdtsc`/`rdtscp` are trapped and journaled, and user `cpuid` is answered
   from a recorded, masked table where the CPU has CPUID faulting (KVM, recent
   bare metal; QEMU's emulator has none, so there `cpuid` runs natively).
@@ -254,9 +261,11 @@ Limits, stated plainly:
   `futex`, `gettid`, `tgkill`; signals (#250); and console input, a tty,
   pipes, `poll`, and `select` (#249; ppoll's and pselect6's signal masks are
   not applied). Unimplemented calls return ENOSYS and are logged once.
-  There are no sockets yet (#253). A dynamic loader is loaded at a fixed
-  address (no ASLR), and there is no vDSO, so libc reads the clocks through
-  journaled system calls.
+  Sockets (#253): `socket`, `bind`, `listen`, `accept4`, `connect`,
+  `send`/`recv` and their `to`/`from`/`msg` forms, `shutdown`,
+  `get`/`setsockopt`, `getsockname`/`getpeername`, and `epoll`. A dynamic
+  loader is loaded at a fixed address (no ASLR), and there is no vDSO, so
+  libc reads the clocks through journaled system calls.
 - Recorded history is read-only from the debuggers.
 - Platforms: QEMU TCG and KVM are tested. No real machine has been booted
   yet; the console and debug channels need COM ports, and the only disks are
@@ -352,7 +361,6 @@ Laplace/
 The plan for running real programs (unmodified static Linux binaries, threads
 included) is tracked in #235. Its main steps:
 
-- Networking (#253)
 - A branch counter, where the boot-time probe finds an exact one, to skip
   most of the breakpoint hits a replay of a preempted hot loop takes (#245);
   a bare-metal machine, NVMe, and a debug channel without COM ports (#236)

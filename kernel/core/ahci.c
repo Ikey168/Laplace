@@ -5,28 +5,10 @@
 #include "core/cpu.h"
 #include "core/mm.h"
 #include "core/console.h"
+#include "core/pci.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
-
-/* ---- PCI configuration space (mechanism #1) ---- */
-
-static inline void outl(uint16_t port, uint32_t v) { __asm__ volatile("outl %0, %1" : : "a"(v), "Nd"(port)); }
-static inline uint32_t inl(uint16_t port) {
-    uint32_t v;
-    __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port));
-    return v;
-}
-
-static uint32_t pci_read(uint32_t bus, uint32_t dev, uint32_t fn, uint32_t off) {
-    outl(0xCF8, 0x80000000u | (bus << 16) | (dev << 11) | (fn << 8) | (off & 0xFC));
-    return inl(0xCFC);
-}
-
-static void pci_write(uint32_t bus, uint32_t dev, uint32_t fn, uint32_t off, uint32_t v) {
-    outl(0xCF8, 0x80000000u | (bus << 16) | (dev << 11) | (fn << 8) | (off & 0xFC));
-    outl(0xCFC, v);
-}
 
 /* ---- HBA registers ---- */
 

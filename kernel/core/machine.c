@@ -4,6 +4,8 @@
 #include "core/machine.h"
 #include "core/pmu.h"
 #include "core/tty.h"
+#include "core/net.h"
+#include "core/e1000.h"
 #include "core/files.h"
 #include "core/timetravel.h"
 #include "core/proc.h"
@@ -163,6 +165,7 @@ uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len) {
     if (machine_quiet()) return len;          /* the recording already did it */
     switch (device) {
     case MACHINE_DEV_CONSOLE: console_write((const char*)buf, (uint32_t)len); break;
+    case MACHINE_DEV_NET:     e1000_send((const uint8_t*)buf, (uint32_t)len); break;
     default: break;
     }
     return len;
@@ -602,7 +605,9 @@ static void deliver_wakes(uint64_t step, bool idle) {
             g_wake_step = step;
             for (uint32_t i = 0; i < proc_count(); i++) ksig_fire_due(proc_at(i), now, journal_timer);
         }
-        if (tty_deliver(step, idle)) files_retry_waiters();
+        bool got = tty_deliver(step, idle);
+        got |= net_deliver(step, idle);
+        if (got) files_retry_waiters();
         return;
     }
     uint32_t nr;
@@ -621,7 +626,7 @@ static void deliver_wakes(uint64_t step, bool idle) {
             wake_timed_out(p);
             continue;
         }
-        if (tty_deliver(step, idle)) {
+        if (tty_deliver(step, idle) || net_deliver(step, idle)) {
             files_retry_waiters();
             continue;
         }
@@ -651,11 +656,12 @@ static bool idle_until_wake(void) {
             g_pick_stop = STOP_REQUEST;
             return false;
         }
-        if (!any_deadline() && !files_console_waited()) {
+        if (!any_deadline() && !files_input_waited()) {
             g_pick_stop = STOP_IDLE;          /* nothing can ever wake them */
             return false;
         }
         tty_poll_uart();
+        net_poll_nic();
         deliver_wakes(g_step, true);
         if (proc_next_ready(0)) return true;
         __asm__ volatile("sti; hlt; cli" ::: "memory");
@@ -1086,7 +1092,10 @@ void machine_resume(void) {
     g_diverged = false;
     g_point_at_start = false;
     /* Console input typed while the machine was stopped is not delivered. */
-    if (g_mode == MACHINE_LIVE) tty_discard_pending();
+    if (g_mode == MACHINE_LIVE) {
+        tty_discard_pending();
+        net_discard_pending();
+    }
     if (!g_cur) {
         /* Stopped while everything waited: wait again, then run. */
         if (!pick_next() || !deliver_signals() || !start_segment()) {
@@ -1140,6 +1149,7 @@ static void on_timer(void) {
         if (++g_slice >= MACHINE_SLICE_TICKS) g_need_resched = true;
         tt_on_tick();
         tty_poll_uart();
+        net_poll_nic();
         if (serial_rx_ready(PORT_GDB) || serial_rx_ready(PORT_MCP)) g_stop_request = true;
     }
     pic_eoi(0);
@@ -1163,7 +1173,7 @@ static bool deadline_due(void) {
  * passed, a keyframe is due, or a debugger asked to stop. */
 static bool async_entry_wanted(void) {
     if (g_mode != MACHINE_LIVE || !g_cur) return false;
-    if (g_stop_request || tt_entry_wanted() || tty_pending()) return true;
+    if (g_stop_request || tt_entry_wanted() || tty_pending() || net_pending()) return true;
     if (g_need_resched) {
         process_t* next = proc_next_ready(g_cur);
         if (next && next != g_cur) return true;

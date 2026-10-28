@@ -41,6 +41,7 @@
 #include "core/ahci.h"
 #include "core/pmu.h"
 #include "core/tty.h"
+#include "core/net.h"
 #include "core/kfpages.h"
 #include "core/monitor.h"
 #include "core/clock.h"
@@ -571,6 +572,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     files_init(seed ? seed->start : 0, seed ? (uint64_t)(seed->end - seed->start) : 0,
                seed ? seed->name : "");
     tty_init();
+    net_init();
     ksig_init();
     preempt_init();
     kdiverge_init();
