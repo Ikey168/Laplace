@@ -11,6 +11,9 @@
 
 static __thread int tls_counter = 41;
 volatile int g_greeted;   /* set before the greeting: a store the gates find backward (#256) */
+/* The random bytes, kept: a replay that reads other ones ends in another
+ * state (the stack copy is overwritten before the epoch ends). */
+volatile unsigned char g_random[8];
 
 int main(int argc, char** argv) {
     struct utsname u;
@@ -19,6 +22,7 @@ int main(int argc, char** argv) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     unsigned char r[8];
     ssize_t n = getrandom(r, sizeof(r), 0);
+    for (int i = 0; i < 8; i++) g_random[i] = r[i];
     tls_counter++;
     g_greeted = 1;
     printf("hello from %s on %s %s (argc %d, pid %d, tls %d, getrandom %zd, clock %s)\n",
