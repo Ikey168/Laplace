@@ -76,6 +76,13 @@ address space.
   executable (`qXfer:exec-file:read`) and reads it over host I/O (`vFile`),
   so `target remote :1235` needs no file argument ("Reading symbols from
   target:/musl_threads").
+- **Shared libraries** of a dynamically linked program (#254): the stub
+  serves the auxiliary vector (`qXfer:auxv:read`), so gdb finds a PIE's load
+  address, and the dynamic loader's list of loaded objects
+  (`qXfer:libraries-svr4:read`, from `r_debug` through the program's
+  `DT_DEBUG`). gdb then reads each library from the target ("target:/lib/
+  x86_64-linux-gnu/libc.so.6") and loads its symbols: `info sharedlibrary`,
+  `break write`, and `reverse-continue` work in libc.
 - **The register file** follows a target description (`qXfer:features:read`):
   amd64 GNU/Linux with x87, SSE, AVX (`info registers xmm0`, `$ymm0`),
   `orig_rax`, and `$fs_base`/`$gs_base`.

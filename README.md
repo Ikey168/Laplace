@@ -198,6 +198,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Raw `rdtsc`/`rdtscp`/`cpuid` in user code replay exactly; a divergence names the instruction that caused it | `tests/qemu/determinism_gate.sh` |
 | x87/SSE/AVX state survives preemption, is in every keyframe, and is part of what replay verifies | `tests/qemu/fpu_gate.sh`, `make selftest` |
 | Unmodified static Linux programs (musl) run; their clock and random reads replay exactly | `tests/qemu/linux_gate.sh` |
+| Dynamically linked programs: a musl PIE through `ld-musl`, and the distribution's `lua5.4` package through glibc's `ld-linux` with libc, libm, libreadline, and libtinfo from the seed image, record and replay byte-exact (sabotage caught); gdb, with no file argument, lists the shared libraries (`qXfer:libraries-svr4`, `qXfer:auxv`), loads their symbols, and reverse-continues to `write` in libc | `tests/qemu/dynamic_gate.py` |
 | Programs load from outside the kernel (Multiboot modules, static and static-PIE) with argv and envp; a recording refuses to resume with changed binaries | `tests/qemu/loader_gate.sh` |
 | malloc, `mmap`/`munmap`/`mprotect`/`mremap`, `brk`, and a demand-paged stack replay exactly with keyframes between the calls, at 512 MiB and 4 GiB of RAM | `tests/qemu/vm_gate.sh` |
 | Files: a seed image, then a program's own files, in keyframes and checksums; unmodified Lua 5.4 runs a script from the image, writes a file and reads it back, and replays byte-exact; a recording refuses another seed | `tests/qemu/files_gate.sh` |
@@ -235,9 +236,11 @@ Limits, stated plainly:
 - x87, SSE, and AVX state is saved and verified (#237); AVX-512 is not enabled
   in XCR0, so programs see no AVX-512.
 - Workloads are Laplace's own programs (`user/laplace/`, `int 0x80`) and
-  unmodified static Linux programs (`musl-gcc -static` or `-static-pie`, the
-  Linux `syscall` ABI, #238), embedded in the kernel (`user/linux/`) or passed
-  as Multiboot modules (`-initrd`, #240). The
+  unmodified Linux programs (the Linux `syscall` ABI, #238): static ones
+  (`musl-gcc -static` or `-static-pie`), embedded in the kernel
+  (`user/linux/`) or passed as Multiboot modules (`-initrd`, #240), and
+  dynamically linked ones (#254) whose loader and libraries are in the seed
+  image: musl's, and a distribution's glibc programs. The
   Linux interface so far covers startup, TLS, stdio to the console, the clocks,
   `getrandom`, memory (`brk`, `mmap`, `munmap`, `mprotect`, `mremap`,
   `madvise`, with pages mapped on first touch, #239), and files (#247): a
@@ -251,7 +254,9 @@ Limits, stated plainly:
   `futex`, `gettid`, `tgkill`; signals (#250); and console input, a tty,
   pipes, `poll`, and `select` (#249; ppoll's and pselect6's signal masks are
   not applied). Unimplemented calls return ENOSYS and are logged once.
-  Programs must be static: no dynamic linker yet (#254), no sockets (#253).
+  There are no sockets yet (#253). A dynamic loader is loaded at a fixed
+  address (no ASLR), and there is no vDSO, so libc reads the clocks through
+  journaled system calls.
 - Recorded history is read-only from the debuggers.
 - Platforms: QEMU TCG and KVM are tested. No real machine has been booted
   yet; the console and debug channels need COM ports, and the only disks are
@@ -347,7 +352,7 @@ Laplace/
 The plan for running real programs (unmodified static Linux binaries, threads
 included) is tracked in #235. Its main steps:
 
-- Networking (#253); dynamically linked binaries (#254)
+- Networking (#253)
 - A branch counter, where the boot-time probe finds an exact one, to skip
   most of the breakpoint hits a replay of a preempted hot loop takes (#245);
   a bare-metal machine, NVMe, and a debug channel without COM ports (#236)

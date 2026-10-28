@@ -99,8 +99,8 @@ static memfs_t   g_fs;
 static ofile_t*  g_of;
 static uint32_t  g_nof;
 static uint64_t  g_fs_now;           /* file times: the last wall time read */
-static lp_image_t g_seed_images[8];  /* programs loaded from the seed */
-static char      g_seed_paths[8][64];
+static lp_image_t g_seed_images[32]; /* programs and libraries loaded from the seed */
+static char      g_seed_paths[32][96];
 static uint32_t  g_nseed_images;
 
 static fdt_t* fdt(process_t* p) { return (fdt_t*)p->files; }

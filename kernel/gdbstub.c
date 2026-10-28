@@ -308,6 +308,8 @@ int gdbstub_handle_session(const gdbstub_ops_t* ops, gdbstub_session_t* s,
         if (ops && ops->cont) puts_(&o, ";vContSupported+");
         if (ops && ops->read_regs) puts_(&o, ";qXfer:features:read+");
         if (ops && ops->exec_file) puts_(&o, ";qXfer:exec-file:read+");
+        if (ops && ops->auxv) puts_(&o, ";qXfer:auxv:read+");
+        if (ops && ops->libraries) puts_(&o, ";qXfer:libraries-svr4:read+");
         return done(&o);
     }
 
@@ -423,6 +425,25 @@ int gdbstub_handle_session(const gdbstub_ops_t* ops, gdbstub_session_t* s,
         i++;
         if (!parse_hex(packet, plen, &i, &len)) return emit(out, outcap, "E01");
         return xfer_string(&o, g_tdesc, sizeof(g_tdesc) - 1, off, len);
+    }
+    /* The auxiliary vector and the shared libraries (#254): "qXfer:auxv:read:",
+     * "qXfer:libraries-svr4:read:", an annex (ignored), ':', then off,len. */
+    bool want_auxv = has_prefix(packet, plen, "qXfer:auxv:read:") && ops->auxv;
+    bool want_libs = has_prefix(packet, plen, "qXfer:libraries-svr4:read:") && ops->libraries;
+    if (want_auxv || want_libs) {
+        uint32_t i = want_auxv ? 16 : 26;
+        while (i < plen && packet[i] != ':') i++;          /* annex (ignored) */
+        if (i >= plen) return emit(out, outcap, "E01");
+        i++;
+        uint64_t off, len;
+        if (!parse_hex(packet, plen, &i, &off) || i >= plen || packet[i] != ',') return emit(out, outcap, "E01");
+        i++;
+        if (!parse_hex(packet, plen, &i, &len)) return emit(out, outcap, "E01");
+        static char doc[8192];
+        int n = want_auxv ? ops->auxv(ops->ctx, 0, (uint8_t*)doc, sizeof(doc))
+                          : ops->libraries(ops->ctx, 0, doc, sizeof(doc));
+        if (n < 0) return emit(out, outcap, "E00");
+        return xfer_string(&o, doc, (uint64_t)n, off, len);
     }
     /* The program, so gdb needs no file argument (#252). */
     if (has_prefix(packet, plen, "qXfer:exec-file:read:") && ops->exec_file) {

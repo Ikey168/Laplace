@@ -67,6 +67,14 @@ typedef struct {
     int64_t (*file_size)(void* ctx, int handle);
     int     (*file_pread)(void* ctx, int handle, uint64_t off, uint8_t* buf, uint32_t len);
     void    (*file_close)(void* ctx, int handle);
+
+    /* #254: thread group `pid`'s auxiliary vector (binary, as Linux lays it
+     * out: qXfer:auxv:read) and its shared libraries as a
+     * <library-list-svr4> document (qXfer:libraries-svr4:read), so gdb finds
+     * a PIE's load address and loads the libraries' symbols. Each returns
+     * its length, or -1. */
+    int (*auxv)(void* ctx, uint32_t pid, uint8_t* out, uint32_t cap);
+    int (*libraries)(void* ctx, uint32_t pid, char* out, uint32_t cap);
 } gdbstub_ops_t;
 
 /* The register file, in the order of the target description the stub serves

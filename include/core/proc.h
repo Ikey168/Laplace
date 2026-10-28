@@ -92,7 +92,12 @@ typedef struct {
     uint64_t clear_child_tid;        /* set_tid_address (#238) */
     uint64_t brk_start;              /* the heap (#239): first byte */
     uint64_t brk_cur;                /*   and the current break */
-    uint8_t  reserved[24];
+    /* What the auxiliary vector said (#254), for gdb's qXfer:auxv. */
+    uint64_t at_phdr;
+    uint64_t at_entry;
+    uint64_t at_base;                /* the dynamic loader's, or 0 */
+    uint32_t at_phnum;
+    uint8_t  reserved[60];
     uint8_t  fpu[FPU_AREA_MAX];      /* 64-byte aligned: lp_arch_t is */
 } __attribute__((aligned(64))) lp_arch_t;
 

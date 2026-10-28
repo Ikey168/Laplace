@@ -27,6 +27,8 @@
 #include "gdbstub.h"
 #include "divergence.h"
 
+void* memcpy(void* dst, const void* src, size_t n);
+
 void* memset(void* dst, int c, size_t n);
 size_t strlen(const char* s);
 int strncmp(const char* a, const char* b, size_t n);
@@ -164,7 +166,98 @@ static int op_exec_file(void* c, uint32_t pid, char* out, uint32_t cap) {
     return n < (int)cap ? n : -1;
 }
 
-#define MAX_OPEN_IMAGES 8
+/* ---- Dynamically linked programs (#254) ---- */
+
+static process_t* group_of(uint32_t pid) {
+    process_t* p = pid ? proc_by_pid(pid) : thread_proc(0);
+    if (p && p->tgid && (uint32_t)p->pid != p->tgid) {
+        process_t* leader = proc_by_pid(p->tgid);
+        if (leader) p = leader;
+    }
+    return p;
+}
+
+static int op_auxv(void* c, uint32_t pid, uint8_t* out, uint32_t cap) {
+    (void)c;
+    process_t* p = group_of(pid);
+    if (!p) return -1;
+    const lp_arch_t* a = proc_arch(p);
+    const uint64_t v[][2] = {
+        { 3, a->at_phdr }, { 4, 56 }, { 5, a->at_phnum }, { 6, PAGE_SIZE },
+        { 7, a->at_base }, { 9, a->at_entry }, { 0, 0 },
+    };
+    if (sizeof(v) > cap) return -1;
+    memcpy(out, v, sizeof(v));
+    return (int)sizeof(v);
+}
+
+static bool rd(process_t* p, uint64_t addr, void* buf, uint32_t len) {
+    return addr && uaccess_read(p->address_space, addr, buf, len);
+}
+
+/* The dynamic loader's r_debug (through the program's DT_DEBUG), or 0. */
+static uint64_t find_r_debug(process_t* p) {
+    const lp_arch_t* a = proc_arch(p);
+    uint64_t bias = 0, dyn = 0;
+    bool have_bias = false;
+    for (uint32_t i = 0; i < a->at_phnum && i < 64; i++) {
+        uint32_t ph[2];
+        uint64_t vaddr;
+        if (!rd(p, a->at_phdr + 56ULL * i, ph, 8) || !rd(p, a->at_phdr + 56ULL * i + 16, &vaddr, 8)) return 0;
+        if (ph[0] == 6) { bias = a->at_phdr - vaddr; have_bias = true; }   /* PT_PHDR */
+        if (ph[0] == 2) dyn = vaddr;                                       /* PT_DYNAMIC */
+    }
+    if (!dyn || !have_bias) return 0;
+    for (uint32_t i = 0; i < 512; i++) {
+        uint64_t d[2];
+        if (!rd(p, bias + dyn + 16ULL * i, d, 16) || d[0] == 0) return 0;
+        if (d[0] == 21) return d[1];                                       /* DT_DEBUG */
+    }
+    return 0;
+}
+
+static void put_xml_str(char* out, uint32_t cap, uint32_t* n, const char* s) {
+    for (; *s && *n + 7 < cap; s++) {
+        const char* e = *s == '&' ? "&amp;" : *s == '<' ? "&lt;" : *s == '>' ? "&gt;" : *s == '"' ? "&quot;" : 0;
+        if (e) {
+            while (*e) out[(*n)++] = *e++;
+        } else {
+            out[(*n)++] = *s;
+        }
+    }
+}
+
+/* The loader's list of loaded objects (r_debug.r_map), the program first. */
+static int op_libraries(void* c, uint32_t pid, char* out, uint32_t cap) {
+    (void)c;
+    process_t* p = group_of(pid);
+    if (!p) return -1;
+    uint64_t rdebug = find_r_debug(p), map = 0;
+    if (rdebug) rd(p, rdebug + 8, &map, 8);
+    uint32_t n = (uint32_t)ksnprintf(out, cap, "<library-list-svr4 version=\"1.0\"");
+    if (map) n += (uint32_t)ksnprintf(out + n, cap - n, " main-lm=\"0x%lx\"", map);
+    n += (uint32_t)ksnprintf(out + n, cap - n, ">");
+    uint64_t lm = map;
+    for (uint32_t k = 0; lm && k < 64 && n + 300 < cap; k++) {
+        uint64_t f[4];                                  /* l_addr, l_name, l_ld, l_next */
+        if (!rd(p, lm, f, sizeof(f))) break;
+        char name[160];
+        uint32_t len = 0;
+        while (len < sizeof(name) - 1 && rd(p, f[1] + len, &name[len], 1) && name[len]) len++;
+        name[len] = 0;
+        if (k > 0 && name[0]) {                         /* the first is the program itself */
+            n += (uint32_t)ksnprintf(out + n, cap - n, "<library name=\"");
+            put_xml_str(out, cap, &n, name);
+            n += (uint32_t)ksnprintf(out + n, cap - n, "\" lm=\"0x%lx\" l_addr=\"0x%lx\" l_ld=\"0x%lx\"/>",
+                                     lm, f[0], f[2]);
+        }
+        lm = f[3];
+    }
+    n += (uint32_t)ksnprintf(out + n, cap - n, "</library-list-svr4>");
+    return n < cap ? (int)n : -1;
+}
+
+#define MAX_OPEN_IMAGES 16
 static const lp_image_t* g_open_images[MAX_OPEN_IMAGES];
 
 static int op_file_open(void* c, const char* path) {
@@ -312,6 +405,8 @@ static gdbstub_ops_t g_target = {
     .file_size = op_file_size,
     .file_pread = op_file_pread,
     .file_close = op_file_close,
+    .auxv = op_auxv,
+    .libraries = op_libraries,
 };
 
 void gdb_target_init(void) {

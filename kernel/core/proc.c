@@ -348,13 +348,14 @@ static uint64_t push_str(ustack_t* u, const char* str) {
     return push_bytes(u, str, n + 1);
 }
 
-/* argv, envp, and the auxiliary vector a static Linux binary's startup code
- * reads. No AT_SYSINFO_EHDR: without a vDSO, libc reads the time through a
- * (journaled) system call. AT_RANDOM's bytes come from the entropy source;
- * they are in the first keyframe. `base` is the load bias (static-PIE). */
+/* argv, envp, and the auxiliary vector a Linux program's startup code (or its
+ * dynamic loader, at `interp_base`: AT_BASE) reads. No AT_SYSINFO_EHDR:
+ * without a vDSO, libc reads the time through a (journaled) system call.
+ * AT_RANDOM's bytes come from the entropy source; they are in the first
+ * keyframe. `base` is the program's load bias (a PIE). */
 #define MAX_ARGS 64
 static bool linux_initial_stack(process_t* p, const elf64_ehdr_t* eh, uint64_t phdr_va,
-                                uint64_t base, uint64_t top, const proc_args_t* a) {
+                                uint64_t base, uint64_t interp_base, uint64_t top, const proc_args_t* a) {
     ustack_t u = { p->address_space, top, true };
     uint32_t argc = a->argc < MAX_ARGS ? a->argc : MAX_ARGS;
     uint32_t envc = a->envc < MAX_ARGS ? a->envc : MAX_ARGS;
@@ -372,7 +373,7 @@ static bool linux_initial_stack(process_t* p, const elf64_ehdr_t* eh, uint64_t p
     cpu_cpuid(1, 0, r);
     const uint64_t aux[][2] = {
         { AT_PHDR, phdr_va }, { AT_PHENT, eh->phentsize }, { AT_PHNUM, eh->phnum },
-        { AT_PAGESZ, PAGE_SIZE }, { AT_BASE, 0 }, { AT_FLAGS, 0 }, { AT_ENTRY, base + eh->entry },
+        { AT_PAGESZ, PAGE_SIZE }, { AT_BASE, interp_base }, { AT_FLAGS, 0 }, { AT_ENTRY, base + eh->entry },
         { AT_UID, 0 }, { AT_EUID, 0 }, { AT_GID, 0 }, { AT_EGID, 0 },
         { AT_PLATFORM, plat_ptr }, { AT_HWCAP, r[3] }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
         { AT_RANDOM, rand_ptr }, { AT_HWCAP2, 0 }, { AT_EXECFN, exec_ptr }, { AT_NULL, 0 },
@@ -385,6 +386,11 @@ static bool linux_initial_stack(process_t* p, const elf64_ehdr_t* eh, uint64_t p
         push_u64(&u, aux[i][1]);
         push_u64(&u, aux[i][0]);
     }
+    lp_arch_t* arch = proc_arch(p);
+    arch->at_phdr = phdr_va;
+    arch->at_entry = base + eh->entry;
+    arch->at_base = interp_base;
+    arch->at_phnum = eh->phnum;
     push_u64(&u, 0);
     for (uint32_t i = envc; i-- > 0;) push_u64(&u, envq[i]);
     push_u64(&u, 0);
@@ -397,33 +403,27 @@ static bool linux_initial_stack(process_t* p, const elf64_ehdr_t* eh, uint64_t p
 #define PT_INTERP    3
 #define ET_DYN       3
 #define PIE_BASE     0x555555554000ULL   /* where Linux puts a PIE (no ASLR) */
+/* The dynamic loader (#254): just above the mmap area, below the stack. */
+#define INTERP_BASE  LP_MMAP_TOP
 
-static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux_abi,
-                     const proc_args_t* args) {
+static bool elf_ok(const uint8_t* img, uint64_t size) {
     const elf64_ehdr_t* eh = (const elf64_ehdr_t*)img;
-    if (size < sizeof(*eh) || eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
-        eh->ident[2] != 'L' || eh->ident[3] != 'F' || eh->ident[4] != 2 ||
-        eh->machine != 62 /* EM_X86_64 */) {
-        return false;
-    }
-    vm_space_t* s = p->address_space;
-    uint64_t phdr_va = 0;
-    uint64_t brk = 0;             /* the page after the highest segment */
-    /* A static PIE is loaded at a fixed base; a program that needs a dynamic
-     * loader is not supported yet (#254). */
-    uint64_t base = eh->type == ET_DYN ? PIE_BASE : 0;
-    for (uint16_t i = 0; i < eh->phnum; i++) {
-        const elf64_phdr_t* ph = (const elf64_phdr_t*)(img + eh->phoff + (uint64_t)i * eh->phentsize);
-        if (ph->type == PT_INTERP) {
-            kprintf("load: %s is dynamically linked; not supported yet\n", p->name);
-            return false;
-        }
-    }
+    return size >= sizeof(*eh) && eh->ident[0] == 0x7F && eh->ident[1] == 'E' && eh->ident[2] == 'L' &&
+           eh->ident[3] == 'F' && eh->ident[4] == 2 && eh->machine == 62 /* EM_X86_64 */ &&
+           eh->phoff + (uint64_t)eh->phnum * eh->phentsize <= size;
+}
+
+/* Map an ELF image's PT_LOAD segments at `base` and copy their bytes. The
+ * program headers' address (if a segment holds them) and the page after
+ * the highest segment are returned. */
+static bool map_segments(vm_space_t* s, const uint8_t* img, uint64_t size, uint64_t base,
+                         const char* what, uint64_t* phdr_va, uint64_t* top) {
+    const elf64_ehdr_t* eh = (const elf64_ehdr_t*)img;
     for (uint16_t i = 0; i < eh->phnum; i++) {
         const elf64_phdr_t* ph = (const elf64_phdr_t*)(img + eh->phoff + (uint64_t)i * eh->phentsize);
         if (ph->type != PT_LOAD || ph->memsz == 0) continue;
-        if (eh->phoff >= ph->offset && eh->phoff < ph->offset + ph->filesz) {
-            phdr_va = base + ph->vaddr + (eh->phoff - ph->offset);
+        if (phdr_va && eh->phoff >= ph->offset && eh->phoff < ph->offset + ph->filesz) {
+            *phdr_va = base + ph->vaddr + (eh->phoff - ph->offset);
         }
         uint64_t vaddr = base + ph->vaddr;
         if (vaddr < LP_USER_BASE || vaddr + ph->memsz > LP_USER_END ||
@@ -432,13 +432,15 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
         }
         uint64_t start = vaddr & ~0xFFFULL;
         uint64_t end = PAGE_ALIGN(vaddr + ph->memsz);
-        if (end > brk) brk = end;
+        if (end > *top) *top = end;
         bool writable = (ph->flags & PF_W) != 0;
         uint32_t rflags = VMM_FLAG_READ | VMM_FLAG_USER |
                           (writable ? VMM_FLAG_WRITE : 0) | ((ph->flags & PF_X) ? VMM_FLAG_EXEC : 0);
-        if (!vmm_create_region(s, start, end - start, rflags,
-                               writable ? VMM_REGION_DATA : VMM_REGION_CODE,
-                               writable ? "data" : "text")) {
+        /* Two segments can share a page: a region covers it once. */
+        vm_region_t* r = vmm_find_region(s, start);
+        uint64_t from = r ? (r->end_addr < end ? r->end_addr : end) : start;
+        if (from < end && !vmm_create_region(s, from, end - from, rflags,
+                                             writable ? VMM_REGION_DATA : VMM_REGION_CODE, what)) {
             return false;
         }
         uint32_t pte_flags = PAGE_USER | (writable ? PAGE_WRITABLE : 0);
@@ -453,6 +455,46 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
             memcpy(P2V(vmm_get_physical_addr(s, va)), img + ph->offset + off, chunk);
             off += chunk;
         }
+    }
+    return true;
+}
+
+static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux_abi,
+                     const proc_args_t* args) {
+    if (!elf_ok(img, size)) return false;
+    const elf64_ehdr_t* eh = (const elf64_ehdr_t*)img;
+    vm_space_t* s = p->address_space;
+    uint64_t phdr_va = 0;
+    uint64_t brk = 0;             /* the page after the highest segment */
+    /* A PIE (static or not) is loaded at a fixed base. */
+    uint64_t base = eh->type == ET_DYN ? PIE_BASE : 0;
+    /* A dynamically linked program (#254): its loader comes from the
+     * filesystem, and the program starts there. */
+    const lp_image_t* interp = 0;
+    for (uint16_t i = 0; i < eh->phnum; i++) {
+        const elf64_phdr_t* ph = (const elf64_phdr_t*)(img + eh->phoff + (uint64_t)i * eh->phentsize);
+        if (ph->type != PT_INTERP) continue;
+        char path[128];
+        uint64_t n = ph->filesz < sizeof(path) ? ph->filesz : sizeof(path) - 1;
+        if (!linux_abi || ph->offset + n > size) return false;
+        memcpy(path, img + ph->offset, n);
+        path[n] = 0;
+        interp = files_find_image(path);
+        if (!interp || !elf_ok(interp->start, (uint64_t)(interp->end - interp->start)) ||
+            ((const elf64_ehdr_t*)interp->start)->type != ET_DYN) {
+            kprintf("load: %s needs the dynamic loader %s, which is not in the filesystem\n", p->name, path);
+            return false;
+        }
+    }
+    if (!map_segments(s, img, size, base, "text", &phdr_va, &brk)) return false;
+    uint64_t entry = base + eh->entry;
+    if (interp) {
+        uint64_t itop = 0;
+        if (!map_segments(s, interp->start, (uint64_t)(interp->end - interp->start), INTERP_BASE, "interp",
+                          0, &itop)) {
+            return false;
+        }
+        entry = INTERP_BASE + ((const elf64_ehdr_t*)interp->start)->entry;
     }
     /* Stack. A Linux program's is 8 MiB at the top of the lower half, its
      * pages mapped as they are touched (#239); an embedded program's is a few
@@ -470,16 +512,16 @@ static bool load_elf(process_t* p, const uint8_t* img, uint64_t size, bool linux
     if (linux_abi) vm_set_brk(p, brk);
 
     memset(&p->context, 0, sizeof(p->context));
-    p->context.rip = base + eh->entry;
+    p->context.rip = entry;
     p->context.rsp = stack_top - 8;        /* as if _start had been called */
     p->context.rflags = RFLAGS_IF | 0x2;
     p->context.cs = SEL_UCODE;
     p->context.ss = SEL_UDATA;
     p->context.ds = p->context.es = SEL_UDATA;
-    p->entry_point = base + eh->entry;
+    p->entry_point = entry;
     p->stack_start = stack_lo;
     p->stack_end = stack_top;
-    if (linux_abi) return linux_initial_stack(p, eh, phdr_va, base, stack_top, args);
+    if (linux_abi) return linux_initial_stack(p, eh, phdr_va, base, interp ? INTERP_BASE : 0, stack_top, args);
     return true;
 }
 
