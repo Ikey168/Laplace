@@ -3,6 +3,8 @@
 
 #include "core/machine.h"
 #include "core/pmu.h"
+#include "core/tty.h"
+#include "core/files.h"
 #include "core/timetravel.h"
 #include "core/proc.h"
 #include "core/mm.h"
@@ -532,7 +534,13 @@ void machine_wake(process_t* p, int64_t ret) {
 }
 
 int64_t machine_timeout_result(uint32_t reason) {
-    return reason == WAIT_SLEEP ? 0 : -110;   /* ETIMEDOUT */
+    return reason == WAIT_SLEEP || reason == WAIT_POLL ? 0 : -110;   /* ETIMEDOUT */
+}
+
+/* A deadline passed: the wait ends with its timeout result. */
+static void wake_timed_out(process_t* p) {
+    if (p->wait_reason == WAIT_POLL) files_poll_timed_out(p);
+    machine_wake(p, machine_timeout_result(p->wait_reason));
 }
 
 static bool any_deadline(void) {
@@ -559,32 +567,47 @@ static bool any_blocked(void) {
 }
 
 /* Wakes due at `step`. Recording: deadlines that passed, by the clock, each
- * journaled. Replaying: the journaled ones for this step. */
-static void deliver_wakes(uint64_t step) {
+ * journaled, then console input (#249). Replaying: the journaled ones for
+ * this step, in their order. `idle`: called while the machine waits for a
+ * wake, before the entry `step` (console input is told apart by it). */
+static void deliver_wakes(uint64_t step, bool idle) {
     if (g_mode == MACHINE_LIVE) {
-        if (!any_deadline()) return;
-        uint64_t now = clock_now_unrecorded();
-        g_wake_step = step;
-        for (uint32_t i = 0; i < proc_count(); i++) {
-            process_t* p = proc_at(i);
-            if (p->state != PROCESS_STATE_BLOCKED || !p->wait_deadline || p->wait_deadline > now) continue;
-            kio_event(IOREC_DEVICE, WAKE_TIMER, (uint64_t)p->pid, step);
-            machine_wake(p, machine_timeout_result(p->wait_reason));
+        if (any_deadline()) {
+            uint64_t now = clock_now_unrecorded();
+            g_wake_step = step;
+            for (uint32_t i = 0; i < proc_count(); i++) {
+                process_t* p = proc_at(i);
+                if (p->state != PROCESS_STATE_BLOCKED || !p->wait_deadline || p->wait_deadline > now) continue;
+                kio_event(IOREC_DEVICE, WAKE_TIMER, (uint64_t)p->pid, step);
+                wake_timed_out(p);
+            }
+            g_wake_step = step;
+            for (uint32_t i = 0; i < proc_count(); i++) ksig_fire_due(proc_at(i), now, journal_timer);
         }
-        g_wake_step = step;
-        for (uint32_t i = 0; i < proc_count(); i++) ksig_fire_due(proc_at(i), now, journal_timer);
+        if (tty_deliver(step, idle)) files_retry_waiters();
         return;
     }
     uint32_t nr;
     uint64_t arg;
-    while (kio_event_next(IOREC_DEVICE, step, &nr, &arg)) {
-        process_t* p = proc_by_pid((uint32_t)arg);
-        if (nr == WAKE_SIGTIMER && p) {
-            ksig_fire(p, (uint32_t)(arg >> 32));
+    for (;;) {
+        if (kio_event_next(IOREC_DEVICE, step, &nr, &arg)) {
+            process_t* p = proc_by_pid((uint32_t)arg);
+            if (nr == WAKE_SIGTIMER && p) {
+                ksig_fire(p, (uint32_t)(arg >> 32));
+                continue;
+            }
+            if (nr != WAKE_TIMER || !p || p->state != PROCESS_STATE_BLOCKED) {
+                machine_stop_diverged();
+                return;
+            }
+            wake_timed_out(p);
             continue;
         }
-        if (nr != WAKE_TIMER || !p || p->state != PROCESS_STATE_BLOCKED) machine_stop_diverged();
-        machine_wake(p, machine_timeout_result(p->wait_reason));
+        if (tty_deliver(step, idle)) {
+            files_retry_waiters();
+            continue;
+        }
+        return;
     }
 }
 
@@ -610,11 +633,12 @@ static bool idle_until_wake(void) {
             g_pick_stop = STOP_REQUEST;
             return false;
         }
-        if (!any_deadline()) {
+        if (!any_deadline() && !files_console_waited()) {
             g_pick_stop = STOP_IDLE;          /* nothing can ever wake them */
             return false;
         }
-        deliver_wakes(g_step);
+        tty_poll_uart();
+        deliver_wakes(g_step, true);
         if (proc_next_ready(0)) return true;
         __asm__ volatile("sti; hlt; cli" ::: "memory");
     }
@@ -632,7 +656,7 @@ static bool pick_next(void) {
         if (g_mode == MACHINE_LIVE) {
             if (!idle_until_wake()) return false;
         } else {
-            deliver_wakes(g_step);
+            deliver_wakes(g_step, true);
             if (!proc_next_ready(0)) {
                 /* The recording stopped here, everything waiting. */
                 g_pick_stop = replay_stop_here();
@@ -901,7 +925,7 @@ static bool start_segment(void) {
 
 static bool complete_entry(void) {
     uint64_t step = g_step;
-    deliver_wakes(step);                  /* before the entry: same order in a replay */
+    deliver_wakes(step, false);           /* before the entry: same order in a replay */
     trace_entry(step);
     if (handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
     g_step = step + 1;
@@ -997,6 +1021,8 @@ void machine_start(void) {
 }
 
 void machine_resume(void) {
+    /* Console input typed while the machine was stopped is not delivered. */
+    if (g_mode == MACHINE_LIVE) tty_discard_pending();
     if (!g_cur) {
         /* Stopped while everything waited: wait again, then run. */
         if (!pick_next() || !deliver_signals() || !start_segment()) {
@@ -1049,6 +1075,7 @@ static void on_timer(void) {
     if (g_mode == MACHINE_LIVE) {
         if (++g_slice >= MACHINE_SLICE_TICKS) g_need_resched = true;
         tt_on_tick();
+        tty_poll_uart();
         if (serial_rx_ready(PORT_GDB) || serial_rx_ready(PORT_MCP)) g_stop_request = true;
     }
     pic_eoi(0);
@@ -1072,7 +1099,7 @@ static bool deadline_due(void) {
  * passed, a keyframe is due, or a debugger asked to stop. */
 static bool async_entry_wanted(void) {
     if (g_mode != MACHINE_LIVE || !g_cur) return false;
-    if (g_stop_request || tt_entry_wanted()) return true;
+    if (g_stop_request || tt_entry_wanted() || tty_pending()) return true;
     if (g_need_resched) {
         process_t* next = proc_next_ready(g_cur);
         if (next && next != g_cur) return true;

@@ -11,14 +11,31 @@
 #include "core/mm.h"
 #include "core/vm.h"
 #include "core/console.h"
+#include "core/tty.h"
+#include "core/ksig.h"
 #include "memfs.h"
 #include "entropy_record.h"
 #include "divergence.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
+void* memmove(void* dst, const void* src, size_t n);
 
 static inline int64_t err(int e) { return -(int64_t)e; }
+
+/* Internal: the call would block (#249). files_syscall blocks the process
+ * with the wait noted here; the kernel retries the call when a pipe or the
+ * console changes, and wakes it with the result. */
+#define E_BLOCK 512
+static uint32_t g_block_reason;
+static uint64_t g_block_obj, g_block_deadline;
+
+static int64_t would_block(uint32_t reason, uint64_t obj) {
+    g_block_reason = reason;
+    g_block_obj = obj;
+    g_block_deadline = 0;
+    return err(E_BLOCK);
+}
 
 /* errno values beyond include/core/linux.h. */
 #define E_EXDEV        18
@@ -49,6 +66,7 @@ static inline int64_t err(int e) { return -(int64_t)e; }
 #define AT_SYMLINK_FOLLOW   0x400
 #define AT_EMPTY_PATH       0x1000
 
+#define S_IFIFO  0010000
 #define S_IFCHR  0020000
 #define S_IFDIR  0040000
 #define S_IFREG  0100000
@@ -58,7 +76,7 @@ static inline int64_t err(int e) { return -(int64_t)e; }
 
 /* ---- Open file descriptions ---- */
 
-enum { OF_FREE = 0, OF_CONSOLE, OF_FILE, OF_DIR, OF_NULL, OF_ZERO, OF_RANDOM };
+enum { OF_FREE = 0, OF_CONSOLE, OF_FILE, OF_DIR, OF_NULL, OF_ZERO, OF_RANDOM, OF_PIPE_R, OF_PIPE_W };
 
 typedef struct {
     uint32_t refs;
@@ -86,6 +104,54 @@ static char      g_seed_paths[8][64];
 static uint32_t  g_nseed_images;
 
 static fdt_t* fdt(process_t* p) { return (fdt_t*)p->files; }
+
+/* ---- Pipes (#249) ---- */
+
+#define PIPE_CAP 16384
+#define PIPE_BUF 4096                /* writes up to this size are atomic */
+
+typedef struct {
+    bool     used;
+    bool     rd, wr;                 /* the read and the write end are open */
+    uint32_t len, head;              /* bytes buffered, from head (a ring) */
+    uint8_t* buf;
+} pipe_t;
+
+static pipe_t*  g_pipes;
+static uint32_t g_npipes;
+static bool     g_changed;           /* a pipe or the console changed: retry the waiters */
+
+static int32_t pipe_alloc(void) {
+    uint32_t id = 0;
+    while (id < g_npipes && g_pipes[id].used) id++;
+    if (id == g_npipes) {
+        uint32_t cap = g_npipes ? g_npipes * 2 : 16;
+        pipe_t* n = (pipe_t*)kzalloc((uint64_t)cap * sizeof(pipe_t));
+        if (!n) return -1;
+        if (g_pipes) {
+            memcpy(n, g_pipes, (uint64_t)g_npipes * sizeof(pipe_t));
+            kfree(g_pipes);
+        }
+        g_pipes = n;
+        g_npipes = cap;
+    }
+    pipe_t* q = &g_pipes[id];
+    q->buf = (uint8_t*)kmalloc(PIPE_CAP);
+    if (!q->buf) return -1;
+    q->used = q->rd = q->wr = true;
+    q->len = q->head = 0;
+    return (int32_t)id;
+}
+
+static void pipe_end_closed(uint32_t id, bool write_end) {
+    pipe_t* q = &g_pipes[id];
+    if (write_end) q->wr = false; else q->rd = false;
+    g_changed = true;
+    if (!q->rd && !q->wr) {
+        kfree(q->buf);
+        memset(q, 0, sizeof(*q));
+    }
+}
 
 static int32_t of_alloc(uint32_t kind, uint32_t ino, uint32_t flags) {
     uint32_t id = 0;
@@ -116,6 +182,7 @@ static void of_put(int32_t id) {
     ofile_t* o = &g_of[id];
     if (--o->refs) return;
     if (o->kind == OF_FILE || o->kind == OF_DIR) memfs_open_ref(&g_fs, o->ino, -1);
+    if (o->kind == OF_PIPE_R || o->kind == OF_PIPE_W) pipe_end_closed(o->ino, o->kind == OF_PIPE_W);
     memset(o, 0, sizeof(*o));
 }
 
@@ -179,6 +246,7 @@ void files_proc_gone(process_t* p) {
     }
     kfree(t);
     p->files = 0;
+    if (g_changed) files_retry_waiters();      /* a pipe end closed (#249) */
 }
 
 void files_fork(process_t* parent, process_t* child) {
@@ -214,6 +282,7 @@ void files_exec(process_t* p) {
     for (int64_t fd = 0; fd < MAX_FDS; fd++) {
         if (t->of[fd] >= 0 && t->cloexec[fd]) fd_close(p, fd);
     }
+    if (g_changed) files_retry_waiters();
 }
 
 /* ---- Paths ---- */
@@ -272,14 +341,64 @@ static int64_t write_console(process_t* p, uint64_t buf, uint64_t len) {
     return (int64_t)done;
 }
 
+static int64_t pipe_read(process_t* p, ofile_t* o, uint64_t buf, uint64_t len) {
+    pipe_t* q = &g_pipes[o->ino];
+    if (!len) return 0;
+    if (!q->len) {
+        if (!q->wr) return 0;                                     /* end of file */
+        return (o->flags & O_NONBLOCK) ? err(LX_EAGAIN) : would_block(WAIT_PIPE, o->ino);
+    }
+    uint64_t n = len < q->len ? len : q->len;
+    uint64_t first = PIPE_CAP - q->head < n ? PIPE_CAP - q->head : n;
+    if (!uaccess_write(p->address_space, buf, q->buf + q->head, first) ||
+        (n > first && !uaccess_write(p->address_space, buf + first, q->buf, n - first))) {
+        return err(LX_EFAULT);
+    }
+    q->head = (q->head + (uint32_t)n) % PIPE_CAP;
+    q->len -= (uint32_t)n;
+    g_changed = true;
+    return (int64_t)n;
+}
+
+/* Up to PIPE_BUF bytes go in at once or not at all; more may go in part
+ * (a short count, as with a signal: callers loop). */
+static int64_t pipe_write(process_t* p, ofile_t* o, uint64_t buf, uint64_t len) {
+    pipe_t* q = &g_pipes[o->ino];
+    if (!q->rd) {
+        ksig_send(p, SIG_SIGPIPE, 0, 0);
+        return err(LX_EPIPE);
+    }
+    if (!len) return 0;
+    uint32_t space = PIPE_CAP - q->len;
+    if (!space || (len <= PIPE_BUF && space < len)) {
+        return (o->flags & O_NONBLOCK) ? err(LX_EAGAIN) : would_block(WAIT_PIPE, o->ino);
+    }
+    uint64_t n = len < space ? len : space;
+    uint32_t tail = (q->head + q->len) % PIPE_CAP;
+    uint64_t first = PIPE_CAP - tail < n ? PIPE_CAP - tail : n;
+    if (!uaccess_read(p->address_space, buf, q->buf + tail, first) ||
+        (n > first && !uaccess_read(p->address_space, buf + first, q->buf, n - first))) {
+        return err(LX_EFAULT);
+    }
+    q->len += (uint32_t)n;
+    g_changed = true;
+    return (int64_t)n;
+}
+
 /* Read `len` bytes at `off` (or the description's offset if off < 0). */
 static int64_t do_read(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, int64_t off) {
     if ((o->flags & O_ACCMODE) == O_WRONLY) return err(LX_EBADF);
     uint8_t tmp[512];
     switch (o->kind) {
-    case OF_CONSOLE:
+    case OF_CONSOLE: {
+        int64_t n = tty_read(p, buf, len);
+        if (n != err(LX_EAGAIN)) return n;
+        return (o->flags & O_NONBLOCK) ? n : would_block(WAIT_INPUT, 0);
+    }
+    case OF_PIPE_R:
+        return pipe_read(p, o, buf, len);
     case OF_NULL:
-        return 0;                                 /* console input: #249 */
+        return 0;
     case OF_ZERO: {
         uint64_t done = 0;
         memset(tmp, 0, sizeof(tmp));
@@ -325,6 +444,7 @@ static int64_t do_write(process_t* p, ofile_t* o, uint64_t buf, uint64_t len, in
     if ((o->flags & O_ACCMODE) == 0 && o->kind != OF_CONSOLE) return err(LX_EBADF);
     switch (o->kind) {
     case OF_CONSOLE: return write_console(p, buf, len);
+    case OF_PIPE_W: return pipe_write(p, o, buf, len);
     case OF_NULL: case OF_ZERO: case OF_RANDOM: return (int64_t)len;
     case OF_DIR: return err(LX_EISDIR);
     case OF_FILE: break;
@@ -471,8 +591,9 @@ static void dev_stat(uint32_t kind, uint64_t out[18]) {
     out[0] = 5;
     out[1] = 1000 + kind;
     out[2] = 1;
-    out[3] = S_IFCHR | 0666;
-    out[5] = kind == OF_CONSOLE ? 0x0501 : 0x0103;
+    bool fifo = kind == OF_PIPE_R || kind == OF_PIPE_W;
+    out[3] = fifo ? S_IFIFO | 0600 : S_IFCHR | 0666;
+    out[5] = fifo ? 0 : kind == OF_CONSOLE ? 0x0501 : 0x0103;
     out[7] = 4096;
 }
 
@@ -579,7 +700,7 @@ static int64_t sys_statx(process_t* p, int64_t dirfd, uint64_t upath, uint64_t f
 static int64_t sys_lseek(process_t* p, int64_t fd, int64_t off, uint64_t whence) {
     ofile_t* o = of_get(p, fd);
     if (!o) return err(LX_EBADF);
-    if (o->kind == OF_CONSOLE) return err(LX_ESPIPE);
+    if (o->kind == OF_CONSOLE || o->kind == OF_PIPE_R || o->kind == OF_PIPE_W) return err(LX_ESPIPE);
     if (o->kind != OF_FILE && o->kind != OF_DIR) return 0;
     memfs_stat_t st;
     memfs_stat(&g_fs, o->ino, &st);
@@ -889,18 +1010,280 @@ static int64_t sys_mmap_file(process_t* p, uint64_t addr, uint64_t len, uint64_t
 /* ---- Dispatch ---- */
 
 static int64_t ioctl(process_t* p, int64_t fd, uint64_t req, uint64_t arg) {
-    (void)arg;
     ofile_t* o = of_get(p, fd);
     if (!o) return err(LX_EBADF);
-    (void)req;
-    return err(LX_ENOTTY);           /* no terminal yet (#249); files are not ttys */
+    int64_t r;
+    if (req == 0x5421) {                                  /* FIONBIO */
+        int32_t on;
+        if (!uaccess_read(p->address_space, arg, &on, 4)) return err(LX_EFAULT);
+        o->flags = on ? o->flags | O_NONBLOCK : o->flags & ~(uint32_t)O_NONBLOCK;
+        return 0;
+    }
+    if (o->kind == OF_CONSOLE && tty_ioctl(p, req, arg, &r)) return r;   /* the tty (#249) */
+    if (req == 0x541B && o->kind == OF_PIPE_R) {           /* FIONREAD */
+        int32_t n = (int32_t)g_pipes[o->ino].len;
+        return uaccess_write(p->address_space, arg, &n, 4) ? 0 : err(LX_EFAULT);
+    }
+    return err(LX_ENOTTY);                                /* files and pipes are not ttys */
 }
 
-bool files_syscall(process_t* p, uint64_t nr, int64_t* ret) {
+/* ---- pipe, poll, select (#249) ---- */
+
+static int64_t sys_pipe2(process_t* p, uint64_t ufds, uint64_t flags) {
+    if (flags & ~(uint64_t)(O_CLOEXEC | O_NONBLOCK)) return err(LX_EINVAL);
+    int32_t id = pipe_alloc();
+    if (id < 0) return err(LX_ENOMEM);
+    uint32_t st = (uint32_t)flags & O_NONBLOCK;
+    int32_t r = of_alloc(OF_PIPE_R, (uint32_t)id, st);
+    int32_t w = r < 0 ? -1 : of_alloc(OF_PIPE_W, (uint32_t)id, O_WRONLY | st);
+    if (w < 0) {
+        if (r >= 0) of_put(r); else pipe_end_closed((uint32_t)id, false);
+        if (r < 0) pipe_end_closed((uint32_t)id, true);
+        return err(LX_ENOMEM);
+    }
+    bool cx = (flags & O_CLOEXEC) != 0;
+    int64_t fr = fd_install(p, r, 0, cx);
+    int64_t fw = fr < 0 ? fr : fd_install(p, w, 0, cx);
+    int32_t fds[2] = { (int32_t)fr, (int32_t)fw };
+    if (fw < 0 || !uaccess_write(p->address_space, ufds, fds, sizeof(fds))) {
+        if (fr >= 0) fd_close(p, fr); else of_put(r);
+        if (fw >= 0) fd_close(p, fw); else of_put(w);
+        return fw < 0 ? fw : err(LX_EFAULT);
+    }
+    return 0;
+}
+
+#define POLLIN   0x001
+#define POLLPRI  0x002
+#define POLLOUT  0x004
+#define POLLERR  0x008
+#define POLLHUP  0x010
+#define POLLNVAL 0x020
+#define POLLRDNORM 0x040
+#define POLLWRNORM 0x100
+
+/* What a description is ready for now. */
+static uint32_t ready_mask(ofile_t* o) {
+    switch (o->kind) {
+    case OF_CONSOLE:
+        return (tty_readable() ? POLLIN | POLLRDNORM : 0) | POLLOUT | POLLWRNORM;
+    case OF_PIPE_R: {
+        pipe_t* q = &g_pipes[o->ino];
+        return (q->len ? POLLIN | POLLRDNORM : 0) | (q->wr ? 0 : POLLHUP);
+    }
+    case OF_PIPE_W: {
+        pipe_t* q = &g_pipes[o->ino];
+        return (q->len < PIPE_CAP ? POLLOUT | POLLWRNORM : 0) | (q->rd ? 0 : POLLERR);
+    }
+    default:
+        return POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM;
+    }
+}
+
+static bool on_console(ofile_t* o) { return o && o->kind == OF_CONSOLE; }
+
+/* The wait object of a poll or select: bit 0 when it watches the console,
+ * which keeps an idle machine waiting for input. */
+#define POLL_CONSOLE 1
+
+/* poll / ppoll. `timeout_ns`: < 0 waits forever. With `retry` the call is
+ * the kernel trying again for a blocked process (its deadline stands). */
+static int64_t do_poll(process_t* p, uint64_t ufds, uint64_t nfds, int64_t timeout_ns, bool retry) {
+    if (nfds > MAX_FDS) return err(LX_EINVAL);
+    int64_t ready = 0;
+    bool console = false;
+    for (uint64_t i = 0; i < nfds; i++) {
+        int32_t fd;
+        int16_t ev[2];
+        if (!uaccess_read(p->address_space, ufds + 8 * i, &fd, 4) ||
+            !uaccess_read(p->address_space, ufds + 8 * i + 4, ev, 4)) {
+            return err(LX_EFAULT);
+        }
+        uint16_t rev = 0;
+        if (fd >= 0) {
+            ofile_t* o = of_get(p, fd);
+            if (!o) {
+                rev = POLLNVAL;
+            } else {
+                console |= on_console(o);
+                rev = (uint16_t)(ready_mask(o) & ((uint16_t)ev[0] | POLLERR | POLLHUP));
+            }
+        }
+        if (rev) ready++;
+        /* revents: written now when ready or not waiting; a wait leaves
+         * them zero until the retry that finds something. */
+        if (rev || !retry) {
+            if (!uaccess_write(p->address_space, ufds + 8 * i + 6, &rev, 2)) return err(LX_EFAULT);
+        }
+    }
+    if (ready || timeout_ns == 0) return ready;
+    if (!retry) {
+        would_block(WAIT_POLL, console ? POLL_CONSOLE : 0);
+        if (timeout_ns > 0) g_block_deadline = clock_monotonic_ns() + (uint64_t)timeout_ns;
+    }
+    return err(E_BLOCK);
+}
+
+/* select / pselect6: the sets are read again on each try and written only
+ * when something is ready (or by the timeout). */
+static int64_t do_select(process_t* p, int64_t nfds, uint64_t sets[3], int64_t timeout_ns, bool retry) {
+    if (nfds < 0 || nfds > MAX_FDS) return err(LX_EINVAL);
+    uint32_t bytes = (uint32_t)((nfds + 63) / 64 * 8);
+    uint64_t in[3][MAX_FDS / 64], out[3][MAX_FDS / 64];
+    memset(in, 0, sizeof(in));
+    memset(out, 0, sizeof(out));
+    for (int k = 0; k < 3; k++) {
+        if (sets[k] && bytes && !uaccess_read(p->address_space, sets[k], in[k], bytes)) return err(LX_EFAULT);
+    }
+    static const uint32_t want[3] = { POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI };
+    int64_t ready = 0;
+    bool console = false;
+    for (int64_t fd = 0; fd < nfds; fd++) {
+        uint64_t bit = 1ULL << (fd % 64);
+        bool asked = (in[0][fd / 64] | in[1][fd / 64] | in[2][fd / 64]) & bit;
+        if (!asked) continue;
+        ofile_t* o = of_get(p, fd);
+        if (!o) return err(LX_EBADF);
+        console |= on_console(o) && (in[0][fd / 64] & bit);
+        uint32_t m = ready_mask(o);
+        for (int k = 0; k < 3; k++) {
+            if ((in[k][fd / 64] & bit) && (m & want[k])) {
+                out[k][fd / 64] |= bit;
+                ready++;
+            }
+        }
+    }
+    if (ready || timeout_ns == 0) {
+        for (int k = 0; k < 3; k++) {
+            if (sets[k] && bytes && !uaccess_write(p->address_space, sets[k], out[k], bytes)) return err(LX_EFAULT);
+        }
+        return ready;
+    }
+    if (!retry) {
+        would_block(WAIT_POLL, console ? POLL_CONSOLE : 0);
+        if (timeout_ns > 0) g_block_deadline = clock_monotonic_ns() + (uint64_t)timeout_ns;
+    }
+    return err(E_BLOCK);
+}
+
+/* A timeout: struct timespec (ns_scale 1) or struct timeval (1000) at `u`;
+ * 0 means none (wait forever: -1). */
+static int64_t read_timeout(process_t* p, uint64_t u, uint64_t ns_scale, int64_t* out) {
+    if (!u) {
+        *out = -1;
+        return 0;
+    }
+    int64_t t[2];
+    if (!uaccess_read(p->address_space, u, t, sizeof(t))) return err(LX_EFAULT);
+    if (t[0] < 0 || t[1] < 0) return err(LX_EINVAL);
+    *out = t[0] * 1000000000LL + t[1] * (int64_t)ns_scale;
+    return 0;
+}
+
+/* The poll-family calls, by number, from a process's registers. */
+static int64_t poll_call(process_t* p, uint64_t nr, bool retry) {
+    process_context_t* c = &p->context;
+    int64_t to;
+    int64_t r;
+    switch (nr) {
+    case 7:                                                       /* poll */
+        to = (int32_t)c->rdx < 0 ? -1 : (int64_t)(int32_t)c->rdx * 1000000LL;
+        return do_poll(p, c->rdi, c->rsi, to, retry);
+    case 271:                                                     /* ppoll; the mask is not applied */
+        if ((r = read_timeout(p, c->rdx, 1, &to)) < 0) return r;
+        return do_poll(p, c->rdi, c->rsi, to, retry);
+    case 23:                                                      /* select */
+    case 270: {                                                   /* pselect6; the mask is not applied */
+        if ((r = read_timeout(p, c->r8, nr == 23 ? 1000 : 1, &to)) < 0) return r;
+        uint64_t sets[3] = { c->rsi, c->rdx, c->r10 };
+        return do_select(p, (int64_t)c->rdi, sets, to, retry);
+    }
+    default:
+        return err(LX_ENOSYS);
+    }
+}
+
+void files_poll_timed_out(process_t* p) {
+    /* select's sets say nothing was ready; poll's revents are zero already. */
+    uint64_t nr = p->wait_aux;
+    if (nr != 23 && nr != 270) return;
+    process_context_t* c = &p->context;
+    int64_t nfds = (int64_t)c->rdi;
+    if (nfds <= 0 || nfds > MAX_FDS) return;
+    uint64_t zero[MAX_FDS / 64];
+    memset(zero, 0, sizeof(zero));
+    uint64_t sets[3] = { c->rsi, c->rdx, c->r10 };
+    for (int k = 0; k < 3; k++) {
+        if (sets[k]) uaccess_write(p->address_space, sets[k], zero, (uint32_t)((nfds + 63) / 64 * 8));
+    }
+}
+
+/* ---- Blocked calls, retried (#249) ---- */
+
+static int64_t dispatch(process_t* p, uint64_t nr, bool* handled);
+
+static bool retryable(const process_t* p) {
+    if (p->state != PROCESS_STATE_BLOCKED) return false;
+    return p->wait_reason == WAIT_INPUT || p->wait_reason == WAIT_PIPE || p->wait_reason == WAIT_POLL;
+}
+
+/* A pipe or the console changed: every blocked read, write, and poll tries
+ * again, in process-table order, until a pass wakes nobody. Deterministic:
+ * the changes happen at journaled or replayed steps. */
+void files_retry_waiters(void) {
+    for (uint32_t pass = 0; pass < 64; pass++) {
+        g_changed = false;
+        bool woke = false;
+        for (uint32_t i = 0; i < proc_count(); i++) {
+            process_t* p = proc_at(i);
+            if (!retryable(p) || !fdt(p)) continue;
+            uint64_t nr = p->wait_aux;
+            int64_t r;
+            if (nr == 7 || nr == 271 || nr == 23 || nr == 270) {
+                r = poll_call(p, nr, true);
+            } else {
+                bool handled;
+                r = dispatch(p, nr, &handled);
+            }
+            if (r == err(E_BLOCK)) continue;
+            machine_wake(p, r);
+            woke = true;
+        }
+        if (!woke && !g_changed) return;
+    }
+}
+
+bool files_console_waited(void) {
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        if (p->state != PROCESS_STATE_BLOCKED) continue;
+        if (p->wait_reason == WAIT_INPUT || (p->wait_reason == WAIT_POLL && (p->wait_obj & POLL_CONSOLE))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void files_console_signal(uint32_t sig) {
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        fdt_t* t = fdt(p);
+        if (!t || p->pid != (pid_t)p->tgid || p->state == PROCESS_STATE_ZOMBIE) continue;
+        for (uint32_t fd = 0; fd < MAX_FDS; fd++) {
+            if (t->of[fd] >= 0 && g_of[t->of[fd]].kind == OF_CONSOLE) {
+                ksig_send(p, sig, 0x80, 0);                       /* SI_KERNEL */
+                break;
+            }
+        }
+    }
+}
+
+/* One call from p's registers; *handled false if `nr` is not a file call. */
+static int64_t dispatch(process_t* p, uint64_t nr, bool* handled) {
     process_context_t* c = &p->context;
     uint64_t a0 = c->rdi, a1 = c->rsi, a2 = c->rdx, a3 = c->r10, a4 = c->r8, a5 = c->r9;
-    if (!fdt(p)) return false;
     int64_t r;
+    *handled = true;
     switch (nr) {
     case 0:   r = sys_rw(p, (int64_t)a0, a1, a2, -1, false); break;              /* read */
     case 1:   r = sys_rw(p, (int64_t)a0, a1, a2, -1, true); break;               /* write */
@@ -915,7 +1298,10 @@ bool files_syscall(process_t* p, uint64_t nr, int64_t* ret) {
     case 332: r = sys_statx(p, (int64_t)a0, a1, a2, a3, a4); break;
     case 8:   r = sys_lseek(p, (int64_t)a0, (int64_t)a1, a2); break;
     case 9:                                                                      /* mmap */
-        if (a3 & MAP_ANONYMOUS) return false;
+        if (a3 & MAP_ANONYMOUS) {
+            *handled = false;
+            return 0;
+        }
         r = sys_mmap_file(p, a0, a1, a2, a3, (int64_t)a4, a5);
         break;
     case 16:  r = ioctl(p, (int64_t)a0, a1, a2); break;
@@ -974,10 +1360,29 @@ bool files_syscall(process_t* p, uint64_t nr, int64_t* ret) {
     case 280: r = sys_utimensat(p, (int64_t)a0, a1, a2, a3); break;
     case 137: r = sys_statfs(p, a1); break;                                      /* statfs */
     case 138: r = of_get(p, (int64_t)a0) ? sys_statfs(p, a1) : err(LX_EBADF); break;
+    case 22:  r = sys_pipe2(p, a0, 0); break;                                    /* pipe */
+    case 293: r = sys_pipe2(p, a0, a1); break;                                   /* pipe2 */
     default:
-        return false;
+        *handled = false;
+        return 0;
     }
-    *ret = r;
+    return r;
+}
+
+bool files_syscall(process_t* p, uint64_t nr, int64_t* ret) {
+    if (!fdt(p)) return false;
+    bool handled = true;
+    int64_t r = (nr == 7 || nr == 271 || nr == 23 || nr == 270) ? poll_call(p, nr, false)
+                                                                 : dispatch(p, nr, &handled);
+    if (!handled) return false;
+    if (r == err(E_BLOCK)) {
+        machine_block(p, g_block_reason, g_block_obj, g_block_deadline);
+        p->wait_aux = nr;                 /* what files_retry_waiters runs again */
+        *ret = FILES_SWITCHED;
+    } else {
+        *ret = r;
+    }
+    if (g_changed) files_retry_waiters();
     return true;
 }
 
@@ -1111,11 +1516,64 @@ static void files_save(ksf_writer_t* w, void* ctx) {
             ksf_put_u32(w, (uint32_t)t->of[fd]);
         }
     }
+    /* v3: pipes and their buffered bytes, oldest first (#249). */
+    uint32_t npipes = 0;
+    for (uint32_t i = 0; i < g_npipes; i++) npipes += g_pipes[i].used;
+    ksf_put_u32(w, npipes);
+    for (uint32_t i = 0; i < g_npipes; i++) {
+        pipe_t* q = &g_pipes[i];
+        if (!q->used) continue;
+        ksf_put_u32(w, i);
+        ksf_put_u32(w, (uint32_t)q->rd | (uint32_t)q->wr << 1);
+        ksf_put_u32(w, q->len);
+        uint32_t first = PIPE_CAP - q->head < q->len ? PIPE_CAP - q->head : q->len;
+        ksf_put(w, q->buf + q->head, first);
+        ksf_put(w, q->buf, q->len - first);
+    }
+}
+
+static void pipes_clear(void) {
+    for (uint32_t i = 0; i < g_npipes; i++) {
+        if (g_pipes[i].used) kfree(g_pipes[i].buf);
+        memset(&g_pipes[i], 0, sizeof(pipe_t));
+    }
+}
+
+static int pipes_restore(ksf_reader_t* r) {
+    uint32_t n = ksf_get_u32(r);
+    for (uint32_t k = 0; k < n && r->ok; k++) {
+        uint32_t id = ksf_get_u32(r);
+        if (id > (1u << 16)) return -1;
+        while (id >= g_npipes) {
+            uint32_t cap = g_npipes ? g_npipes * 2 : 16;
+            pipe_t* nn = (pipe_t*)kzalloc((uint64_t)cap * sizeof(pipe_t));
+            if (!nn) return -1;
+            if (g_pipes) {
+                memcpy(nn, g_pipes, (uint64_t)g_npipes * sizeof(pipe_t));
+                kfree(g_pipes);
+            }
+            g_pipes = nn;
+            g_npipes = cap;
+        }
+        pipe_t* q = &g_pipes[id];
+        uint32_t ends = ksf_get_u32(r);
+        q->len = ksf_get_u32(r);
+        if (q->len > PIPE_CAP) return -1;
+        q->buf = (uint8_t*)kmalloc(PIPE_CAP);
+        if (!q->buf) return -1;
+        q->used = true;
+        q->rd = (ends & 1) != 0;
+        q->wr = (ends & 2) != 0;
+        q->head = 0;
+        ksf_get(r, q->buf, q->len);
+    }
+    return r->ok ? 0 : -1;
 }
 
 static int files_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
     (void)ctx;
-    if (version < 1 || version > 2) return -1;
+    if (version < 1 || version > 3) return -1;
+    pipes_clear();
     /* The process table was rebuilt without descriptor tables; descriptions
      * are rebuilt here, and the inodes' open counts came with the tree. */
     if (g_of) memset(g_of, 0, (uint64_t)g_nof * sizeof(ofile_t));
@@ -1170,6 +1628,7 @@ static int files_restore(ksf_reader_t* r, uint32_t version, void* ctx) {
             t->cloexec[fd] = cx;
         }
     }
+    if (version >= 3 && pipes_restore(r) != 0) return -1;
     return r->ok ? 0 : -1;
 }
 
@@ -1200,6 +1659,15 @@ static uint32_t files_sum(void* ctx) {
             crc = divergence_checksum(crc, e, sizeof(e));
         }
     }
+    for (uint32_t i = 0; i < g_npipes; i++) {
+        pipe_t* q = &g_pipes[i];
+        if (!q->used) continue;
+        uint32_t head[3] = { i, (uint32_t)q->rd | (uint32_t)q->wr << 1, q->len };
+        crc = divergence_checksum(crc, head, sizeof(head));
+        uint32_t first = PIPE_CAP - q->head < q->len ? PIPE_CAP - q->head : q->len;
+        crc = divergence_checksum(crc, q->buf + q->head, first);
+        crc = divergence_checksum(crc, q->buf, q->len - first);
+    }
     return crc;
 }
 
@@ -1222,7 +1690,7 @@ void files_init(const uint8_t* seed, uint64_t len, const char* seed_name) {
                 len, g_fs.seed_crc);
     }
     static const ksf_subsys_t fs = { KS_ID_FS, "fs", 1, fs_save, fs_restore, fs_sum, 0 };
-    static const ksf_subsys_t files = { KS_ID_FILES, "files", 2, files_save, files_restore, files_sum, 0 };
+    static const ksf_subsys_t files = { KS_ID_FILES, "files", 3, files_save, files_restore, files_sum, 0 };
     if (kstate_register(&fs) != KSF_OK || kstate_register(&files) != KSF_OK) {
         panic("files: cannot register keyframe sections");
     }

@@ -48,6 +48,8 @@ bool     kio_event_next(uint32_t kind, uint64_t step, uint32_t* nr, uint64_t* ar
  * replaying takes the next record if it is one of `kind` at `step`, copying
  * up to `cap` payload bytes. */
 void     kio_record(uint32_t kind, uint64_t step, uint64_t args, const void* payload, uint32_t len);
+/* Replay: the next record is `kind` at `step`; its args, without taking it. */
+bool     kio_record_peek(uint32_t kind, uint64_t step, uint64_t* args);
 bool     kio_record_next(uint32_t kind, uint64_t step, uint64_t* args, void* buf, uint32_t cap,
                          uint32_t* len);
 /* (When the payload is larger than `cap`, false with *len set to its size,

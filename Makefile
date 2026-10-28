@@ -37,7 +37,7 @@ CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
             kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
-            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c kernel/core/kio.c kernel/core/pctl.c kernel/core/ksig.c kernel/core/preempt.c kernel/core/ahci.c kernel/core/pmu.c \
+            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c kernel/core/kio.c kernel/core/pctl.c kernel/core/ksig.c kernel/core/preempt.c kernel/core/ahci.c kernel/core/pmu.c kernel/core/tty.c \
             kernel/core/kfpages.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
@@ -67,7 +67,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 
 # Linux programs (#238): plain C built against musl, unmodified.
 MUSL_CC     ?= musl-gcc
-LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads benchcpu benchalloc
+LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads benchcpu benchalloc pipeline
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \

@@ -58,7 +58,7 @@ WORKLOADS = {
     "hello": ("hello world (musl)", None, "musl_hello"),
     "lua": ("Lua 5.4: the gate script", [("lua", "/bin/lua")], '"/bin/lua /scripts/gate.lua"'),
     "sqlite": ("SQLite shell: 20000 rows, an index, queries", [("sqlite", "/bin/sqlite3")],
-               '"/bin/sqlite3 -batch -init /scripts/sqlite.sql /tmp/gate.db"'),
+               '"/bin/sqlite3 -batch -init /scripts/sqlite.sql /tmp/gate.db .quit"'),
     "threads": ("pthreads: 2 threads, 300000 racy increments", None, '"musl_threads race 300000"'),
     "cpu": ("compute-bound: a sieve, 4 rounds", None, '"musl_benchcpu 4"'),
     "alloc": ("allocation-heavy: 100000 malloc/free", None, '"musl_benchalloc 100000"'),

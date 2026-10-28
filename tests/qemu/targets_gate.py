@@ -249,7 +249,7 @@ def gate_sqlite():
     subprocess.run(["bash", os.path.join(ROOT, "scripts", "build", "sqlite.sh")], check=True)
     sq = os.path.join(ROOT, "build", "ext", "sqlite3")
     seed = seed_image([(sq, "/bin/sqlite3")])
-    run = 'run="/bin/sqlite3 -batch -init /scripts/sqlite.sql /tmp/gate.db" interval=25 keyframes=64'
+    run = 'run="/bin/sqlite3 -batch -init /scripts/sqlite.sql /tmp/gate.db .quit" interval=25 keyframes=64'
     try:
         out = replay_checks("sqlite", seed, run)
         for want in ("rows|20000|137043.857", "first|w00000", "after|16000|146179.000", "ok"):

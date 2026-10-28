@@ -31,5 +31,6 @@ USER_IMAGE musl_spinner
 USER_IMAGE musl_threads
 USER_IMAGE musl_benchcpu
 USER_IMAGE musl_benchalloc
+USER_IMAGE musl_pipeline
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -42,6 +42,7 @@ extern const uint8_t user_image_musl_spinner[], user_image_musl_spinner_end[];
 extern const uint8_t user_image_musl_threads[], user_image_musl_threads_end[];
 extern const uint8_t user_image_musl_benchcpu[], user_image_musl_benchcpu_end[];
 extern const uint8_t user_image_musl_benchalloc[], user_image_musl_benchalloc_end[];
+extern const uint8_t user_image_musl_pipeline[], user_image_musl_pipeline_end[];
 
 static const lp_image_t g_images[] = {
     { "heisenbug", user_image_heisenbug, user_image_heisenbug_end, false },
@@ -64,6 +65,7 @@ static const lp_image_t g_images[] = {
     { "musl_threads", user_image_musl_threads, user_image_musl_threads_end, true },
     { "musl_benchcpu", user_image_musl_benchcpu, user_image_musl_benchcpu_end, true },
     { "musl_benchalloc", user_image_musl_benchalloc, user_image_musl_benchalloc_end, true },
+    { "musl_pipeline", user_image_musl_pipeline, user_image_musl_pipeline_end, true },
 };
 
 const lp_image_t* proc_images(uint32_t* count) {

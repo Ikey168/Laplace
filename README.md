@@ -204,6 +204,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Inputs (clock reads, entropy, and later console and network) are one journaled record with payloads of any size: 10 MiB read in one epoch replays byte-exact; a replay whose input call differs from the recording stops at that step and is reported | `tests/qemu/input_gate.sh` |
 | Processes: 50 children fork (copy-on-write), exec, exit, and are reaped with their statuses; kill ends a child; rewinding between a fork and its exec shows both processes in gdb and MCP | `tests/qemu/proc_gate.sh` |
 | Threads: unmodified musl pthreads (mutexes, condition variables, join) record and replay byte-exact; two threads racing on a counter lose updates while recording, replay the same losses, and MCP's watch_last_write traces the overwritten update to the other thread's store | `tests/qemu/threads_gate.sh` |
+| Console input and pipes: a Lua REPL session typed on COM1 (with line editing) is journaled at the steps it is delivered and replays byte-exact with nothing attached; a shell-style `producer \| consumer` pipeline moves 300000 bytes through read, poll, and select with keyframes mid-pipeline; EOF, EAGAIN, poll timeouts, and EPIPE | `tests/qemu/console_gate.py` |
 | Preemption at any instruction without a counter: two loops with no system call interleave, a loop where only memory changes and `rep movsb` copies are preempted, a spin gets its timer's signals, and each replays byte-exact | `tests/qemu/preempt_gate.sh` |
 | Signals: SIGALRM from a timer interrupts a loop at journaled points with FPU state saved in the frame; a SIGSEGV handler recovers; masks, pending, sigsuspend, sigaltstack; every run replays byte-exact; an unhandled fault or abort() stops the machine and gdb shows the signal and the faulting line | `tests/qemu/signal_gate.sh` |
 | Blocking: a sleeping process and a working one replay byte-exact with each timer wake at its journaled step; a 10 s idle adds no steps and replays without waiting; a debugger stops the machine while everything waits | `tests/qemu/sleep_gate.sh` |
@@ -220,8 +221,8 @@ Limits, stated plainly:
   such point by trapping on its instruction: a preempted hot loop replays a
   trap or two per iteration slower (no branch counter is used yet), 100 to
   300x the recorded run under TCG ([`docs/benchmarks.md`](docs/benchmarks.md)).
-- The journaled inputs are preemption, clock, and entropy. There is no device
-  input (keyboard, network) yet, so there is nothing else to journal.
+- The journaled inputs are preemption, clock, entropy, and bytes typed on the
+  console (COM1). There is no network yet (#253).
 - User `rdtsc`/`rdtscp` are trapped and journaled, and user `cpuid` is answered
   from a recorded, masked table where the CPU has CPUID faulting (KVM, recent
   bare metal; QEMU's emulator has none, so there `cpuid` runs natively).
@@ -247,9 +248,10 @@ Limits, stated plainly:
   `dup`, `getcwd`/`chdir`, private file `mmap`, and `/dev/null`, `/dev/zero`,
   `/dev/urandom`; processes (#248): `fork`, `vfork`, `execve`, `wait4`,
   `kill`, zombies and orphans; threads (#251): `clone` for pthreads,
-  `futex`, `gettid`, `tgkill`; and signals (#250). Unimplemented calls return
-  ENOSYS and are logged once. Programs must be static: no dynamic linker
-  yet (#254), no console input, pipes, or `poll` (#249), no sockets (#253).
+  `futex`, `gettid`, `tgkill`; signals (#250); and console input, a tty,
+  pipes, `poll`, and `select` (#249; ppoll's and pselect6's signal masks are
+  not applied). Unimplemented calls return ENOSYS and are logged once.
+  Programs must be static: no dynamic linker yet (#254), no sockets (#253).
 - Recorded history is read-only from the debuggers.
 - Platforms: QEMU TCG and KVM are tested. No real machine has been booted
   yet; the console and debug channels need COM ports, and the only disks are
@@ -345,8 +347,7 @@ Laplace/
 The plan for running real programs (unmodified static Linux binaries, threads
 included) is tracked in #235. Its main steps:
 
-- Console input, pipes, and `poll`, so interactive programs can be recorded
-  (#249); networking (#253); dynamically linked binaries (#254)
+- Networking (#253); dynamically linked binaries (#254)
 - A branch counter, where the boot-time probe finds an exact one, to skip
   most of the breakpoint hits a replay of a preempted hot loop takes (#245);
   a bare-metal machine, NVMe, and a debug channel without COM ports (#236)

@@ -199,6 +199,7 @@ uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len);
 #define WAIT_POLL   5         /* poll, select (#249) */
 #define WAIT_SIGNAL 6         /* pause, sigsuspend (#250) */
 #define WAIT_GROUP  7         /* a thread group's leader whose own thread exited (#251) */
+#define WAIT_PIPE   8         /* a pipe read or write (#249) */
 void machine_block(process_t* p, uint32_t reason, uint64_t obj, uint64_t deadline_ns);
 /* Make a blocked process runnable; its system call returns `ret`. */
 void machine_wake(process_t* p, int64_t ret);

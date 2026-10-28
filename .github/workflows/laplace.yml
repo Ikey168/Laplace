@@ -133,6 +133,8 @@ jobs:
         run: bash tests/qemu/signal_gate.sh
       - name: Preemption at any instruction, found again by state (in QEMU, TCG, no PMU)
         run: bash tests/qemu/preempt_gate.sh
+      - name: A Lua session typed on the console and a pipeline replay byte-exact (in QEMU)
+        run: python3 tests/qemu/console_gate.py
       - name: "Target: a pthreads lost-update race, traced to the other thread's store (MCP + gdb)"
         run: bash tests/qemu/threads_gate.sh
       - name: "Target: hello world (record, verify, sabotage caught, MCP + gdb backward)"

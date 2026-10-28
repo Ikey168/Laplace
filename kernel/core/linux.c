@@ -195,6 +195,7 @@ lx_after_t linux_syscall(process_t* p) {
 
     /* Files and descriptors (#247): read, write, open, stat, ... */
     if (files_syscall(p, nr, &r)) {
+        if (r == FILES_SWITCHED) return LX_SWITCHED;     /* blocked (#249) */
         c->rax = (uint64_t)r;
         return LX_CONTINUE;
     }

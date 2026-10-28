@@ -152,6 +152,13 @@ void kio_record(uint32_t kind, uint64_t step, uint64_t args, const void* payload
     journal_new();
 }
 
+bool kio_record_peek(uint32_t kind, uint64_t step, uint64_t* args) {
+    iorec_t r;
+    if (iorec_peek(&g_log, &r) != IOREC_OK || r.kind != kind || r.step != step) return false;
+    *args = r.args;
+    return true;
+}
+
 bool kio_record_next(uint32_t kind, uint64_t step, uint64_t* args, void* buf, uint32_t cap,
                      uint32_t* len) {
     iorec_t r;
