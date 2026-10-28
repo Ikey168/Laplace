@@ -29,5 +29,7 @@ USER_IMAGE musl_forkexec
 USER_IMAGE musl_sigprobe
 USER_IMAGE musl_spinner
 USER_IMAGE musl_threads
+USER_IMAGE musl_benchcpu
+USER_IMAGE musl_benchalloc
 
 section .note.GNU-stack noalloc noexec nowrite progbits

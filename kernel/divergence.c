@@ -6,21 +6,13 @@
  * checksummed by the caller and fed in by id, so this is host-testable.
  */
 
+#include "crc32_ieee.h"
 #include "divergence.h"
 
-/* IEEE 802.3 reflected CRC32 (poly 0xEDB88320), bitwise. Local copy so this
+/* IEEE 802.3 reflected CRC32 (poly 0xEDB88320), via crc32_ieee.h so this
  * core stays dependency-free, like the journal and disk cores. */
 uint32_t divergence_checksum(uint32_t crc, const void* data, uint32_t len) {
-    const uint8_t* p = (const uint8_t*)data;
-    crc = ~crc;
-    for (uint32_t i = 0; i < len; i++) {
-        crc ^= p[i];
-        for (int b = 0; b < 8; b++) {
-            uint32_t mask = -(crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
-        }
-    }
-    return ~crc;
+    return crc32_ieee(crc, data, len);
 }
 
 static void clear_epoch(divergence_t* d) {

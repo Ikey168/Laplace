@@ -67,7 +67,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 
 # Linux programs (#238): plain C built against musl, unmodified.
 MUSL_CC     ?= musl-gcc
-LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads
+LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads benchcpu benchalloc
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
 UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \

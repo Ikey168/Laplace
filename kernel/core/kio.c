@@ -57,6 +57,7 @@ static void journal_new(void) {
 }
 
 static void append(uint32_t kind, uint32_t nr, uint64_t args, int64_t ret, const void* p, uint32_t len) {
+    if (machine_norecord()) return;
     int rc = iorec_append(&g_log, machine_step(), kind, nr, args, ret, p, len);
     if (rc != IOREC_OK) panic("kio: cannot record an input (%d); the page pool may be full", rc);
     g_stats.records++;
@@ -126,6 +127,7 @@ int64_t kio_input(uint32_t kind, uint32_t nr, uint64_t args,
 }
 
 void kio_event(uint32_t kind, uint32_t nr, uint64_t args, uint64_t step) {
+    if (machine_norecord()) return;
     int rc = iorec_append(&g_log, step, kind, nr, args, 0, 0, 0);
     if (rc != IOREC_OK) panic("kio: cannot record an event (%d)", rc);
     g_stats.records++;
@@ -142,6 +144,7 @@ bool kio_event_next(uint32_t kind, uint64_t step, uint32_t* nr, uint64_t* args) 
 }
 
 void kio_record(uint32_t kind, uint64_t step, uint64_t args, const void* payload, uint32_t len) {
+    if (machine_norecord()) return;
     int rc = iorec_append(&g_log, step, kind, 0, args, 0, payload, len);
     if (rc != IOREC_OK) panic("kio: cannot record (%d); the page pool may be full", rc);
     g_stats.records++;

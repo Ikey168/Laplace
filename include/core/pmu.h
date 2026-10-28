@@ -25,4 +25,9 @@ typedef struct {
 void pmu_init(void);
 const pmu_info_t* pmu_info(void);
 
+/* The hypervisor's CPUID vendor ("" on bare metal), and whether it is QEMU's
+ * TCG emulator, which applies RF to a whole translated block (#255). */
+const char* pmu_hypervisor(void);
+bool pmu_tcg(void);
+
 #endif /* CORE_PMU_H */

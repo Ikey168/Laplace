@@ -345,6 +345,7 @@ static void close_epoch(uint64_t epoch, uint64_t steps) {
     if (rc != JOURNAL_OK) panic("timetravel: journal for epoch %lu failed (%d)", epoch, rc);
     len_cache_put(epoch, steps);
     g_stats.journals_written++;
+    g_stats.recorded_steps += steps;
 }
 
 static void take_keyframe(void) {
@@ -380,13 +381,13 @@ void tt_on_tick(void) {
 }
 
 bool tt_entry_wanted(void) {
-    if (!g_ready) return false;
+    if (!g_ready || machine_norecord()) return false;
     return (g_wb_pending && g_ticks != g_wb_tick) || g_ticks_since_kf >= g_cfg.interval_ticks ||
            g_force_keyframe;
 }
 
 void tt_on_live_entry(void) {
-    if (!g_ready) return;
+    if (!g_ready || machine_norecord()) return;
     /* Writeback runs at a later entry than the take, so the processes write
      * pages in between and the COW hook preserves their keyframe images. */
     if (g_wb_pending && g_ticks != g_wb_tick) do_writeback();
@@ -411,7 +412,9 @@ void tt_before_mapping_change(void) {
 }
 
 int tt_seal(void) {
-    if (!g_ready || !machine_started() || machine_mode() != MACHINE_LIVE) return TT_ERR_STATE;
+    if (!g_ready || !machine_started() || machine_mode() != MACHINE_LIVE || machine_norecord()) {
+        return TT_ERR_STATE;
+    }
     do_writeback();
     close_epoch(machine_epoch(), machine_step());
     g_sealed = true;

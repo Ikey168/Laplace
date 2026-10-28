@@ -18,6 +18,11 @@
  *   sabotage=clock|entropy  every replay is wrong on purpose (#256): each
  *                  replayed clock read one tick (1 ms) late, or one bit of
  *                  each replayed random payload flipped; verify must notice
+ *   bench          after the machine stops, print "bench:" lines (run time,
+ *                  what the recording wrote, verify, rewind, replay, and
+ *                  reverse-stepi times) instead of the self-test (#255);
+ *                  bench=run: the run line only
+ *   norecord       run without recording (with bench: the baseline run time)
  */
 
 #include "core/cpu.h"
@@ -63,6 +68,9 @@ typedef struct {
     bool     fresh;
     bool     selftest;
     bool     exit;
+    bool     bench;
+    bool     bench_run_only;
+    bool     norecord;
 } boot_options_t;
 
 static boot_options_t g_opts;
@@ -122,6 +130,13 @@ static void parse_cmdline(const char* cmd) {
             g_opts.selftest = true;
         } else if (len == 4 && strncmp(tok, "exit", 4) == 0) {
             g_opts.exit = true;
+        } else if (len == 5 && strncmp(tok, "bench", 5) == 0) {
+            g_opts.bench = true;
+        } else if (len == 9 && strncmp(tok, "bench=run", 9) == 0) {
+            g_opts.bench = true;
+            g_opts.bench_run_only = true;
+        } else if (len == 8 && strncmp(tok, "norecord", 8) == 0) {
+            g_opts.norecord = true;
         } else if (len == 14 && strncmp(tok, "sabotage=clock", 14) == 0) {
             kio_sabotage(KIO_SABOTAGE_CLOCK);
         } else if (len == 16 && strncmp(tok, "sabotage=entropy", 16) == 0) {
@@ -422,6 +437,93 @@ static bool selftest(void) {
     return ok;
 }
 
+/* ---- Benchmarks (#255) ---- */
+
+/* The store's device, counting the bytes the recording writes. */
+static fat_block_device_t  g_counted;
+static fat_block_device_t* g_inner;
+static uint64_t            g_disk_written;
+
+static int counted_read(void* d, uint32_t sector, uint32_t count, void* buf) {
+    (void)d;
+    return g_inner->read_sectors(g_inner->private_data, sector, count, buf);
+}
+
+static int counted_write(void* d, uint32_t sector, uint32_t count, const void* buf) {
+    (void)d;
+    g_disk_written += (uint64_t)count * g_inner->sector_size;
+    return g_inner->write_sectors(g_inner->private_data, sector, count, buf);
+}
+
+static fat_block_device_t* counting(fat_block_device_t* dev) {
+    g_inner = dev;
+    g_counted = *dev;
+    g_counted.read_sectors = counted_read;
+    g_counted.write_sectors = counted_write;
+    g_counted.private_data = 0;
+    return &g_counted;
+}
+
+static uint64_t elapsed_us(uint64_t t0) { return (clock_now_unrecorded() - t0) / 1000; }
+
+/* After the run: what it cost, then how fast the recording is navigated. All
+ * times are the guest's (TSC), from the start of the first program. */
+static void bench(uint64_t run_us) {
+    if (g_opts.norecord) {
+        kprintf("bench: norecord run_us=%lu steps=%lu\n", run_us, machine_step());
+        return;
+    }
+    tt_pos_t end;
+    tt_position(&end);
+    const tt_stats_t* s = tt_stats();
+    kprintf("bench: record run_us=%lu steps=%lu keyframes=%lu keyframe_bytes=%lu disk_bytes=%lu "
+            "input_bytes=%lu input_records=%lu cow_pages=%lu\n", run_us, s->recorded_steps,
+            s->keyframes_taken, kfp_stats()->pages_written * PAGE_SIZE, g_disk_written,
+            kio_stats()->bytes, kio_stats()->records, s->cow_captures);
+    if (g_opts.bench_run_only) return;
+    tt_window_t w;
+    if (!tt_window(&w)) return;
+    uint64_t window_steps = 0;
+    for (uint64_t e = w.oldest; e <= w.newest; e++) {
+        uint64_t len;
+        if (tt_epoch_len(e, &len)) window_steps += len;
+    }
+    tt_verify_t v;
+    uint64_t t0 = clock_now_unrecorded();
+    int rc = tt_verify(&v);
+    kprintf("bench: verify us=%lu rc=%d epochs=%u diverged=%u\n", elapsed_us(t0), rc,
+            v.epochs_checked, v.epochs_diverged);
+    t0 = clock_now_unrecorded();
+    rc = tt_goto(w.oldest, 0, 0);
+    kprintf("bench: rewind us=%lu rc=%d to_epoch=%lu\n", elapsed_us(t0), rc, w.oldest);
+    /* Replay: every retained epoch re-executed from its keyframe to its end,
+     * without verify's comparisons. */
+    uint64_t replay_us = 0;
+    rc = TT_OK;
+    for (uint64_t e = w.oldest; e <= w.newest && rc == TT_OK; e++) {
+        uint64_t len;
+        if (!tt_epoch_len(e, &len)) continue;
+        t0 = clock_now_unrecorded();
+        rc = tt_goto(e, len, 0);
+        replay_us += elapsed_us(t0);
+    }
+    const preempt_stats_t* pm = preempt_stats();
+    kprintf("bench: replay us=%lu rc=%d window_steps=%lu window_epochs=%u preemption_points=%lu "
+            "breakpoint_checks=%lu\n", replay_us, rc, window_steps, w.count, pm->recorded,
+            pm->candidates);
+    tt_goto_pos(&end);
+    uint64_t total = 0, worst = 0;
+    uint32_t n = 0;
+    for (; n < 10; n++) {
+        t0 = clock_now_unrecorded();
+        if (tt_reverse_stepi() != TT_OK) break;
+        uint64_t us = elapsed_us(t0);
+        total += us;
+        if (us > worst) worst = us;
+    }
+    kprintf("bench: rstepi avg_us=%lu max_us=%lu n=%u\n", n ? total / n : 0, worst, n);
+}
+
 void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     serial_init(COM1);
     serial_init(COM2);
@@ -478,6 +580,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
         if (!dev) panic("no disk and no memory for a RAM disk");
         kprintf("boot: no IDE or AHCI disk; recording to a RAM disk (lost at power-off)\n");
     }
+    if (g_opts.bench) dev = counting(dev);
     tt_config_t cfg = { g_opts.interval, g_opts.keyframes, g_opts.stop_after, g_opts.dirty };
     bool had_keyframe = false;
     if (tt_init(dev, &cfg, &had_keyframe) != 0) panic("cannot arm the recording store");
@@ -496,10 +599,18 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     if (!resumed) spawn_run_list();
 
     monitor_init();
+    machine_set_norecord(g_opts.norecord);
     machine_set_mode(MACHINE_LIVE);
+    uint64_t t_start = clock_now_unrecorded();
     if (resumed) machine_resume(); else machine_start();
+    uint64_t run_us = elapsed_us(t_start);
 
     monitor_live_stopped();
+    if (g_opts.bench) {
+        bench(run_us);
+        if (g_opts.exit) boot_qemu_exit(0);
+        cpu_halt_forever();
+    }
     if (g_opts.selftest) {
         bool ok = selftest();
         if (g_opts.exit) boot_qemu_exit(ok ? 0 : 1);

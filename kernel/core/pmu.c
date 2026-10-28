@@ -6,8 +6,31 @@
 #include "core/console.h"
 
 static pmu_info_t g_pmu;
+static char       g_hypervisor[13];
 
 const pmu_info_t* pmu_info(void) { return &g_pmu; }
+const char* pmu_hypervisor(void) { return g_hypervisor; }
+bool pmu_tcg(void) { return g_hypervisor[0] == 'T' && g_hypervisor[1] == 'C' && g_hypervisor[2] == 'G'; }
+
+/* CPUID.1:ECX.31 and the vendor of leaf 0x40000000 ("KVMKVMKVM",
+ * "TCGTCGTCGTCG", ...); empty on bare metal. */
+static void find_hypervisor(void) {
+    uint32_t r[4];
+    cpu_cpuid(1, 0, r);
+    if (!(r[2] & (1u << 31))) return;
+    cpu_cpuid(0x40000000, 0, r);
+    *(uint32_t*)&g_hypervisor[0] = r[1];
+    *(uint32_t*)&g_hypervisor[4] = r[2];
+    *(uint32_t*)&g_hypervisor[8] = r[3];
+    g_hypervisor[12] = 0;
+    for (int i = 0; i < 12; i++) {
+        if (g_hypervisor[i] < 0x20 || g_hypervisor[i] > 0x7E) g_hypervisor[i] = 0;
+    }
+    if (!g_hypervisor[0]) {
+        const char* u = "unknown";
+        for (int i = 0; u[i]; i++) g_hypervisor[i] = u[i];
+    }
+}
 
 /* Retired branches over a loop of exactly `n` taken conditional branches (and
  * one not taken), counted by an already-programmed counter `ctr`, kernel
@@ -32,6 +55,8 @@ static bool probe(uint32_t sel, uint32_t ctr, uint64_t event, uint64_t* got) {
 }
 
 void pmu_init(void) {
+    find_hypervisor();
+    kprintf("boot: hypervisor: %s\n", g_hypervisor[0] ? g_hypervisor : "none (bare metal)");
     uint32_t r[4];
     cpu_cpuid(0, 0, r);
     char vendor[13];

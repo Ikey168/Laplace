@@ -2,6 +2,7 @@
  * See include/core/machine.h for the step, determinism, and coroutine model. */
 
 #include "core/machine.h"
+#include "core/pmu.h"
 #include "core/timetravel.h"
 #include "core/proc.h"
 #include "core/mm.h"
@@ -70,10 +71,13 @@ static uint64_t       g_dr_enabled;      /* DR6 B0-B3 bits of the slots DR7 enab
 static int            g_pm_slot = -1;
 static bool           g_pm_stepping;
 static bool           g_pm_moved;        /* its breakpoint waits past a string instruction */
-/* Stepping over an execution breakpoint: RF for the instruction, and a
- * single step right after it (QEMU's TCG applies RF to a whole translated
- * block, so without the step a breakpoint in a loop would not hit again). */
+/* Stepping over an execution breakpoint: RF for the instruction, and under
+ * QEMU's TCG a single step right after it (TCG applies RF to a whole
+ * translated block, so without the step a breakpoint in a loop would not hit
+ * again). Elsewhere RF alone, one trap per hit instead of two (#255). */
 static bool           g_stepping_over;
+static bool           g_rf_per_block;    /* TCG */
+static bool           g_rf_over;         /* RF alone was set since the last entry */
 static bool           g_step_over;       /* entering: step over the breakpoints at rip */
 /* #245: a user breakpoint reported at the instruction where a preemption
  * point then matched is not reported again when that process resumes there. */
@@ -99,13 +103,15 @@ static uint64_t g_trace_bad_step;
 /* ---- Accessors ---- */
 
 void machine_init(void) {
+    g_rf_per_block = pmu_tcg();
     sched_record_init(&g_sr, SCHED_REC_RECORD, g_sr_points, SCHED_POINTS_MAX);
 }
 
 machine_mode_t machine_mode(void) { return g_mode; }
 void machine_set_mode(machine_mode_t m) {
     g_mode = m;
-    sched_record_set_mode(&g_sr, m == MACHINE_LIVE ? SCHED_REC_RECORD : SCHED_REC_REPLAY);
+    sched_record_set_mode(&g_sr, m != MACHINE_LIVE ? SCHED_REC_REPLAY :
+                                 machine_norecord() ? SCHED_REC_OFF : SCHED_REC_RECORD);
     ktime_set_mode(m == MACHINE_LIVE ? TIME_REC_RECORD : TIME_REC_REPLAY);
     kentropy_set_mode(m == MACHINE_LIVE ? ENTROPY_REC_RECORD : ENTROPY_REC_REPLAY);
     if (m == MACHINE_LIVE) {
@@ -162,6 +168,12 @@ uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len) {
 void machine_request_stop(void) { g_stop_request = true; }
 static bool g_lenient;
 void machine_set_lenient(bool on) { g_lenient = on; }
+static bool g_norecord;
+void machine_set_norecord(bool on) {
+    g_norecord = on;
+    if (g_mode == MACHINE_LIVE) sched_record_set_mode(&g_sr, on ? SCHED_REC_OFF : SCHED_REC_RECORD);
+}
+bool machine_norecord(void) { return g_norecord; }
 
 void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step) {
     g_has_target = true;
@@ -257,7 +269,12 @@ static void load_hwbps(const process_t* p) {
 }
 
 static void step_over(trap_frame_t* f) {
-    f->rflags |= RFLAGS_RF | RFLAGS_TF;
+    f->rflags |= RFLAGS_RF;
+    if (!g_rf_per_block) {
+        g_rf_over = true;
+        return;
+    }
+    f->rflags |= RFLAGS_TF;
     g_stepping_over = true;
 }
 
@@ -742,7 +759,7 @@ static void trace_entry(uint64_t step) {
     for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) g_trace = mix64(g_trace, regs[i]);
     if ((step + 1) % KJ_TRACE_EVERY != 0) return;
     if (g_mode == MACHINE_LIVE) {
-        kj_append(KJ_EV_TRACE, step, g_trace, 0);
+        if (!g_norecord) kj_append(KJ_EV_TRACE, step, g_trace, 0);
         return;
     }
     uint64_t want;
@@ -1233,6 +1250,8 @@ void trap_dispatch(trap_frame_t* f) {
          * a preemption point's single step set: not the program's. */
         g_cur->context.r11 &= ~(RFLAGS_TF | RFLAGS_RF);
     }
+    if (vector == VEC_LINUX_SYSCALL && g_rf_over) g_cur->context.r11 &= ~RFLAGS_RF;
+    g_rf_over = false;
     g_stepping_over = false;
     g_stepping = false;
     g_pending.vector = vector;
@@ -1245,7 +1264,7 @@ void trap_dispatch(trap_frame_t* f) {
         g_started = true;
         /* Journaled before a keyframe can close the epoch: the point is
          * the epoch's last step. */
-        if (vector == VEC_TIMER) preempt_record(g_cur, g_step);
+        if (vector == VEC_TIMER && !g_norecord) preempt_record(g_cur, g_step);
         tt_on_live_entry();        /* keyframes and writeback happen here */
     } else {
         uint64_t pm_step;

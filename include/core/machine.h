@@ -114,6 +114,12 @@ void machine_clear_target(void);
  * the epoch still runs to its end. Off: the replay stops there. */
 void machine_set_lenient(bool on);
 
+/* Benchmarks (#255): run live without recording. No keyframes, journals, or
+ * preemption points are kept, inputs are read live and dropped, and the
+ * schedule is not recorded; nothing can be replayed. Set before the start. */
+void machine_set_norecord(bool on);
+bool machine_norecord(void);
+
 /* Ask a live machine to stop at its next kernel entry. */
 void machine_request_stop(void);
 

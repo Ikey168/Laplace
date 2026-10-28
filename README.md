@@ -212,12 +212,14 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | MCP: protocol handshake, 13 tools (threads, vector registers), stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
 | Power cut and resume from the disk | `qemu_persistence_demo.sh` |
+| Overhead measured per workload (recording 1.1-1.6x for Lua, SQLite, malloc-heavy code under TCG; rewind in milliseconds), under TCG and KVM | `scripts/bench/overhead.py` (CI artifact, not a gate) |
 
 Limits, stated plainly:
 
 - One CPU. A process is preempted at any instruction, but a replay finds each
   such point by trapping on its instruction: a preempted hot loop replays a
-  trap or two per iteration slower (no branch counter is used yet).
+  trap or two per iteration slower (no branch counter is used yet), 100 to
+  300x the recorded run under TCG ([`docs/benchmarks.md`](docs/benchmarks.md)).
 - The journaled inputs are preemption, clock, and entropy. There is no device
   input (keyboard, network) yet, so there is nothing else to journal.
 - User `rdtsc`/`rdtscp` are trapped and journaled, and user `cpuid` is answered
@@ -294,6 +296,8 @@ Kernel command line (`make run APPEND="..."`):
 | `stop_after=N` | stop for the debugger after N keyframes |
 | `dirty=N` | also take a keyframe once an epoch dirties N pages (default 8192) |
 | `pool=N` | without an IDE or AHCI disk: the RAM disk's page pool in MiB (default 64) |
+| `bench` / `bench=run` | after the run, print its cost and the verify, replay, rewind, and reverse-stepi times (`bench=run`: the cost only); see [`docs/benchmarks.md`](docs/benchmarks.md) |
+| `norecord` | run without recording (the benchmarks' baseline): nothing can be replayed |
 | `sabotage=clock` / `sabotage=entropy` | test hook: every replayed clock read one tick late, or one bit of every replayed random payload flipped; `selftest` must report divergence |
 
 | Target | Description |
@@ -346,7 +350,6 @@ included) is tracked in #235. Its main steps:
 - A branch counter, where the boot-time probe finds an exact one, to skip
   most of the breakpoint hits a replay of a preempted hot loop takes (#245);
   a bare-metal machine, NVMe, and a debug channel without COM ports (#236)
-- Overhead benchmarks (#255)
 - SMP-safe deterministic replay
 - Repair or remove the legacy subsystems (#233)
 
@@ -356,6 +359,7 @@ Full index: [`docs/README.md`](docs/README.md).
 
 - [Time-travel debugging: design, module map, limits](docs/architecture/time-travel.md)
 - [Platforms: TCG, KVM, PMU detection, the AHCI disk, bare metal](docs/architecture/hardware.md)
+- [Overhead: recording, keyframes, replay, rewind](docs/benchmarks.md)
 - [Reverse debugging with gdb](docs/testing/reverse-debugging.md)
 - [Driving time travel from MCP](docs/testing/mcp-server.md)
 - [Orthogonal persistence](docs/architecture/orthogonal-persistence.md) and

@@ -188,6 +188,7 @@ typedef struct {
     uint64_t journals_written;
     uint64_t restores;
     uint64_t replayed_steps;
+    uint64_t recorded_steps;     /* in the journals written */
 } tt_stats_t;
 const tt_stats_t* tt_stats(void);
 
