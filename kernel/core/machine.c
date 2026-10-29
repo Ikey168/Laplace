@@ -620,7 +620,7 @@ static void deliver_wakes(uint64_t step, bool idle) {
                 continue;
             }
             if (nr != WAKE_TIMER || !p || p->state != PROCESS_STATE_BLOCKED) {
-                machine_stop_diverged();
+                kio_diverged(IOREC_DEVICE, step);   /* named in "inputs" */
                 return;
             }
             wake_timed_out(p);

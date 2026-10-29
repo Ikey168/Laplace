@@ -217,15 +217,19 @@ static void mem_page(void* ctx, uint64_t va, uint64_t phys, pte_t pte) {
     *crc = crc32_ieee(*crc, P2V(phys), PM_PAGE);
 }
 
-/* A candidate that is not the point. Every 2^k-th, its state is compared
- * with the previous 2^k-th: registers first, the user memory only when they
- * are the same. The same state twice means the process, which runs alone
- * and without an entry until its point, repeats those checks forever and
- * never reaches a state it did not already show (a keyframe restored
- * wrongly, say, under a loop that waits for a signal). */
+/* A candidate that is not the point. From the 1024th on, every 2^k-th has
+ * its state compared with the previous 2^k-th: registers first, the user
+ * memory only when they are the same. The same state at two moments means
+ * the process, which runs alone and without an entry until its point,
+ * repeats what it did in between forever and never reaches a state it did
+ * not already show (a keyframe restored wrongly, say, under a loop that
+ * waits for a signal). One execution of the instruction can be checked a
+ * few times (at its breakpoint, again after a transparent fault restarts
+ * it), so the two compared checks are kept hundreds apart: they are never
+ * the same moment. */
 static void note_miss(process_t* p, const pm_state_t* s) {
     uint64_t n = ++g_cyc.checks;
-    if (n & (n - 1)) return;
+    if (n < 1024 || (n & (n - 1))) return;
     uint32_t fpu = fpu_crc_of(p);
     bool same = g_cyc.have && g_cyc.fs == s->fs_base && g_cyc.gs == s->gs_base && g_cyc.fpu == fpu &&
                 memcmp(g_cyc.regs, s->regs, sizeof(g_cyc.regs)) == 0;
