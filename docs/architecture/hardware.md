@@ -64,6 +64,18 @@ CACHE EXT after every write, so a keyframe that was committed survives a power
 cut. At boot the store is chosen in this order: the IDE disk, then the AHCI
 disk, then the RAM disk.
 
+## The IDE disk under KVM
+
+The IDE driver (`kernel/ide_driver.c`) moves each sector through the data
+port, and under KVM every `outs` element is an exit to QEMU: 256 per sector.
+On a GitHub-hosted runner, where KVM itself runs nested, writing one keyframe
+then took minutes. `kernel/core/bmide.c` moves the data by bus-master DMA
+instead, when the IDE controller has a bus master (PIIX, class 01:01 with
+prog-if bit 7, as in QEMU's default machine). It uses READ/WRITE DMA EXT
+through a 64 KiB bounce buffer, polled, and is used once a test read
+matches the PIO one. The boot log says which path it took:
+`boot: recording to the IDE disk (131072 sectors, bus-master DMA)`.
+
 ```bash
 LAPLACE_DISK=ahci bash scripts/test/qemu_persistence_demo.sh   # four power cuts on AHCI
 ```

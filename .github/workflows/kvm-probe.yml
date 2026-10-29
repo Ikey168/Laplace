@@ -1,8 +1,7 @@
 name: KVM probe (throwaway)
 
-# One-off diagnosis of the KVM step on the development branch (#236): where
-# the e2e boot (IDE disk) and the alarm boot spend their time under KVM.
-# Removed once the KVM step passes.
+# One-off run of the main workflow's KVM step on the development branch
+# (#236). Removed once it passes.
 
 on:
   push:
@@ -16,59 +15,12 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm musl-tools qemu-system-x86 gdb binutils
+          sudo apt-get install -y nasm musl-tools qemu-system-x86 gdb
           sudo chmod 666 /dev/kvm
       - name: Build
         run: make
-      - name: Sample where the guest runs
+      - name: The KVM step of laplace.yml
         run: |
-          cat > /tmp/sample.py <<'EOF'
-          import os, re, socket, subprocess, sys, tempfile, time
-          def sample(tag, extra, wait, n=12):
-              work = tempfile.mkdtemp()
-              con = os.path.join(work, "c.log")
-              mon = 45000 + n + len(tag)
-              q = subprocess.Popen(["qemu-system-x86_64", "-enable-kvm", "-cpu", "host", "-m", "256M",
-                                    "-display", "none", "-no-reboot", "-kernel", "build/laplace.elf",
-                                    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-                                    "-monitor", f"tcp:127.0.0.1:{mon},server=on,wait=off",
-                                    "-serial", f"file:{con}", "-serial", "null", "-serial", "null"] + extra,
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-              time.sleep(wait)
-              rips = []
-              try:
-                  m = socket.create_connection(("127.0.0.1", mon), timeout=10)
-                  m.settimeout(3)
-                  for i in range(n):
-                      m.sendall(b"info registers\n")
-                      time.sleep(0.5)
-                      buf = b""
-                      try:
-                          while True:
-                              d = m.recv(65536)
-                              if not d: break
-                              buf += d
-                              if len(d) < 65536 and b"EFER" in buf: break
-                      except socket.timeout:
-                          pass
-                      r = re.findall(rb"RIP=([0-9a-f]{16})", buf)
-                      if r: rips.append(r[-1].decode())
-                      time.sleep(0.5)
-                  m.sendall(b"info pic\n"); time.sleep(0.5)
-                  try: print(m.recv(65536).decode(errors="replace")[-1500:])
-                  except socket.timeout: pass
-              except Exception as e:
-                  print("monitor:", e)
-              print(f"=== {tag}: exited={q.poll()} rips:")
-              for r in rips:
-                  out = subprocess.run(["addr2line", "-f", "-e", "build/laplace.elf", "0x" + r],
-                                       capture_output=True, text=True).stdout.split()
-                  print("  ", r, " ".join(out))
-              print(open(con, errors="replace").read().replace("\r", "")[-2500:])
-              q.kill()
-          d = tempfile.mkdtemp() + "/d.img"
-          open(d, "wb").truncate(64 << 20)
-          sample("e2e-ide", ["-drive", f"file={d},format=raw,if=ide,index=0"], 40)
-          sample("alarm", ["-append", 'run="musl_spinner alarm 20" interval=10 keyframes=64 selftest exit'], 60)
-          EOF
-          timeout 600 python3 /tmp/sample.py
+          time QEMU_ACCEL=kvm bash tests/qemu/preempt_gate.sh
+          time make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
+          time QEMU_ACCEL=kvm python3 tests/qemu/timetravel_e2e.py

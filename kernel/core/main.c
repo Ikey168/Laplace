@@ -39,6 +39,7 @@
 #include "core/ksig.h"
 #include "core/preempt.h"
 #include "core/ahci.h"
+#include "core/bmide.h"
 #include "core/pmu.h"
 #include "core/tty.h"
 #include "core/net.h"
@@ -584,7 +585,10 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
      * (#236), else a volatile RAM disk. */
     fat_block_device_t* dev = checkpoint_ide_boot_bind();
     if (dev) {
-        kprintf("boot: recording to the IDE disk (%u sectors)\n", dev->total_sectors);
+        fat_block_device_t* dma = bmide_boot_bind(dev);
+        if (dma) dev = dma;
+        kprintf("boot: recording to the IDE disk (%u sectors%s)\n", dev->total_sectors,
+                dma ? ", bus-master DMA" : ", PIO");
     } else if ((dev = ahci_boot_bind()) != 0) {
         kprintf("boot: recording to the AHCI disk (%u sectors)\n", dev->total_sectors);
     } else {
