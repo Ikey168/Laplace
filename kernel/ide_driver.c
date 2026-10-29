@@ -36,6 +36,17 @@ static inline void outw(uint16_t port, uint16_t data) {
     __asm__ volatile("outw %0, %1" : : "a"(data), "Nd"(port));
 }
 
+/* A whole sector through the data port with one string instruction: under
+ * KVM each inw/outw is an exit to the emulator, a rep insw/outsw one per page
+ * (#236). */
+static inline void insw_rep(uint16_t port, uint16_t* dst, uint32_t count) {
+    __asm__ volatile("rep insw" : "+D"(dst), "+c"(count) : "d"(port) : "memory");
+}
+
+static inline void outsw_rep(uint16_t port, const uint16_t* src, uint32_t count) {
+    __asm__ volatile("rep outsw" : "+S"(src), "+c"(count) : "d"(port) : "memory");
+}
+
 static inline uint16_t inw(uint16_t port) {
     uint16_t data;
     __asm__ volatile("inw %1, %0" : "=a"(data) : "Nd"(port));
@@ -439,9 +450,7 @@ int ide_read_sectors(ide_device_t* ide_dev, uint8_t drive, uint64_t lba,
         }
         
         /* Read sector data (256 words = 512 bytes) */
-        for (int i = 0; i < 256; i++) {
-            buf[sector * 256 + i] = ide_read_data(ide_dev);
-        }
+        insw_rep(ide_dev->controller.io_base + IDE_REG_DATA, &buf[sector * 256], 256);
     }
     
     g_ide_stats.total_reads++;
@@ -487,9 +496,7 @@ int ide_write_sectors(ide_device_t* ide_dev, uint8_t drive, uint64_t lba,
         }
         
         /* Write sector data (256 words = 512 bytes) */
-        for (int i = 0; i < 256; i++) {
-            ide_write_data(ide_dev, buf[sector * 256 + i]);
-        }
+        outsw_rep(ide_dev->controller.io_base + IDE_REG_DATA, &buf[sector * 256], 256);
         
         /* Wait for write completion */
         if (ide_wait_ready(ide_dev, 5000) != IDE_SUCCESS) {
