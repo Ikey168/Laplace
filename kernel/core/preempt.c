@@ -9,9 +9,11 @@
 #include "core/fpu.h"
 #include "core/console.h"
 #include "iorec.h"
+#include "crc32_ieee.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
+int   memcmp(const void* a, const void* b, size_t n);
 
 static pm_builder_t    g_b;
 static uint8_t*        g_buf;            /* a record's payload (8-byte aligned) */
@@ -24,6 +26,14 @@ static uint32_t        g_hint;
 static bool            g_stepped;        /* the armed point needed string-instruction steps */
 static preempt_stats_t g_stats;
 static uint8_t         g_scratch[PM_PAGE] __attribute__((aligned(8)));
+/* Replay: the process's whole state at the last power-of-two check, to
+ * notice a loop that cannot reach the point (see preempt_cycled). */
+static struct {
+    uint64_t checks;
+    bool     have, have_mem, cycled;
+    uint64_t regs[PM_NREGS], fs, gs;
+    uint32_t fpu, mem;
+} g_cyc;
 
 static void* alloc(uint64_t n) { return kmalloc(n); }
 static void release(void* p) { kfree(p); }
@@ -148,6 +158,7 @@ preempt_arm_t preempt_arm(process_t* p, uint64_t step) {
     g_armed = true;
     g_pid = g_view.hdr.pid;
     g_step = step;
+    memset(&g_cyc, 0, sizeof(g_cyc));
     g_hint = 0;
     g_stepped = false;
     return PREEMPT_ARMED;
@@ -199,6 +210,43 @@ static bool read_page(void* ctx, uint64_t va, uint8_t* page) {
     return true;
 }
 
+static void mem_page(void* ctx, uint64_t va, uint64_t phys, pte_t pte) {
+    (void)pte;
+    uint32_t* crc = (uint32_t*)ctx;
+    *crc = crc32_ieee(*crc, &va, sizeof(va));
+    *crc = crc32_ieee(*crc, P2V(phys), PM_PAGE);
+}
+
+/* A candidate that is not the point. Every 2^k-th, its state is compared
+ * with the previous 2^k-th: registers first, the user memory only when they
+ * are the same. The same state twice means the process, which runs alone
+ * and without an entry until its point, repeats those checks forever and
+ * never reaches a state it did not already show (a keyframe restored
+ * wrongly, say, under a loop that waits for a signal). */
+static void note_miss(process_t* p, const pm_state_t* s) {
+    uint64_t n = ++g_cyc.checks;
+    if (n & (n - 1)) return;
+    uint32_t fpu = fpu_crc_of(p);
+    bool same = g_cyc.have && g_cyc.fs == s->fs_base && g_cyc.gs == s->gs_base && g_cyc.fpu == fpu &&
+                memcmp(g_cyc.regs, s->regs, sizeof(g_cyc.regs)) == 0;
+    uint32_t mem = 0;
+    if (same) vmm_for_each_page(p->address_space, mem_page, &mem);
+    if (same && g_cyc.have_mem && g_cyc.mem == mem) g_cyc.cycled = true;
+    memcpy(g_cyc.regs, s->regs, sizeof(g_cyc.regs));
+    g_cyc.fs = s->fs_base;
+    g_cyc.gs = s->gs_base;
+    g_cyc.fpu = fpu;
+    g_cyc.mem = mem;
+    g_cyc.have = true;
+    g_cyc.have_mem = same;
+}
+
+bool preempt_cycled(void) {
+    if (!g_armed || !g_cyc.cycled) return false;
+    kio_note_diverged(IOREC_PREEMPT, g_step);
+    return true;
+}
+
 pm_verdict_t preempt_check(process_t* p, const process_context_t* c) {
     if (!g_armed || (uint32_t)p->pid != g_pid || c->rip != g_view.hdr.regs[PM_RIP]) return PM_NO;
     g_stats.candidates++;
@@ -214,6 +262,7 @@ pm_verdict_t preempt_check(process_t* p, const process_context_t* c) {
     pm_mem_t mem = { read_page, p };
     pm_verdict_t v = pm_check(&g_view, &s, &mem, g_scratch, &g_hint);
     if (v == PM_STEP) g_stepped = true;
+    if (v == PM_NO) note_miss(p, &s);
     if (v == PM_MATCH) {
         g_stats.matched++;
         if (g_stepped) g_stats.matched_rep++;

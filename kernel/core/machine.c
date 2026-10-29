@@ -1275,6 +1275,16 @@ target_check:
             if (done) v = preempt_check(g_cur, &c);
         }
         if (v == PM_MATCH) return true;
+        if (preempt_cycled()) {
+            /* Looping where the point cannot be reached: the replay has left
+             * the recording. Verifying, the point is taken here, as at an
+             * entry that comes first. */
+            if (!g_lenient) {
+                stop_here(STOP_DIVERGED, 0);
+                machine_exit();
+            }
+            return true;
+        }
         uint32_t len;
         if (v == PM_NO && g_pm_slot >= 0 && (len = preempt_rep_len(g_cur, rip)) != 0) {
             /* A string instruction that cannot reach the point: let it

@@ -15,7 +15,9 @@
  * turns the first matching point into the entry. A recorded point inside a
  * repeated string instruction is reached by single-stepping its iterations.
  * A replay that reaches the segment's next real entry first has diverged:
- * it stops there and is reported in the "inputs" component.
+ * it stops there and is reported in the "inputs" component. So does one
+ * whose process comes back to a state it already had at the point's rip
+ * without matching it: it would loop there forever.
  */
 
 #ifndef CORE_PREEMPT_H
@@ -42,6 +44,10 @@ bool          preempt_armed(uint64_t* step);
 
 /* Replay: is p, with registers `c`, at the armed point? */
 pm_verdict_t  preempt_check(process_t* p, const process_context_t* c);
+/* Replay: the checks show the process looping through states it already
+ * had, so it can never reach the point. Journals the divergence (reported
+ * in "inputs"); the caller stops the replay. */
+bool          preempt_cycled(void);
 /* Replay, PM_STEP at a `rep movs`/`rep stos` (forward, 64-bit addressing):
  * run its iterations up to the recorded count here, element by element as
  * the CPU would, advancing rcx/rsi/rdi in *c (also when it stops early).
