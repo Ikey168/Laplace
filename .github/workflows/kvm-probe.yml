@@ -1,0 +1,26 @@
+name: KVM probe (throwaway)
+
+# One-off run of the main workflow's KVM step on the development branch
+# (#236). Removed once it passes.
+
+on:
+  push:
+    branches: [claude/festive-keller-m5xkmf]
+
+jobs:
+  kvm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm musl-tools qemu-system-x86 gdb
+          sudo chmod 666 /dev/kvm
+      - name: Build
+        run: make
+      - name: The KVM step of laplace.yml
+        run: |
+          time QEMU_ACCEL=kvm bash tests/qemu/preempt_gate.sh
+          time make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
+          time QEMU_ACCEL=kvm python3 tests/qemu/timetravel_e2e.py
