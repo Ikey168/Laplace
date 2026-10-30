@@ -116,7 +116,7 @@ def http_server():
         q.wait(timeout=1800)
         out = text()
         for line in out.splitlines():
-            if re.search(r"^httpd: (request|\d+ requests)|selftest: (inputs|verify rc|PASSED|FAILED)", line):
+            if re.search(r"^httpd: (request|\d+ requests)|selftest: (inputs|verify rc|first divergence|leak|PASSED|FAILED)", line):
                 print("  [httpd] " + line.strip()[:150], flush=True)
         check("httpd: 10 requests, exiting" in out, "httpd: the server answered all 10 and exited")
         m = re.search(r"selftest: inputs: (\d+) records", out)
@@ -141,7 +141,7 @@ def loopback():
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900, cwd=ROOT)
     out = r.stdout.decode(errors="replace").replace("\r", "")
     for line in out.splitlines():
-        if re.search(r"^netloop|selftest: (window|verify rc|PASSED|FAILED)", line):
+        if re.search(r"^netloop|selftest: (window|verify rc|first divergence|leak|PASSED|FAILED)", line):
             print("  [netloop] " + line.strip()[:150], flush=True)
     check(re.search(r"netloop client: port \d+, sent 200000, got 200000 back, 0 wrong, \d+ polls; "
                     r"20 of 20 datagrams answered", out) is not None,

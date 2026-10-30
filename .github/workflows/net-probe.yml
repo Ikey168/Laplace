@@ -1,0 +1,46 @@
+name: Loopback probe (throwaway)
+
+# One-off: the loopback TCP/UDP recording (musl_netloop) diverged in one
+# epoch on a runner and never locally. Record it 40 times and print the
+# diagnosis of any run that diverges. Removed once found.
+
+on:
+  push:
+    branches: [claude/festive-keller-m5xkmf]
+
+permissions:
+  contents: read
+
+jobs:
+  netloop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2]
+    env:
+      QEMU: ${{ github.workspace }}/tools/qemu-tcg-max
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm musl-tools qemu-system-x86
+      - name: Build
+        run: make
+      - name: Record and verify 20 times
+        run: |
+          bad=0
+          for i in $(seq 1 20); do
+            out=$(timeout 400 "$QEMU" -m 512M -display none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+                  -kernel build/laplace.elf -append "run=musl_netloop interval=5 keyframes=64 selftest exit" \
+                  -serial stdio -serial null -serial null 2>&1 | tr -d '\r')
+            v=$(echo "$out" | grep -E 'verify rc')
+            echo "$i: $v"
+            case "$v" in *" 0 diverged"*) ;; *)
+              bad=$((bad + 1))
+              echo "$out" | grep -E '^netloop|selftest:|timetravel:|leak|diverg' | head -40 ;;
+            esac
+          done
+          echo "$bad of 20 diverged"
