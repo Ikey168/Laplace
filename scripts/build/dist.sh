@@ -32,7 +32,7 @@ bash scripts/build/sqlite.sh
 
 # A dynamically linked musl program and the loader it names.
 mkdir -p build/ext/dist
-"$MUSL_CC" -O2 -g -o build/ext/dist/hello_dyn user/linux/hello.c
+"$MUSL_CC" -march=x86-64 -mtune=generic -O2 -g -o build/ext/dist/hello_dyn user/linux/hello.c
 interp=$(readelf -l build/ext/dist/hello_dyn | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
 
 rm -rf "$STAGE" "$DIST/$NAME.tar.gz"

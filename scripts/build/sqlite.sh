@@ -28,6 +28,6 @@ if [ ! -f "$SRC/$TARBALL/sqlite3.c" ]; then
         "$TARBALL/shell.c"
 fi
 # One thread, no extension loading: what a static program in the machine has.
-"$MUSL_CC" -static -O2 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC/$TARBALL" \
+"$MUSL_CC" -march=x86-64 -mtune=generic -static -O2 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC/$TARBALL" \
     -o "$OUT" "$SRC/$TARBALL/shell.c" "$SRC/$TARBALL/sqlite3.c" -lm
 echo "$OUT: SQLite 3.44.2, $(stat -c %s "$OUT") bytes"

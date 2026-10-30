@@ -23,9 +23,14 @@ BUILD   := build
 KBUILD  := $(BUILD)/kernel
 UBUILD  := $(BUILD)/user
 
+# Every image the machine runs is built for the baseline x86-64 ISA, whatever
+# the compiler defaults to: QEMU's default CPU (qemu64) has no BMI2 or AVX,
+# and a compiler that targets x86-64-v3 emits shlx and the like.
+ISA     := -march=x86-64 -mtune=generic
+
 # Kernel: freestanding, no SSE/x87 state (the context switch saves only the
 # general registers), -Werror so the bootable build stays green.
-KCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie -mcmodel=kernel \
+KCFLAGS := -m64 $(ISA) -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie -mcmodel=kernel \
            -DLAPLACE_KERNEL -DLAPLACE_VERSION='"$(VERSION)"' \
            -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone \
            -mgeneral-regs-only -fno-tree-loop-distribute-patterns \
@@ -71,7 +76,7 @@ USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
 MUSL_CC     ?= musl-gcc
 LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads benchcpu benchalloc pipeline httpd netloop
 LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
-UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
+UCFLAGS := -m64 $(ISA) -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
            -fno-stack-protector -fno-omit-frame-pointer \
            -fno-tree-loop-distribute-patterns -Wall -Wextra -Werror \
            -Iinclude -Iuser/laplace
@@ -99,7 +104,7 @@ $(UBUILD)/%.elf: user/laplace/%.c user/laplace/ulib.h include/laplace/syscalls.h
 
 $(UBUILD)/musl_%.elf: user/linux/%.c
 	@mkdir -p $(dir $@)
-	$(MUSL_CC) -static -O2 -g -o $@ $<
+	$(MUSL_CC) $(ISA) -static -O2 -g -o $@ $<
 
 # The boot banner names the version.
 $(KBUILD)/kernel/core/main.o: VERSION

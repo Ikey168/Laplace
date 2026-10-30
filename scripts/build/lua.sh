@@ -23,5 +23,5 @@ if [ "$have" != "$COMMIT" ]; then
     exit 1
 fi
 # onelua.c is the whole interpreter in one translation unit.
-"$MUSL_CC" -static -O2 -std=gnu99 -DLUA_USE_POSIX -o "$OUT" "$SRC/onelua.c" -lm
+"$MUSL_CC" -march=x86-64 -mtune=generic -static -O2 -std=gnu99 -DLUA_USE_POSIX -o "$OUT" "$SRC/onelua.c" -lm
 echo "$OUT: Lua ${TAG#v} ($COMMIT), $(stat -c %s "$OUT") bytes"

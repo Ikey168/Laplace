@@ -15,7 +15,7 @@ MUSL_CC=${MUSL_CC:-musl-gcc}
 mkdir -p "$OUT"
 
 if [ ! -s "$OUT/musl.manifest" ]; then
-    "$MUSL_CC" -O2 -g -o "$OUT/hello_dyn" user/linux/hello.c
+    "$MUSL_CC" -march=x86-64 -mtune=generic -O2 -g -o "$OUT/hello_dyn" user/linux/hello.c
     interp=$(readelf -l "$OUT/hello_dyn" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
     {
         echo "$OUT/hello_dyn:/bin/hello_dyn"

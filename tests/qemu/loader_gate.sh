@@ -17,8 +17,8 @@ trap 'rm -rf "$W"' EXIT
 fail=0
 check() { if echo "$1" | grep -qE "$2"; then echo "[ok] $3"; else echo "[FAIL] $3"; fail=1; fi; }
 
-$MUSL_CC -static -O2 -o "$W/musl_args.elf" user/linux/args.c
-$MUSL_CC -static-pie -O2 -o "$W/musl_args_pie.elf" user/linux/args.c
+$MUSL_CC -march=x86-64 -static -O2 -o "$W/musl_args.elf" user/linux/args.c
+$MUSL_CC -march=x86-64 -static-pie -O2 -o "$W/musl_args_pie.elf" user/linux/args.c
 
 for m in musl_args musl_args_pie; do
     out=$(timeout 120 "$QEMU" -m 256M -display none -no-reboot \
