@@ -21,7 +21,7 @@ QEMU=${QEMU:-qemu-system-x86_64}
 ACCEL=()
 # KVM runs the loops far faster than TCG: more work, so they still span
 # several 1 ms slices.
-K=1 KR=1
+K=1 KR=5   # KR: the rep copies span many 1 ms slices on a fast runner
 if [ "${QEMU_ACCEL:-tcg}" = kvm ]; then ACCEL=(-enable-kvm -cpu host); K=2 KR=20; fi
 fail=0
 
