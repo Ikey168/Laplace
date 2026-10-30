@@ -933,6 +933,46 @@ bool net_external(int32_t i) {
 
 /* ---- Keyframes ---- */
 
+/* s's fields in a zeroed copy, without its buffers. A socket's padding
+ * (net_addr_t has two bytes, sock_t a few more) holds whatever a struct
+ * assignment such as `s->local = a` copied from the stack, which differs
+ * between a recording and its replay: only the fields may reach a keyframe
+ * or a checksum. */
+static void canon(const sock_t* s, sock_t* c) {
+    memset(c, 0, sizeof(*c));
+    c->used = s->used;
+    c->open = s->open;
+    c->type = s->type;
+    c->state = s->state;
+    c->local.ip = s->local.ip;
+    c->local.port = s->local.port;
+    c->remote.ip = s->remote.ip;
+    c->remote.port = s->remote.port;
+    c->bound = s->bound;
+    c->connected = s->connected;
+    c->loop = s->loop;
+    c->peer = s->peer;
+    c->listener = s->listener;
+    c->backlog = s->backlog;
+    c->nq = s->nq;
+    memcpy(c->q, s->q, sizeof(c->q));
+    c->rhead = s->rhead;
+    c->rlen = s->rlen;
+    c->slen = s->slen;
+    c->iss = s->iss;
+    c->snd_una = s->snd_una;
+    c->snd_nxt = s->snd_nxt;
+    c->rcv_nxt = s->rcv_nxt;
+    c->peer_wnd = s->peer_wnd;
+    c->rd_shut = s->rd_shut;
+    c->wr_shut = s->wr_shut;
+    c->fin_rcvd = s->fin_rcvd;
+    c->fin_sent = s->fin_sent;
+    c->connect_pending = s->connect_pending;
+    c->need_arp = s->need_arp;
+    c->err = s->err;
+}
+
 static void save(ksf_writer_t* w, void* ctx) {
     (void)ctx;
     ksf_put_u32(w, g_isn);
@@ -946,8 +986,8 @@ static void save(ksf_writer_t* w, void* ctx) {
         sock_t* s = &g_s[i];
         if (!s->used) continue;
         ksf_put_u32(w, (uint32_t)i);
-        sock_t copy = *s;
-        copy.rbuf = copy.sbuf = 0;
+        sock_t copy;
+        canon(s, &copy);
         ksf_put(w, &copy, sizeof(copy));
         uint8_t tmp[512];
         for (uint32_t off = 0; off < s->rlen; off += sizeof(tmp)) {
@@ -1000,8 +1040,8 @@ static uint32_t checksum(void* ctx) {
     for (int32_t i = 0; i < NSOCK; i++) {
         sock_t* s = &g_s[i];
         if (!s->used) continue;
-        sock_t copy = *s;
-        copy.rbuf = copy.sbuf = 0;
+        sock_t copy;
+        canon(s, &copy);
         copy.rhead = 0;
         crc = divergence_checksum(crc, &i, sizeof(i));
         crc = divergence_checksum(crc, &copy, sizeof(copy));
