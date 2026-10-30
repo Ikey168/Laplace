@@ -105,6 +105,25 @@ interpreter loop is preempted too, 39 times.
   - A branch counter, on bare metal or a host with a vPMU (#236), would
     remove the cost. No CI machine has one.
 
+## Keyframes at scale (#244)
+
+`tests/qemu/scale_gate.sh`, QEMU 8.2 TCG, `-m 1G`: `musl_bigmem resident
+256 300` fills 256 MiB (65536 pages), then rewrites a 64-page working set for
+300 rounds, with a keyframe every 5 ms and 8 keyframes retained.
+
+| | |
+|---|---|
+| keyframes taken | 719 (8 retained: the base keyframe that wrote the fill is evicted) |
+| pages written by all keyframes | 82836, of which about 65600 are the fill |
+| pages written per keyframe after the fill | about 24 (of 65536 resident) |
+| pages kept in their slot instead of written | 31818354 |
+| the newest keyframe | holds 65552 pages, wrote 0 |
+| verify of the 8 retained epochs | 0 diverged, 2.3 s |
+
+A keyframe's writeback follows the pages its epoch dirtied, not the resident
+size, and the retained keyframes restore and replay without the one that
+wrote most of their pages.
+
 ## Budgets
 
 The first numbers set these budgets. A regression past one should be
