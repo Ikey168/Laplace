@@ -147,11 +147,14 @@ run: kernel $(DISK) $(BUILD)/rootfs.cpio
 # Record the heisenbug until it fires, then verify every retained epoch
 # byte-exact, check that a perturbed replay is caught, and find the clobbering
 # store backward. QEMU exits 1 on success (isa-debug-exit), 3 on failure.
+SELFTEST_TIMEOUT ?= 600
+
 selftest: kernel
-	@$(QEMU) $(QEMU_FLAGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+	@timeout $(SELFTEST_TIMEOUT) $(QEMU) $(QEMU_FLAGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 	    -kernel $(BUILD)/laplace.elf -append "selftest exit" \
 	    -serial stdio -serial null -serial null; \
-	 status=$$?; [ $$status -eq 1 ] || { echo "selftest failed (status $$status)"; exit 1; }
+	 status=$$?; [ $$status -ne 124 ] || echo "selftest: no result after $(SELFTEST_TIMEOUT) s"; \
+	 [ $$status -eq 1 ] || { echo "selftest failed (status $$status)"; exit 1; }
 
 # Everything CI runs: host unit tests are in .github/workflows/laplace.yml;
 # these are the booted-kernel gates.

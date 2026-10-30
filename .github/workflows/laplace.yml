@@ -18,6 +18,7 @@ permissions:
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -85,6 +86,7 @@ jobs:
 
   headless-demos:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: unit-tests
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +103,7 @@ jobs:
 
   qemu:
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     needs: unit-tests
     steps:
       - uses: actions/checkout@v4
@@ -177,6 +180,7 @@ jobs:
   bench:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     needs: unit-tests
     steps:
       - uses: actions/checkout@v4
