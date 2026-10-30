@@ -109,7 +109,9 @@ for secs in 3 4 2.5 3.5; do
             lost=$(( last - first + 20000 )); [ "$lost" -lt 0 ] && lost=0
             progress=$(( last - prev_first ))
             echo "         lost at most $lost counts to the cut (work since the newest keyframe)"
-            [ $(( lost * 10 )) -le "$progress" ] || { echo "  [FAIL] lost $lost of $progress counts: more than one keyframe interval"; fail=1; }
+            # The counter prints every 20000, so `lost` overstates the work
+            # lost by up to one print; what is left of it must be under 10%.
+            [ $(( (lost - 20000) * 10 )) -le "$progress" ] || { echo "  [FAIL] lost $lost of $progress counts: more than one keyframe interval"; fail=1; }
         fi
     fi
     prev_first=${first:-0}
