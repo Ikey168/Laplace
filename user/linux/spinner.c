@@ -71,10 +71,13 @@ int main(int argc, char** argv) {
         struct itimerval it = { { 0, 5000 }, { 0, 5000 } };
         printf("spinner: spinning for %d alarms\n", n);
         setitimer(ITIMER_REAL, &it, 0);
-        while (g_alarms < n) {}
+        /* The count the loop saw: another alarm may land before the timer
+         * is stopped. */
+        int seen;
+        while ((seen = g_alarms) < n) {}
         struct itimerval off = { { 0, 0 }, { 0, 0 } };
         setitimer(ITIMER_REAL, &off, 0);
-        printf("spinner: %d alarms arrived while spinning\n", g_alarms);
+        printf("spinner: %d alarms arrived while spinning\n", seen);
         return 0;
     }
     if (argc < 4) {
