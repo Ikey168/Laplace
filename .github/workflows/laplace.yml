@@ -105,6 +105,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     needs: unit-tests
+    # The runners' distribution is built for x86-64-v3: TCG guests get
+    # QEMU's max CPU (tools/qemu-tcg-max), KVM guests the host's.
+    env:
+      QEMU: ${{ github.workspace }}/tools/qemu-tcg-max
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
@@ -182,6 +186,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     needs: unit-tests
+    # The runners' distribution is built for x86-64-v3: TCG guests get
+    # QEMU's max CPU (tools/qemu-tcg-max), KVM guests the host's.
+    env:
+      QEMU: ${{ github.workspace }}/tools/qemu-tcg-max
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain

@@ -107,7 +107,10 @@ tools/laplace-run --disk test.img selftest exit    # record, verify every epoch,
 ```
 
 `tools/laplace-run --help` lists its options (`--kvm`, `--disk`, `--seed`,
-`--mem`). `boot/laplace.iso` boots a BIOS machine or `qemu -cdrom`. From a
+`--mem`, `--cpu`). Under TCG it gives the guest QEMU's `max` CPU: the release's
+Linux programs are built on a distribution compiled for x86-64-v3, so under
+KVM or on a physical machine they need a Haswell-or-later CPU
+([details](docs/architecture/hardware.md#which-cpu-the-guest-needs)). `boot/laplace.iso` boots a BIOS machine or `qemu -cdrom`. From a
 source tree, `make dist` builds the tarball and `make dist-test` boots it
 unpacked elsewhere. Changes per version: [`CHANGELOG.md`](CHANGELOG.md).
 

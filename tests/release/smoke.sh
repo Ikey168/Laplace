@@ -72,7 +72,7 @@ else
 fi
 
 # The ISO: GRUB boots the kernel, which runs the demo until it stops.
-timeout 120 qemu-system-x86_64 -m 256M -display none -no-reboot -cdrom "$rel/boot/laplace.iso" \
+timeout 120 "${QEMU:-qemu-system-x86_64}" -m 256M -display none -no-reboot -cdrom "$rel/boot/laplace.iso" \
     -serial "file:$work/iso.log" -serial null -serial null < /dev/null > /dev/null 2>&1 &
 ipid=$!
 for _ in $(seq 1 200); do

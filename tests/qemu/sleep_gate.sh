@@ -60,7 +60,7 @@ def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 mcp_port = free_port()
 console = tempfile.mktemp()
-q = subprocess.Popen(["qemu-system-x86_64", "-m", "256M", "-display", "none", "-no-reboot",
+q = subprocess.Popen([os.environ.get("QEMU", "qemu-system-x86_64"), "-m", "256M", "-display", "none", "-no-reboot",
                       "-kernel", "build/laplace.elf", "-append", 'run="musl_sleeper idle 60000"',
                       "-serial", f"file:{console}", "-serial", "null",
                       "-serial", f"tcp:127.0.0.1:{mcp_port},server,nowait"])

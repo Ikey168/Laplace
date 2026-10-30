@@ -64,6 +64,24 @@ CACHE EXT after every write, so a keyframe that was committed survives a power
 cut. At boot the store is chosen in this order: the IDE disk, then the AHCI
 disk, then the RAM disk.
 
+## Which CPU the guest needs
+
+The kernel and Laplace's own programs are built for the baseline x86-64 ISA
+(`-march=x86-64`) and boot on any x86-64 CPU, including QEMU's default
+`qemu64`. The Linux programs link against the build host's musl (and the
+glibc gate runs the host's `lua5.4`), so they need what that distribution was
+compiled for. Ubuntu 26.04 on GitHub's runners is built for x86-64-v3 (BMI2,
+AVX2, FMA): its musl `libc.a` alone has a few hundred such instructions,
+and under `qemu64` they raise #UD. So:
+
+- under TCG, CI runs QEMU through `tools/qemu-tcg-max` (QEMU's `max` CPU,
+  which emulates them on any host), and `tools/laplace-run` uses `-cpu max`
+  unless `--cpu` names another model;
+- under KVM the guest has the host's CPU (`-cpu host`);
+- on bare metal, a build made on such a distribution needs a CPU with
+  x86-64-v3 (Intel Haswell, AMD Excavator, or later). A build made on a
+  baseline distribution runs anywhere.
+
 ## The IDE disk under KVM
 
 The IDE driver (`kernel/ide_driver.c`) moves each sector through the data

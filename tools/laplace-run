@@ -8,6 +8,8 @@
 #   --seed FILE    the filesystem's seed image (default: the demo seed, with
 #                  /bin/lua, /bin/sqlite3, and /bin/hello_dyn)
 #   --kvm          run under KVM (-enable-kvm -cpu host)
+#   --cpu MODEL    the guest CPU under TCG (default max: programs built on a
+#                  distribution compiled for x86-64-v3 need BMI2 and AVX2)
 #   --mem SIZE     guest memory (default 512M)
 #   --no-net       no network card
 #
@@ -39,6 +41,7 @@ fi
 disk=laplace-disk.img
 mem=512M
 accel=()
+cpu=max
 net=(-nic "user,model=e1000,hostfwd=tcp:127.0.0.1:${HTTP_PORT:-8080}-:8080")
 QEMU=${QEMU:-qemu-system-x86_64}
 
@@ -47,9 +50,10 @@ while [ $# -gt 0 ]; do
         --disk) disk=$2; shift 2 ;;
         --seed) seed=$2; shift 2 ;;
         --kvm)  accel=(-enable-kvm -cpu host); shift ;;
+        --cpu)  cpu=$2; shift 2 ;;
         --mem)  mem=$2; shift 2 ;;
         --no-net) net=(); shift ;;
-        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) break ;;
     esac
 done
@@ -57,6 +61,7 @@ done
 [ -f "$kernel" ] || { echo "laplace-run: no kernel at $kernel" >&2; exit 2; }
 command -v "$QEMU" >/dev/null || { echo "laplace-run: $QEMU not found (install qemu-system-x86)" >&2; exit 2; }
 [ -f "$disk" ] || truncate -s 1G "$disk"
+[ ${#accel[@]} -gt 0 ] || accel=(-cpu "$cpu")
 initrd=()
 [ -f "$seed" ] && initrd=(-initrd "$seed")
 

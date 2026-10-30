@@ -56,6 +56,11 @@ backward (#235).
 
 - QEMU TCG: every gate. QEMU/KVM on GitHub-hosted runners: the self-test, the
   preemption gate, and the e2e gate (#236).
+- The kernel is built for baseline x86-64. The release's Linux programs are
+  built on Ubuntu 26.04, which targets x86-64-v3, so they need BMI2 and AVX2:
+  `tools/laplace-run` gives a TCG guest QEMU's `max` CPU, and KVM or a
+  physical machine needs a Haswell-or-later CPU
+  ([`docs/architecture/hardware.md`](docs/architecture/hardware.md)).
 - Not yet shown: a bare-metal machine, and the branch-counter path on a host
   whose PMU is exposed. No such machine has run Laplace yet
   ([`docs/architecture/hardware.md`](docs/architecture/hardware.md)).

@@ -85,7 +85,7 @@ def field(text, key):
 
 port = free_port()
 console = tempfile.mktemp()
-q = subprocess.Popen(["qemu-system-x86_64", "-m", "256M", "-display", "none", "-no-reboot",
+q = subprocess.Popen([os.environ.get("QEMU", "qemu-system-x86_64"), "-m", "256M", "-display", "none", "-no-reboot",
                       "-kernel", "build/laplace.elf", "-append",
                       'run="musl_threads race 300000" interval=10 keyframes=64',
                       "-serial", f"file:{console}", "-serial", "null",
