@@ -1,7 +1,8 @@
 name: TCG probe (throwaway)
 
-# One-off: where the in-kernel self-test spends its time under the runners'
-# QEMU TCG when it does not finish. Removed once the qemu job passes.
+# One-off: the self-test panics with #UD at a valid instruction under the
+# runners' QEMU TCG. Which configurations do, and are the guest's code bytes
+# what the ELF has? Removed once the qemu job passes.
 
 on:
   push:
@@ -13,69 +14,85 @@ permissions:
 jobs:
   tcg:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        n: [1, 2, 3]
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm musl-tools qemu-system-x86 binutils
-          qemu-system-x86_64 --version | head -1; gcc --version | head -1; grep -m1 'model name' /proc/cpuinfo
+      - name: Versions
+        run: |
+          qemu-system-x86_64 --version | head -1
+          dpkg -l | grep -E 'qemu-system-x86|seabios|ipxe-qemu' | awk '{print $2, $3}'
+          gcc --version | head -1
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -cE '.'
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E 'avx512|apx|amx|avx10|lam|fred' | tr '\n' ' '; echo
       - name: Build
         run: make
-      - name: Self-test boots, sampled when one hangs
+      - name: Configurations
         run: |
-          cat > /tmp/sample.py <<'PY'
-          import os, re, socket, subprocess, sys, tempfile, time
-          def boot(i):
+          cat > /tmp/probe.py <<'PY'
+          import os, re, socket, subprocess, tempfile, time
+          def boot(tag, extra, dump=False):
               work = tempfile.mkdtemp()
               con = os.path.join(work, "c.log")
-              mon = 46000 + i
+              mon = 47000 + (abs(hash(tag)) % 1000)
               q = subprocess.Popen(["qemu-system-x86_64", "-m", "256M", "-display", "none", "-no-reboot",
-                                    "-kernel", "build/laplace.elf", "-append", "selftest exit",
+                                    "-kernel", "build/laplace.elf", "-append", "selftest",
                                     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
                                     "-monitor", f"tcp:127.0.0.1:{mon},server=on,wait=off",
-                                    "-serial", f"file:{con}", "-serial", "null", "-serial", "null"],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                                    "-serial", f"file:{con}", "-serial", "null", "-serial", "null"] + extra,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
               t0 = time.monotonic()
-              while q.poll() is None and time.monotonic() - t0 < 240:
+              text = ""
+              while time.monotonic() - t0 < 90 and q.poll() is None:
                   time.sleep(0.5)
-              text = open(con, errors="replace").read().replace("\r", "")
-              if q.poll() is not None:
-                  print(f"=== boot {i}: exit {q.returncode} after {time.monotonic() - t0:.0f} s; "
-                        + ("PASSED" if "selftest: PASSED" in text else "no PASSED"))
-                  if "selftest: PASSED" not in text:
-                      print(text[-3000:])
-                  return
-              print(f"=== boot {i}: still running after 240 s")
-              rips = []
-              m = socket.create_connection(("127.0.0.1", mon), timeout=10)
-              m.settimeout(2)
-              for _ in range(16):
-                  m.sendall(b"info registers\n")
-                  time.sleep(0.4)
-                  buf = b""
-                  try:
-                      while b"EFER" not in buf:
-                          d = m.recv(65536)
-                          if not d: break
-                          buf += d
-                  except socket.timeout:
-                      pass
-                  r = re.findall(rb"RIP=([0-9a-f]{16})", buf)
-                  if r: rips.append(r[-1].decode())
-                  time.sleep(0.6)
-              for r in rips:
-                  out = subprocess.run(["addr2line", "-f", "-i", "-e", "build/laplace.elf", "0x" + r],
-                                       capture_output=True, text=True).stdout.split()
-                  print("  ", r, " ".join(out))
-              print(text[-4000:])
-              q.kill()
-          for i in range(6):
-              boot(i)
+                  text = open(con, errors="replace").read().replace("\r", "") if os.path.exists(con) else ""
+                  if "kernel panic" in text or "selftest: PASSED" in text or "selftest: FAILED" in text:
+                      time.sleep(1)
+                      break
+              text = open(con, errors="replace").read().replace("\r", "") if os.path.exists(con) else ""
+              res = ("PASSED" if "selftest: PASSED" in text else
+                     (re.search(r"kernel panic: .*", text).group(0) if "kernel panic" in text else
+                      "no result (exit %s)" % q.poll()))
+              print(f"=== {tag}: {res}", flush=True)
+              if dump and "kernel panic" in text and q.poll() is None:
+                  rip = re.search(r"rip ([0-9a-f]{16})", text).group(1)
+                  m = socket.create_connection(("127.0.0.1", mon), timeout=10)
+                  m.settimeout(2)
+                  def cmd(c):
+                      m.sendall(c.encode() + b"\n")
+                      time.sleep(0.8)
+                      out = b""
+                      try:
+                          while True:
+                              d = m.recv(65536)
+                              if not d: break
+                              out += d
+                      except socket.timeout:
+                          pass
+                      return out.decode(errors="replace")
+                  cmd("")
+                  start = int(rip, 16) - 32
+                  print(cmd(f"x /48xb 0x{start:x}")[-2500:])
+                  print(cmd("info registers")[-2500:])
+                  od = subprocess.run(["objdump", "-d", "build/laplace.elf", f"--start-address=0x{start:x}",
+                                       f"--stop-address=0x{start + 48:x}"], capture_output=True, text=True).stdout
+                  print("ELF:\n" + "\n".join(od.splitlines()[-16:]))
+              if q.poll() is None:
+                  q.kill()
+              if "PASSED" not in res and not dump:
+                  print("\n".join(text.splitlines()[-6:]))
+          boot("default", [], dump=True)
+          boot("one-insn-per-tb", ["-accel", "tcg,one-insn-per-tb=on"])
+          boot("tb-size-small", ["-accel", "tcg,tb-size=64"])
+          boot("cpu max", ["-cpu", "max"])
+          boot("cpu qemu64", ["-cpu", "qemu64"])
+          boot("cpu Skylake-Client", ["-cpu", "Skylake-Client"])
+          boot("cpu EPYC", ["-cpu", "EPYC"])
+          boot("thread=single", ["-accel", "tcg,thread=single"])
+          boot("-m 512M", ["-m", "512M"])
           PY
-          python3 /tmp/sample.py
+          python3 /tmp/probe.py
