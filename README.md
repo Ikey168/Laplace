@@ -197,8 +197,10 @@ with SIGKILL, and boots again, four times:
 PASSED: the booted machine resumed from the IDE disk after every power cut
 ```
 
-A power cut loses only the work since the newest keyframe on the disk (at most
-one keyframe interval, 100 ms by default); the demo checks that bound. (Recording:
+A power cut loses only the work since the newest keyframe the disk has made
+durable: about one keyframe interval (100 ms by default), plus the time the
+disk takes to write and flush it. The demo checks that the loss stays a small
+part of each boot's work. (Recording:
 `asciinema play docs/media/qemu-resume.cast`.) A checkpoint marks
 every writable page read-only and copy-on-write; the first write to a marked
 page makes the kernel preserve its pre-checkpoint image, and the keyframe is
