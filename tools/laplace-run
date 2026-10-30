@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Boot Laplace in QEMU from a release (or a built tree), without make.
+#
+#   laplace-run [options] [kernel options...]
+#
+#   --disk FILE    the recording's disk (created, 1 GiB sparse, if missing;
+#                  default: laplace-disk.img in the current directory)
+#   --seed FILE    the filesystem's seed image (default: the demo seed, with
+#                  /bin/lua, /bin/sqlite3, and /bin/hello_dyn)
+#   --kvm          run under KVM (-enable-kvm -cpu host)
+#   --mem SIZE     guest memory (default 512M)
+#   --no-net       no network card
+#
+# The rest is the kernel command line, e.g.
+#
+#   laplace-run                                   # the heisenbug demo
+#   laplace-run 'run="/bin/lua /scripts/gate.lua"'
+#   laplace-run run=musl_httpd                    # a web server on :8080
+#   laplace-run selftest exit                     # record, verify, exit
+#
+# The console is this terminal (Ctrl-A X quits QEMU). When the machine
+# stops, gdb attaches on 127.0.0.1:$GDB_PORT (default 1235) and MCP on
+# 127.0.0.1:$MCP_PORT (default 1236, through tools/laplace-mcp). Guest port
+# 8080 is forwarded to 127.0.0.1:$HTTP_PORT (default 8080).
+#
+# With `exit` on the command line, QEMU's exit status is 1 when the
+# self-test passed and 3 when it failed; laplace-run turns those into 0 and 1.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+# A release puts the kernel in boot/ and the seed in seed/; a source tree in build/.
+if [ -f "$here/../boot/laplace.elf" ]; then
+    kernel=$here/../boot/laplace.elf
+    seed=$here/../seed/demo.cpio
+else
+    kernel=$here/../build/laplace.elf
+    seed=$here/../build/rootfs.cpio
+fi
+disk=laplace-disk.img
+mem=512M
+accel=()
+net=(-nic "user,model=e1000,hostfwd=tcp:127.0.0.1:${HTTP_PORT:-8080}-:8080")
+QEMU=${QEMU:-qemu-system-x86_64}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --disk) disk=$2; shift 2 ;;
+        --seed) seed=$2; shift 2 ;;
+        --kvm)  accel=(-enable-kvm -cpu host); shift ;;
+        --mem)  mem=$2; shift 2 ;;
+        --no-net) net=(); shift ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) break ;;
+    esac
+done
+
+[ -f "$kernel" ] || { echo "laplace-run: no kernel at $kernel" >&2; exit 2; }
+command -v "$QEMU" >/dev/null || { echo "laplace-run: $QEMU not found (install qemu-system-x86)" >&2; exit 2; }
+[ -f "$disk" ] || truncate -s 1G "$disk"
+initrd=()
+[ -f "$seed" ] && initrd=(-initrd "$seed")
+
+set +e
+"$QEMU" "${accel[@]}" -m "$mem" -display none -no-reboot \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    -kernel "$kernel" "${initrd[@]}" -append "$*" \
+    -drive "file=$disk,format=raw,if=ide,index=0" "${net[@]}" \
+    -serial mon:stdio \
+    -serial "tcp:127.0.0.1:${GDB_PORT:-1235},server,nowait" \
+    -serial "tcp:127.0.0.1:${MCP_PORT:-1236},server,nowait"
+status=$?
+set -e
+case "$status" in
+    0) exit 0 ;;
+    1) exit 0 ;;   # isa-debug-exit: the self-test passed
+    3) exit 1 ;;   # isa-debug-exit: the self-test failed
+    *) exit "$status" ;;
+esac

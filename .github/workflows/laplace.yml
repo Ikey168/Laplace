@@ -166,6 +166,8 @@ jobs:
         run: LAPLACE_DISK=ahci bash scripts/test/qemu_persistence_demo.sh
       - name: Bootable ISO (GRUB, BIOS)
         run: make iso
+      - name: The release tarball works on its own (make dist-test)
+        run: make dist-test
 
   # Recording overhead (#255): not a gate. Every push to main measures the
   # table under TCG and KVM and keeps it as an artifact.

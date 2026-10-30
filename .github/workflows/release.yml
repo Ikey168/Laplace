@@ -1,0 +1,73 @@
+name: Release
+
+# Publishes a GitHub release of the version in VERSION: the tarball
+# (scripts/build/dist.sh), the ISO, and SHA256SUMS, after the in-kernel
+# self-test and the release smoke test (tests/release/smoke.sh) pass on
+# exactly what is uploaded. Run it from the Actions tab (it tags the commit
+# v$VERSION), or push that tag.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version
+        id: v
+        run: |
+          version=$(cat VERSION)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match VERSION ($version)" >&2
+            exit 1
+          fi
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "release v$version already exists" >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm musl-tools qemu-system-x86 gdb grub-pc-bin xorriso mtools
+      - name: Build the release
+        run: make dist
+      - name: Self-test
+        run: make selftest
+      - name: The tarball works on its own
+        run: bash tests/release/smoke.sh build/dist/laplace-${{ steps.v.outputs.version }}-x86_64.tar.gz
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v v="## ${{ steps.v.outputs.version }}" '
+            $0 == v { on = 1; next }
+            on && /^## / { exit }
+            on { print }' CHANGELOG.md > notes.md
+          test -s notes.md
+          {
+            echo
+            echo '### Get started'
+            echo
+            echo '```bash'
+            echo 'sha256sum -c --ignore-missing SHA256SUMS'
+            echo 'tar xzf laplace-${{ steps.v.outputs.version }}-x86_64.tar.gz && cd laplace-${{ steps.v.outputs.version }}-x86_64'
+            echo 'tools/laplace-run                # the heisenbug demo; needs qemu-system-x86_64'
+            echo 'gdb programs/heisenbug.elf -ex "target remote :1235"   # once the machine stops'
+            echo '```'
+          } >> notes.md
+      - name: Publish
+        run: |
+          v=${{ steps.v.outputs.version }}
+          gh release create "v$v" --target "$GITHUB_SHA" --title "Laplace $v" --notes-file notes.md \
+            build/dist/laplace-$v-x86_64.tar.gz build/dist/laplace-$v-x86_64.iso build/dist/SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -55,6 +55,10 @@
 #include "revbreak.h"
 #include "replay_driver.h"
 
+#ifndef LAPLACE_VERSION
+#define LAPLACE_VERSION "dev"   /* the Makefile passes VERSION */
+#endif
+
 int strncmp(const char* a, const char* b, size_t n);
 int strcmp(const char* a, const char* b);
 size_t strlen(const char* s);
@@ -538,7 +542,7 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     serial_init(COM1);
     serial_init(COM2);
     serial_init(COM3);
-    kprintf("\nLaplace: a time-traveling debugger built as an operating system\n");
+    kprintf("\nLaplace %s: a time-traveling debugger built as an operating system\n", LAPLACE_VERSION);
     if (mb_magic != 0x2BADB002) panic("not booted by a Multiboot loader (magic %x)", mb_magic);
 
     const uint32_t* mbi = (const uint32_t*)P2V(mb_info);

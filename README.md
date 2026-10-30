@@ -90,6 +90,27 @@ make selftest                         # in-kernel: verify every epoch, catch a p
 bash scripts/test/qemu_persistence_demo.sh   # pull the power, boot, resume
 ```
 
+## Install a release
+
+Each [release](https://github.com/Ikey168/Laplace/releases) has a tarball with
+the kernel, a GRUB ISO, a seed image with Lua, SQLite, and a dynamically linked
+program, the user programs with their symbols, and the tools. It needs only
+`qemu-system-x86_64` (and gdb to debug):
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf laplace-0.1.0-x86_64.tar.gz && cd laplace-0.1.0-x86_64
+tools/laplace-run                                  # the heisenbug demo, recording to ./laplace-disk.img
+gdb programs/heisenbug.elf -ex 'target remote :1235'   # once the machine stops
+tools/laplace-run --disk lua.img 'run="/bin/lua /scripts/gate.lua"'
+tools/laplace-run --disk test.img selftest exit    # record, verify every epoch, exit 0 on success
+```
+
+`tools/laplace-run --help` lists its options (`--kvm`, `--disk`, `--seed`,
+`--mem`). `boot/laplace.iso` boots a BIOS machine or `qemu -cdrom`. From a
+source tree, `make dist` builds the tarball and `make dist-test` boots it
+unpacked elsewhere. Changes per version: [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Using the debugger
 
 ```bash
@@ -211,7 +232,7 @@ Everything in this table runs in the booted kernel and is exercised in CI
 | Preemption at any instruction without a counter: two loops with no system call interleave, a loop where only memory changes and `rep movsb` copies are preempted, a spin gets its timer's signals, and each replays byte-exact | `tests/qemu/preempt_gate.sh` |
 | Signals: SIGALRM from a timer interrupts a loop at journaled points with FPU state saved in the frame; a SIGSEGV handler recovers; masks, pending, sigsuspend, sigaltstack; every run replays byte-exact; an unhandled fault or abort() stops the machine and gdb shows the signal and the faulting line | `tests/qemu/signal_gate.sh` |
 | Blocking: a sleeping process and a working one replay byte-exact with each timer wake at its journaled step; a 10 s idle adds no steps and replays without waiting; a debugger stops the machine while everything waits | `tests/qemu/sleep_gate.sh` |
-| Incremental keyframes: 256 MiB resident records at about 90 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
+| Incremental keyframes: 256 MiB resident records at about 24 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
 | gdb: registers (x87, SSE, AVX, fs_base by a target description), memory, every thread, the program read from the target, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e, `tests/qemu/threads_gate.sh` |
 | MCP: protocol handshake, 13 tools (threads, vector registers), stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |

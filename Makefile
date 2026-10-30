@@ -6,7 +6,7 @@
 #   make selftest   boot, record the heisenbug, verify the replay, and exit
 #   make iso        build a GRUB rescue ISO (build/laplace.iso) for BIOS machines
 #   make test       the self-test plus the in-QEMU end-to-end gates
-#   make      the pre-Laplace wildcard build (does not compile; see #233)
+#   make dist       the release tarball (build/dist/laplace-VERSION-x86_64.tar.gz)
 #
 # Needs gcc, GNU ld, nasm, musl-gcc (musl-tools), and (to boot) qemu-system-x86_64.
 
@@ -17,6 +17,8 @@ OBJCOPY ?= objcopy
 QEMU    ?= qemu-system-x86_64
 GRUB_MKRESCUE ?= grub-mkrescue   # needs grub-pc-bin, xorriso, mtools
 
+VERSION := $(shell cat VERSION)
+
 BUILD   := build
 KBUILD  := $(BUILD)/kernel
 UBUILD  := $(BUILD)/user
@@ -24,7 +26,7 @@ UBUILD  := $(BUILD)/user
 # Kernel: freestanding, no SSE/x87 state (the context switch saves only the
 # general registers), -Werror so the bootable build stays green.
 KCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie -mcmodel=kernel \
-           -DLAPLACE_KERNEL \
+           -DLAPLACE_KERNEL -DLAPLACE_VERSION='"$(VERSION)"' \
            -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone \
            -mgeneral-regs-only -fno-tree-loop-distribute-patterns \
            -Wall -Wextra -Werror -Iinclude
@@ -76,7 +78,7 @@ UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
 ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -z noexecstack \
             -T user/laplace/user.ld
 
-.PHONY: all kernel user run selftest test iso clean
+.PHONY: all kernel user run selftest test iso dist dist-test clean
 
 all: kernel $(BUILD)/rootfs.cpio
 
@@ -98,6 +100,9 @@ $(UBUILD)/%.elf: user/laplace/%.c user/laplace/ulib.h include/laplace/syscalls.h
 $(UBUILD)/musl_%.elf: user/linux/%.c
 	@mkdir -p $(dir $@)
 	$(MUSL_CC) -static -O2 -g -o $@ $<
+
+# The boot banner names the version.
+$(KBUILD)/kernel/core/main.o: VERSION
 
 $(KBUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -177,6 +182,14 @@ iso: kernel
 	cp $(BUILD)/laplace.elf $(BUILD)/iso/boot/laplace.elf
 	printf 'set timeout=0\nset default=0\nmenuentry "Laplace" {\n  multiboot /boot/laplace.elf\n  boot\n}\n' > $(BUILD)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD)/laplace.iso $(BUILD)/iso
+
+# The release: build/dist/laplace-$(VERSION)-x86_64.tar.gz, the ISO, and
+# SHA256SUMS; `make dist-test` boots the tarball unpacked elsewhere.
+dist:
+	bash scripts/build/dist.sh
+
+dist-test: dist
+	bash tests/release/smoke.sh $(BUILD)/dist/laplace-$(VERSION)-x86_64.tar.gz
 
 clean:
 	rm -rf $(BUILD)
