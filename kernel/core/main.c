@@ -140,6 +140,7 @@ static void parse_cmdline(const char* cmd) {
             g_opts.selftest = true;
         } else if (len == 4 && strncmp(tok, "exit", 4) == 0) {
             g_opts.exit = true;
+            panic_exits(true);
         } else if (len == 5 && strncmp(tok, "bench", 5) == 0) {
             g_opts.bench = true;
         } else if (len == 9 && strncmp(tok, "bench=run", 9) == 0) {

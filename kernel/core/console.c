@@ -175,6 +175,9 @@ int ksnprintf(char* buf, uint32_t cap, const char* fmt, ...) {
     return (int)o.len;
 }
 
+static bool g_panic_exits;
+void panic_exits(bool on) { g_panic_exits = on; }
+
 void panic(const char* fmt, ...) {
     __asm__ volatile("cli");
     kputs("\n*** Laplace kernel panic: ");
@@ -183,5 +186,6 @@ void panic(const char* fmt, ...) {
     kvprintf(fmt, ap);
     va_end(ap);
     kputs("\n");
+    if (g_panic_exits) outb(0xF4, 1);   /* isa-debug-exit: status 3 */
     cpu_halt_forever();
 }
