@@ -56,10 +56,15 @@ if command -v gdb >/dev/null; then
     GDB_PORT=$port MCP_PORT=$((port + 1)) "$rel/tools/laplace-run" --no-net --disk "$work/gdb.img" \
         < /dev/null > "$work/gdb-console.log" 2>&1 &
     qpid=$!
-    for _ in $(seq 1 120); do
+    # The heisenbug fires when preemption, the clock, and a random payload
+    # line up, which can take a while; gdb attaching to a machine that still
+    # runs would stop it somewhere else.
+    for _ in $(seq 1 600); do
         grep -q "monitor: stopped" "$work/gdb-console.log" 2>/dev/null && break
         sleep 0.5
     done
+    stopped=$(tr -d '\r' < "$work/gdb-console.log" | grep -m1 "monitor: stopped" || true)
+    check "$stopped" "monitor: stopped \\(break: pid 1 asserted" "the demo stops at the heisenbug's assertion"
     g=$(timeout 300 gdb -q -batch "$rel/programs/heisenbug.elf" -ex 'set remotetimeout 120' \
         -ex "target remote 127.0.0.1:$port" -ex 'watch -l g.batch_limit' -ex 'reverse-continue' \
         -ex 'print g.batch_limit' 2>&1 || true)
@@ -67,6 +72,7 @@ if command -v gdb >/dev/null; then
     wait "$qpid" 2>/dev/null || true
     check "$g" "Hardware watchpoint 1: -location g.batch_limit" "gdb attaches to the stopped machine"
     check "$g" "New value = 48" "watch + reverse-continue finds the clobbering store"
+    echo "$g" | grep -q "New value = 48" || echo "$g" | tail -12 | sed 's/^/  gdb> /'
 else
     echo "[skip] gdb is not installed"
 fi
