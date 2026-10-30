@@ -2,6 +2,11 @@
  * See include/core/machine.h for the step, determinism, and coroutine model. */
 
 #include "core/machine.h"
+#include "core/pmu.h"
+#include "core/tty.h"
+#include "core/net.h"
+#include "core/e1000.h"
+#include "core/files.h"
 #include "core/timetravel.h"
 #include "core/proc.h"
 #include "core/mm.h"
@@ -11,6 +16,17 @@
 #include "time_record.h"
 #include "entropy_record.h"
 #include "laplace/syscalls.h"
+#include "core/kjournal.h"
+#include "core/linux.h"
+#include "core/vm.h"
+#include "core/kfpages.h"
+#include "core/kio.h"
+#include "core/pctl.h"
+#include "core/ksig.h"
+#include "core/files.h"
+#include "core/clock.h"
+#include "core/preempt.h"
+#include "iorec.h"
 
 void* memset(void* dst, int c, size_t n);
 
@@ -54,22 +70,58 @@ static bool           g_hwbp_armed;      /* some slot is set */
 static bool           g_hwbp_active;     /* a search or continue wants them on */
 static uint64_t       g_dr_enabled;      /* DR6 B0-B3 bits of the slots DR7 enables now */
 
+/* #245: the slot of the armed preemption point's breakpoint (-1: none), and
+ * single-stepping the whole segment for it (no slot free). */
+static int            g_pm_slot = -1;
+static bool           g_pm_stepping;
+static bool           g_pm_moved;        /* its breakpoint waits past a string instruction */
+/* Stepping over an execution breakpoint: RF for the instruction, and under
+ * QEMU's TCG a single step right after it (TCG applies RF to a whole
+ * translated block, so without the step a breakpoint in a loop would not hit
+ * again). Elsewhere RF alone, one trap per hit instead of two (#255). */
+static bool           g_stepping_over;
+static bool           g_rf_per_block;    /* TCG */
+static bool           g_rf_over;         /* RF alone was set since the last entry */
+static bool           g_step_over;       /* entering: step over the breakpoints at rip */
+/* #245: a user breakpoint reported at the instruction where a preemption
+ * point then matched is not reported again when that process resumes there. */
+static bool           g_bp_reported;
+static uint64_t       g_bp_rip;
+static uint32_t       g_over_pid;
+static uint64_t       g_over_rip;
+
 /* Scans (#226): called at every replayed entry, before the stop checks. */
 static machine_entry_hook_fn g_entry_hook;
 static void*                 g_entry_hook_ctx;
 
+/* #241: per-instruction hook while single-stepping (leak diagnosis). */
+static machine_insn_hook_fn g_insn_hook;
+static void*                g_insn_hook_ctx;
+
+/* #241: rolling hash of the registers at every entry of this epoch, journaled
+ * every KJ_TRACE_EVERY steps; on replay, the first step whose hash differs. */
+static uint64_t g_trace;
+static bool     g_trace_bad;
+static uint64_t g_trace_bad_step;
+
 /* ---- Accessors ---- */
 
 void machine_init(void) {
+    g_rf_per_block = pmu_tcg();
     sched_record_init(&g_sr, SCHED_REC_RECORD, g_sr_points, SCHED_POINTS_MAX);
 }
 
 machine_mode_t machine_mode(void) { return g_mode; }
 void machine_set_mode(machine_mode_t m) {
     g_mode = m;
-    sched_record_set_mode(&g_sr, m == MACHINE_LIVE ? SCHED_REC_RECORD : SCHED_REC_REPLAY);
+    sched_record_set_mode(&g_sr, m != MACHINE_LIVE ? SCHED_REC_REPLAY :
+                                 machine_norecord() ? SCHED_REC_OFF : SCHED_REC_RECORD);
     ktime_set_mode(m == MACHINE_LIVE ? TIME_REC_RECORD : TIME_REC_REPLAY);
     kentropy_set_mode(m == MACHINE_LIVE ? ENTROPY_REC_RECORD : ENTROPY_REC_REPLAY);
+    if (m == MACHINE_LIVE) {
+        preempt_disarm();
+        g_pm_stepping = false;
+    }
 }
 process_t* machine_current(void) { return g_cur; }
 void machine_set_current(process_t* p) { g_cur = p; }
@@ -84,6 +136,23 @@ void machine_set_position(uint64_t epoch, uint64_t step) {
     g_step = step;
     g_insn = 0;
     g_at_entry = true;
+    preempt_disarm();
+    g_pm_stepping = false;
+    g_over_pid = 0;
+    if (step == 0) {
+        g_trace = 0;
+        g_trace_bad = false;
+    }
+}
+
+bool machine_trace_mismatch(uint64_t* step) {
+    if (g_trace_bad && step) *step = g_trace_bad_step;
+    return g_trace_bad;
+}
+
+void machine_set_insn_hook(machine_insn_hook_fn fn, void* ctx) {
+    g_insn_hook = fn;
+    g_insn_hook_ctx = ctx;
 }
 const pending_entry_t* machine_pending(void) { return &g_pending; }
 void machine_set_pending(const pending_entry_t* e) { g_pending = *e; }
@@ -91,7 +160,26 @@ const machine_stop_t* machine_last_stop(void) { return &g_stop; }
 bool machine_started(void) { return g_started; }
 sched_record_t* machine_sched_record(void) { return &g_sr; }
 bool machine_quiet(void) { return g_mode == MACHINE_REPLAY; }
+
+uint64_t machine_device_write(uint32_t device, const void* buf, uint64_t len) {
+    if (machine_quiet()) return len;          /* the recording already did it */
+    switch (device) {
+    case MACHINE_DEV_CONSOLE: console_write((const char*)buf, (uint32_t)len); break;
+    case MACHINE_DEV_NET:     e1000_send((const uint8_t*)buf, (uint32_t)len); break;
+    default: break;
+    }
+    return len;
+}
 void machine_request_stop(void) { g_stop_request = true; }
+static bool g_lenient;
+void machine_set_lenient(bool on) { g_lenient = on; }
+static bool g_norecord;
+void machine_set_norecord(bool on) {
+    g_norecord = on;
+    if (g_mode == MACHINE_LIVE) sched_record_set_mode(&g_sr, on ? SCHED_REC_OFF : SCHED_REC_RECORD);
+}
+bool machine_norecord(void) { return g_norecord; }
+void machine_set_step_over_tf(bool tf) { g_rf_per_block = tf; }
 
 void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step) {
     g_has_target = true;
@@ -102,6 +190,12 @@ void machine_set_target(uint64_t step, uint64_t insn, uint64_t max_step) {
 void machine_clear_target(void) { g_has_target = false; }
 
 void machine_set_count_insns(bool on) { g_count_insns = on; g_counted = 0; }
+
+static bool want_stepping(void);
+void machine_stop_counting(void) {
+    g_count_insns = false;
+    if (!want_stepping()) g_stepping = false;   /* the next #DB does not re-arm TF */
+}
 void machine_set_hit_hook(machine_hit_hook_fn fn, void* ctx) {
     g_hit_hook = fn;
     g_hit_hook_ctx = ctx;
@@ -136,9 +230,15 @@ void machine_clear_hwbps(void) {
     g_hwbp_armed = false;
 }
 
-/* Program DR0-3/DR7 for the process about to run (breakpoints are per pid). */
+/* Program DR0-3/DR7 for the process about to run (breakpoints are per pid),
+ * and the armed preemption point (#245) in a slot the debugger leaves free. */
 static void load_hwbps(const process_t* p) {
     uint64_t dr7 = 0;
+    g_dr_enabled = 0;
+    g_pm_slot = -1;
+    g_pm_stepping = false;
+    g_pm_moved = false;
+    g_stepping_over = false;
     if (g_mode != MACHINE_REPLAY || !g_hwbp_active) {
         /* Breakpoints and watchpoints apply to recorded history, and only
          * while a continue or a search runs; plain navigation ignores them
@@ -146,23 +246,72 @@ static void load_hwbps(const process_t* p) {
          * breakpoint in DR6 even when DR7 does not enable it. */
         write_dr(7, 0);
         for (int i = 0; i < MACHINE_MAX_HWBP; i++) write_dr(i, 0);
-        g_dr_enabled = 0;
-        return;
+    } else {
+        for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
+            const machine_hwbp_t* b = &g_hwbp[i];
+            if (!g_hwbp_armed || !b->active || (b->pid && p && b->pid != p->tgid)) continue;
+            write_dr(i, b->addr);
+            uint64_t rw = b->kind & 3;
+            uint64_t ln = b->len == 8 ? 2 : b->len == 4 ? 3 : b->len == 2 ? 1 : 0;
+            if (rw == 0) ln = 0;
+            dr7 |= (1ULL << (i * 2));                  /* local enable */
+            dr7 |= (rw | (ln << 2)) << (16 + i * 4);
+            g_dr_enabled |= 1ULL << i;
+        }
     }
-    g_dr_enabled = 0;
-    for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
-        const machine_hwbp_t* b = &g_hwbp[i];
-        if (!g_hwbp_armed || !b->active || (b->pid && p && b->pid != (uint32_t)p->pid)) continue;
-        write_dr(i, b->addr);
-        uint64_t rw = b->kind & 3;
-        uint64_t ln = b->len == 8 ? 2 : b->len == 4 ? 3 : b->len == 2 ? 1 : 0;
-        if (rw == 0) ln = 0;
-        dr7 |= (1ULL << (i * 2));                  /* local enable */
-        dr7 |= (rw | (ln << 2)) << (16 + i * 4);
-        g_dr_enabled |= 1ULL << i;
+    uint64_t rip;
+    if (g_mode == MACHINE_REPLAY && preempt_armed_for(p, &rip)) {
+        for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
+            if (g_dr_enabled & (1ULL << i)) continue;
+            write_dr(i, rip);
+            dr7 |= 1ULL << (i * 2);                    /* execution, length 1 */
+            g_pm_slot = i;
+            break;
+        }
+        if (g_pm_slot < 0) g_pm_stepping = true;      /* every slot is the debugger's */
     }
     write_dr(6, 0);
     write_dr(7, dr7);
+}
+
+static void step_over(trap_frame_t* f) {
+    f->rflags |= RFLAGS_RF;
+    if (!g_rf_per_block) {
+        g_rf_over = true;
+        return;
+    }
+    f->rflags |= RFLAGS_TF;
+    g_stepping_over = true;
+}
+
+/* ---- x87/SSE/AVX ownership (#237) ---- */
+
+/* The process whose state the FPU registers hold (see core/fpu.h). */
+static process_t* g_fpu_owner;
+/* FS/GS base (#238): written to the MSRs when a different process runs, or
+ * when arch_prctl changes them. */
+static process_t* g_seg_owner;
+
+void machine_fpu_flush(void) {
+    if (g_fpu_owner) fpu_save(proc_arch(g_fpu_owner)->fpu);
+}
+
+void machine_fpu_forget(process_t* p) {
+    if (g_fpu_owner == p) g_fpu_owner = 0;
+    if (g_seg_owner == p) g_seg_owner = 0;
+}
+
+void machine_load_segment_bases(process_t* p) {
+    wrmsr(MSR_FS_BASE, proc_arch(p)->fs_base);
+    wrmsr(MSR_GS_BASE, proc_arch(p)->gs_base);
+    g_seg_owner = p;
+}
+
+static void fpu_switch_to(process_t* p) {
+    if (g_fpu_owner == p) return;
+    if (g_fpu_owner) fpu_save(proc_arch(g_fpu_owner)->fpu);
+    fpu_restore(proc_arch(p)->fpu);
+    g_fpu_owner = p;
 }
 
 /* ---- Stops ---- */
@@ -177,6 +326,7 @@ static void stop_here(stop_reason_t reason, uint64_t code) {
     g_stop.code = code;
     g_stepping = false;
     write_dr(7, 0);
+    machine_fpu_flush();   /* debuggers read the saved areas */
 }
 
 /* ---- Entering user mode ---- */
@@ -188,29 +338,392 @@ static trap_frame_t* frame_slot(void) {
 /* Load the current process's registers into `f` and its address space. */
 static void load_current(trap_frame_t* f) {
     ctx_to_frame(&g_cur->context, f);
-    if (g_stepping) f->rflags |= RFLAGS_TF;
+    fpu_switch_to(g_cur);
+    if (g_seg_owner != g_cur) machine_load_segment_bases(g_cur);
     vmm_switch_address_space(g_cur->address_space);
     load_hwbps(g_cur);
+    if (g_step_over) step_over(f);
+    g_step_over = false;
+    if (g_over_pid && g_over_pid == (uint32_t)g_cur->pid) {
+        /* Resuming where a reported breakpoint became a preemption point:
+         * the instruction has not run yet, and is not reported twice
+         * (unless the next preemption point is there too). */
+        uint64_t rip;
+        bool armed_here = preempt_armed_for(g_cur, &rip) && rip == g_over_rip;
+        if (f->rip == g_over_rip && !armed_here) step_over(f);
+        g_over_pid = 0;
+    }
+    if (g_stepping || g_pm_stepping) f->rflags |= RFLAGS_TF;
 }
 
+/* Inside machine_enter: machine_exit returns to the monitor stack. */
+static bool g_in_machine;
+/* Replay: the segment about to run starts at its own preemption point, and
+ * the state there matches (set by start_segment). */
+static bool g_point_at_start;
+static bool take_points_at_start(void);
+/* A divergence noticed outside it (an entry handled by machine_resume, a
+ * replayed wake): the entry path stops there instead. */
+static bool g_diverged;
+
 static void enter(void) {
+    if (!take_points_at_start()) return;
     trap_frame_t* f = frame_slot();
     load_current(f);
     g_cur->state = PROCESS_STATE_RUNNING;
+    g_in_machine = true;
     machine_enter(f);
+    g_in_machine = false;
     /* Back on the monitor stack: the machine stopped. */
     vmm_switch_address_space(0);
 }
 
 /* ---- Handling an entry ---- */
 
-void machine_terminate(process_t* p, int code) {
-    (void)code;
+void machine_stop_diverged(void) {
+    stop_here(STOP_DIVERGED, 0);
+    if (!g_in_machine) {
+        g_diverged = true;               /* the caller returns; complete_entry stops */
+        return;
+    }
+    machine_exit();
+    for (;;) {}
+}
+
+/* p is gone: with a living parent it waits as a zombie for wait4 (#248);
+ * its own children go to pid 1, or are destroyed if no one can reap them. */
+static void end_process(process_t* p, uint32_t status) {
     tt_before_process_exit(p);
+    process_t* init = proc_by_pid(1);
+    bool init_reaps = init && init != p && init->state != PROCESS_STATE_ZOMBIE;
+    for (uint32_t i = 0; i < proc_count();) {
+        process_t* c = proc_at(i);
+        if (c->ppid != p->pid || c == p) { i++; continue; }
+        c->ppid = init_reaps ? 1 : 0;
+        if (!init_reaps && c->state == PROCESS_STATE_ZOMBIE) {
+            proc_destroy(c);                 /* the table shifted: same index */
+            continue;
+        }
+        if (init_reaps && c->state == PROCESS_STATE_ZOMBIE) pctl_child_exited(c);
+        i++;
+    }
     process_t* next = proc_next_ready(p);
     if (next == p) next = 0;
     if (g_cur == p) g_cur = next;
-    proc_destroy(p);
+    process_t* parent = p->ppid ? proc_by_pid((uint32_t)p->ppid) : 0;
+    if (!parent || parent->state == PROCESS_STATE_ZOMBIE) {
+        proc_destroy(p);
+        return;
+    }
+    /* A zombie keeps its pid and status, and nothing else. */
+    files_proc_gone(p);
+    machine_fpu_forget(p);
+    vm_space_t* empty = vmm_create_address_space((uint32_t)p->pid);
+    vmm_destroy_address_space(p->address_space);
+    p->address_space = empty;
+    p->state = PROCESS_STATE_ZOMBIE;
+    p->wait_status = status;
+    p->wait_reason = 0;
+    p->wait_obj = 0;
+    p->wait_deadline = 0;
+    p->wait_aux = 0;
+    pctl_child_exited(p);
+    /* The parent hears of it (default: ignored). */
+    ksig_send(parent, SIG_SIGCHLD, (status & 0x7F) ? 2 /* CLD_KILLED */ : 1 /* CLD_EXITED */,
+              (uint64_t)p->pid);
+}
+
+/* ---- Thread groups (#251) ---- */
+
+static bool parked(const process_t* t) {
+    return t->state == PROCESS_STATE_BLOCKED && t->wait_reason == WAIT_GROUP;
+}
+
+/* The group's threads that still run (not its parked leader, not zombies). */
+static uint32_t running_threads(uint32_t tgid) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* t = proc_at(i);
+        n += t->tgid == tgid && t->state != PROCESS_STATE_ZOMBIE && !parked(t);
+    }
+    return n;
+}
+
+/* Remove a thread that is not its group's leader. */
+static void drop_thread(process_t* t) {
+    if (g_cur == t) {
+        process_t* next = proc_next_ready(t);
+        g_cur = next == t ? 0 : next;
+    }
+    proc_destroy(t);
+}
+
+/* The whole group ends with `status`: its other threads go, the leader
+ * exits (and waits as a zombie for its parent). */
+static void end_group(process_t* p, uint32_t status) {
+    process_t* leader = proc_by_pid(p->tgid);
+    for (uint32_t i = 0; i < proc_count();) {
+        process_t* t = proc_at(i);
+        if (t->tgid == p->tgid && t != leader) {
+            if (g_cur == t) g_cur = leader;   /* end_process moves past the leader */
+            proc_destroy(t);
+            continue;
+        }
+        i++;
+    }
+    if (!leader) return;
+    if (g_cur == 0) g_cur = leader;
+    end_process(leader, status);
+}
+
+void machine_terminate(process_t* p, int code) {
+    end_group(p, ((uint32_t)code & 0xFF) << 8);
+}
+
+void machine_kill(process_t* p, uint32_t sig) {
+    end_group(p, sig & 0x7F);
+}
+
+void machine_thread_exit(process_t* p, int code) {
+    uint32_t status = ((uint32_t)code & 0xFF) << 8;
+    if (running_threads(p->tgid) <= 1) {
+        end_group(p, status);              /* the last thread: the process ends */
+        return;
+    }
+    if (p->pid == (pid_t)p->tgid) {
+        /* The leader's thread ends, the group goes on: the leader stays,
+         * holding the group's pid and address space, until the last. */
+        process_t* next = proc_next_ready(p);
+        p->state = PROCESS_STATE_BLOCKED;
+        p->wait_reason = WAIT_GROUP;
+        p->wait_obj = 0;
+        p->wait_deadline = 0;
+        p->wait_status = status;
+        if (g_cur == p) g_cur = next == p ? 0 : next;
+        return;
+    }
+    drop_thread(p);
+}
+
+/* The signal a user fault raises (#250), with si_code and si_addr. */
+static uint32_t fault_signal(int32_t* code, uint64_t* addr) {
+    uint64_t rip = g_cur ? g_cur->context.rip : 0;
+    *addr = 0;
+    *code = SI_KERNEL;
+    switch (g_pending.vector) {
+    case 0:  *code = 1; *addr = rip; return SIG_SIGFPE;          /* #DE: FPE_INTDIV */
+    case 16: case 19: *code = 0; *addr = rip; return SIG_SIGFPE; /* #MF, #XM */
+    case 1: case 3: return SIG_SIGTRAP;                          /* #DB, int3 */
+    case 6:  *code = 2; *addr = rip; return SIG_SIGILL;          /* #UD: ILL_ILLOPN */
+    case 17: *code = 1; return SIG_SIGBUS;                       /* #AC: BUS_ADRALN */
+    case VEC_PAGE_FAULT:
+        *code = (g_pending.error & 1) ? 2 : 1;                   /* SEGV_ACCERR, SEGV_MAPERR */
+        *addr = g_pending.cr2;
+        return SIG_SIGSEGV;
+    default: return SIG_SIGSEGV;                                 /* #GP and the rest */
+    }
+}
+
+uint32_t machine_fault_signal(void) {
+    int32_t code;
+    uint64_t addr;
+    return fault_signal(&code, &addr);
+}
+
+/* ---- Blocking and idle (#246) ---- */
+
+#define WAKE_TIMER 1                  /* kio_event nr: a deadline passed */
+
+void machine_block(process_t* p, uint32_t reason, uint64_t obj, uint64_t deadline_ns) {
+    p->state = PROCESS_STATE_BLOCKED;
+    p->wait_reason = reason;
+    p->wait_obj = obj;
+    p->wait_deadline = deadline_ns;
+    if (g_cur == p) {
+        process_t* next = proc_next_ready(p);
+        g_cur = next != p ? next : 0;
+    }
+}
+
+void machine_wake(process_t* p, int64_t ret) {
+    if (p->state != PROCESS_STATE_BLOCKED) return;
+    p->context.rax = (uint64_t)ret;
+    p->state = PROCESS_STATE_READY;
+    p->wait_reason = 0;
+    p->wait_obj = 0;
+    p->wait_deadline = 0;
+}
+
+int64_t machine_timeout_result(uint32_t reason) {
+    return reason == WAIT_SLEEP || reason == WAIT_POLL ? 0 : -110;   /* ETIMEDOUT */
+}
+
+/* A deadline passed: the wait ends with its timeout result. */
+static void wake_timed_out(process_t* p) {
+    if (p->wait_reason == WAIT_POLL) files_poll_timed_out(p);
+    machine_wake(p, machine_timeout_result(p->wait_reason));
+}
+
+static bool any_deadline(void) {
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        if (p->state == PROCESS_STATE_BLOCKED && p->wait_deadline) return true;
+        uint64_t d;
+        if (ksig_next_deadline(p, &d)) return true;     /* a timer (#250) */
+    }
+    return false;
+}
+
+#define WAKE_SIGTIMER 2               /* kio_event nr: a signal timer fired */
+static uint64_t g_wake_step;
+static void journal_timer(uint32_t pid, uint32_t index) {
+    kio_event(IOREC_DEVICE, WAKE_SIGTIMER, (uint64_t)pid | ((uint64_t)index << 32), g_wake_step);
+}
+
+static bool any_blocked(void) {
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        if (proc_at(i)->state == PROCESS_STATE_BLOCKED) return true;
+    }
+    return false;
+}
+
+/* Wakes due at `step`. Recording: deadlines that passed, by the clock, each
+ * journaled, then console input (#249). Replaying: the journaled ones for
+ * this step, in their order. `idle`: called while the machine waits for a
+ * wake, before the entry `step` (console input is told apart by it). */
+static void deliver_wakes(uint64_t step, bool idle) {
+    if (g_mode == MACHINE_LIVE) {
+        if (any_deadline()) {
+            uint64_t now = clock_now_unrecorded();
+            g_wake_step = step;
+            for (uint32_t i = 0; i < proc_count(); i++) {
+                process_t* p = proc_at(i);
+                if (p->state != PROCESS_STATE_BLOCKED || !p->wait_deadline || p->wait_deadline > now) continue;
+                kio_event(IOREC_DEVICE, WAKE_TIMER, (uint64_t)p->pid, step);
+                wake_timed_out(p);
+            }
+            g_wake_step = step;
+            for (uint32_t i = 0; i < proc_count(); i++) ksig_fire_due(proc_at(i), now, journal_timer);
+        }
+        bool got = tty_deliver(step, idle);
+        got |= net_deliver(step, idle);
+        if (got) files_retry_waiters();
+        return;
+    }
+    uint32_t nr;
+    uint64_t arg;
+    for (;;) {
+        if (kio_event_next(IOREC_DEVICE, step, &nr, &arg)) {
+            process_t* p = proc_by_pid((uint32_t)arg);
+            if (nr == WAKE_SIGTIMER && p) {
+                ksig_fire(p, (uint32_t)(arg >> 32));
+                continue;
+            }
+            if (nr != WAKE_TIMER || !p || p->state != PROCESS_STATE_BLOCKED) {
+                kio_diverged(IOREC_DEVICE, step);   /* named in "inputs" */
+                return;
+            }
+            wake_timed_out(p);
+            continue;
+        }
+        if (tty_deliver(step, idle) || net_deliver(step, idle)) {
+            files_retry_waiters();
+            continue;
+        }
+        return;
+    }
+}
+
+static stop_reason_t g_pick_stop = STOP_IDLE;
+
+/* A replay that stops where no entry arrives (everything waits, or a fatal
+ * signal): the recording ended here. It is the target if asked for, and
+ * the position is visited like an entry. */
+static stop_reason_t replay_stop_here(void) {
+    if (g_has_target && g_step == g_target_step && g_target_insn == 0) {
+        if (g_entry_hook) g_entry_hook(g_entry_hook_ctx, g_step);
+        return STOP_TARGET;
+    }
+    return STOP_END;
+}
+
+/* Recording, nothing runnable: halt until a wake (or a debugger's request).
+ * No steps pass. */
+static bool idle_until_wake(void) {
+    for (;;) {
+        if (g_stop_request) {
+            g_stop_request = false;
+            g_pick_stop = STOP_REQUEST;
+            return false;
+        }
+        if (!any_deadline() && !files_input_waited()) {
+            g_pick_stop = STOP_IDLE;          /* nothing can ever wake them */
+            return false;
+        }
+        tty_poll_uart();
+        net_poll_nic();
+        deliver_wakes(g_step, true);
+        if (proc_next_ready(0)) return true;
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+    }
+}
+
+/* Choose the process to run next, idling if they all wait. False (with
+ * g_pick_stop) when the machine must stop instead. */
+static bool pick_next(void) {
+    if (!g_cur) g_cur = proc_next_ready(0);
+    while (!g_cur) {
+        if (!any_blocked()) {
+            g_pick_stop = STOP_IDLE;
+            return false;
+        }
+        if (g_mode == MACHINE_LIVE) {
+            if (!idle_until_wake()) return false;
+        } else {
+            deliver_wakes(g_step, true);
+            if (g_diverged) {
+                g_pick_stop = STOP_DIVERGED;
+                return false;
+            }
+            if (!proc_next_ready(0)) {
+                /* The recording stopped here, everything waiting. */
+                g_pick_stop = replay_stop_here();
+                return false;
+            }
+        }
+        g_cur = proc_next_ready(0);
+    }
+    return true;
+}
+
+void machine_yield(process_t* p) {
+    process_t* next = proc_next_ready(p);
+    if (next && next != p) {
+        p->state = PROCESS_STATE_READY;
+        g_cur = next;
+    }
+}
+
+/* The pending entry ends its process: exit in either ABI. */
+static bool entry_is_exit(void) {
+    if (g_pending.vector == VEC_SYSCALL) return g_cur->context.rax == SYS_EXIT;
+    if (g_pending.vector == VEC_LINUX_SYSCALL) return linux_is_exit(g_cur->context.rax);
+    return false;
+}
+
+/* The pending exit ends the last process: everything else that lives is
+ * the exiting thread's group, and the exit takes all of it (exit_group, or
+ * the group's last running thread). */
+static bool exit_ends_machine(void) {
+    if (!entry_is_exit()) return false;
+    bool group = g_pending.vector == VEC_SYSCALL || g_cur->context.rax != LX_exit ||
+                 running_threads(g_cur->tgid) <= 1;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* t = proc_at(i);
+        if (t->state == PROCESS_STATE_ZOMBIE || t == g_cur) continue;
+        if (t->tgid != g_cur->tgid || !group) return false;
+    }
+    return true;
 }
 
 /* SYS_WRITE: copy out of user memory in chunks and print (unless replaying). */
@@ -220,7 +733,7 @@ static int64_t sys_write(process_t* p, uint64_t buf, uint64_t len) {
     while (done < len) {
         uint64_t n = len - done < sizeof(tmp) ? len - done : sizeof(tmp);
         if (!uaccess_read(p->address_space, buf + done, tmp, n)) return done ? (int64_t)done : -1;
-        if (!machine_quiet()) console_write(tmp, (uint32_t)n);
+        machine_device_write(MACHINE_DEV_CONSOLE, tmp, n);
         done += n;
     }
     return (int64_t)done;
@@ -233,6 +746,81 @@ static int64_t sys_random(process_t* p, uint64_t buf, uint64_t len) {
     return uaccess_write(p->address_space, buf, tmp, len) ? 0 : -1;
 }
 
+/* ---- Emulated instructions (#241) ----
+ *
+ * CR4.TSD makes user RDTSC/RDTSCP raise #GP, and CPUID faulting does the same
+ * for CPUID. The kernel answers them from the journaled clock and the recorded
+ * CPUID table, so a program that reads the time stamp counter or the CPU's
+ * identity directly replays exactly. Each one is a kernel entry, so a step. */
+
+typedef enum { EMUL_NONE = 0, EMUL_RDTSC, EMUL_RDTSCP, EMUL_CPUID } emul_t;
+
+static emul_t emulated_insn(process_t* p, uint64_t* len) {
+    if (g_pending.vector != VEC_GPF || g_pending.error != 0) return EMUL_NONE;
+    uint8_t b[3] = { 0, 0, 0 };
+    if (!uaccess_read(p->address_space, p->context.rip, b, 2)) return EMUL_NONE;
+    if (b[0] != 0x0F) return EMUL_NONE;
+    if (b[1] == 0x31) { *len = 2; return EMUL_RDTSC; }
+    if (b[1] == 0xA2) { *len = 2; return cpu_cpuid_faulting() ? EMUL_CPUID : EMUL_NONE; }
+    if (b[1] == 0x01 && uaccess_read(p->address_space, p->context.rip + 2, &b[2], 1) &&
+        b[2] == 0xF9) {
+        *len = 3;
+        return EMUL_RDTSCP;
+    }
+    return EMUL_NONE;
+}
+
+static void emulate(process_t* p, emul_t kind, uint64_t len) {
+    process_context_t* c = &p->context;
+    if (kind == EMUL_CPUID) {
+        uint32_t r[4];
+        cpu_cpuid_lookup((uint32_t)c->rax, (uint32_t)c->rcx, r);
+        c->rax = r[0]; c->rbx = r[1]; c->rcx = r[2]; c->rdx = r[3];
+    } else {
+        uint64_t t = ktime_read();
+        c->rax = (uint32_t)t;
+        c->rdx = t >> 32;
+        if (kind == EMUL_RDTSCP) c->rcx = 0;   /* IA32_TSC_AUX: CPU 0 */
+    }
+    c->rip += len;
+}
+
+bool machine_entry_is_fault(void) {
+    uint64_t len;
+    return g_cur && !vec_is_syscall(g_pending.vector) && g_pending.vector != VEC_TIMER &&
+           emulated_insn(g_cur, &len) == EMUL_NONE;
+}
+
+/* ---- Register trace (#241) ---- */
+
+static uint64_t mix64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    return h ^ (h >> 32);
+}
+
+static void trace_entry(uint64_t step) {
+    const process_context_t* c = &g_cur->context;
+    const uint64_t regs[] = {
+        step, (uint64_t)g_cur->pid, g_pending.vector,
+        c->rax, c->rbx, c->rcx, c->rdx, c->rsi, c->rdi, c->rbp, c->rsp,
+        c->r8, c->r9, c->r10, c->r11, c->r12, c->r13, c->r14, c->r15,
+        c->rip, c->rflags & 0xED5ULL,
+    };
+    for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) g_trace = mix64(g_trace, regs[i]);
+    if ((step + 1) % KJ_TRACE_EVERY != 0) return;
+    if (g_mode == MACHINE_LIVE) {
+        if (!g_norecord) kj_append(KJ_EV_TRACE, step, g_trace, 0);
+        return;
+    }
+    uint64_t want;
+    if (!g_trace_bad && kj_find(KJ_EV_TRACE, step, &want) && want != g_trace) {
+        g_trace_bad = true;
+        g_trace_bad_step = step;
+    }
+}
+
 typedef enum { AFTER_CONTINUE, AFTER_SWITCHED } after_t;
 
 /* Handle the pending entry of g_cur. Returns AFTER_SWITCHED when the entry
@@ -242,9 +830,24 @@ static after_t handle_entry(void) {
     process_t* p = g_cur;
     process_context_t* c = &p->context;
 
+    if (g_pending.vector == VEC_LINUX_SYSCALL) {
+        return linux_syscall(p) == LX_SWITCHED ? AFTER_SWITCHED : AFTER_CONTINUE;
+    }
+    if (g_pending.vector == VEC_TIMER) return AFTER_CONTINUE;   /* a preemption point (#245) */
     if (g_pending.vector != VEC_SYSCALL) {
-        /* A fault that was reported (or replayed): the process dies. */
-        machine_terminate(p, -1);
+        uint64_t len;
+        emul_t kind = emulated_insn(p, &len);
+        if (kind != EMUL_NONE) {
+            emulate(p, kind, len);
+            return AFTER_CONTINUE;
+        }
+        /* A fault: the signal it raises, for a handler, or the process
+         * dies of it (#250). */
+        int32_t code;
+        uint64_t addr;
+        uint32_t sig = fault_signal(&code, &addr);
+        if (ksig_fault(p, sig, code, addr)) return AFTER_CONTINUE;
+        machine_kill(p, sig);
         return AFTER_SWITCHED;
     }
 
@@ -258,15 +861,10 @@ static after_t handle_entry(void) {
     case SYS_WRITE:
         c->rax = (uint64_t)sys_write(p, c->rdi, c->rsi);
         break;
-    case SYS_YIELD: {
+    case SYS_YIELD:
         c->rax = 0;
-        process_t* next = proc_next_ready(p);
-        if (next && next != p) {
-            p->state = PROCESS_STATE_READY;
-            g_cur = next;
-        }
+        machine_yield(p);
         return AFTER_SWITCHED;
-    }
     case SYS_GETPID:
         c->rax = (uint64_t)p->pid;
         break;
@@ -310,20 +908,79 @@ static bool want_stepping(void) {
 
 /* Complete the pending entry: handle it, decide preemption, advance the clock.
  * Returns false when no process is left to run. */
-static bool complete_entry(void) {
-    uint64_t step = g_step;
-    if (handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
-    g_step = step + 1;
-    g_insn = 1;
-    g_seg_hits = 0;
-    if (!g_cur) {
-        g_cur = proc_next_ready(0);
+static uint32_t g_stop_signal;
+
+/* Before a process runs: deliver its next pending signal (#250). False when
+ * the machine must stop: nothing left to run, or a core-dumping signal with
+ * no handler. */
+static bool deliver_signals(void) {
+    while (g_cur) {
+        uint32_t sig = 0;
+        ksig_result_t r = ksig_deliver(g_cur, &sig);
+        if (r == KSIG_NONE || r == KSIG_DELIVERED) return true;
+        if (r == KSIG_KILLED) {
+            if (!pick_next()) return false;
+            continue;
+        }
+        /* KSIG_STOP: as at an unhandled fault, the machine stops here. */
+        g_stop_signal = sig;
+        if (g_mode == MACHINE_LIVE) {
+            g_pick_stop = STOP_SIGNAL;
+        } else {
+            g_pick_stop = replay_stop_here();
+        }
+        return false;
     }
-    if (!g_cur) return false;
+    return pick_next() && deliver_signals();
+}
+
+/* Replay: the process is about to execute c->rip; is that its armed
+ * preemption point, in the recorded state? A string instruction's earlier
+ * iterations are run first (#245). */
+static bool at_armed_point(process_context_t* c) {
+    uint64_t rip;
+    if (g_mode != MACHINE_REPLAY || !preempt_armed_for(g_cur, &rip) || c->rip != rip) return false;
+    pm_verdict_t v = preempt_check(g_cur, c);
+    if (v == PM_STEP && preempt_rep_forward(g_cur, c)) v = preempt_check(g_cur, c);
+    return v == PM_MATCH;
+}
+
+/* The current process starts its segment. Replay: arm the next entry's
+ * preemption point if it is one (#245); false (STOP_DIVERGED) when the
+ * journal's point is not this process's. */
+static bool start_segment(void) {
     g_cur->state = PROCESS_STATE_RUNNING;
     g_at_entry = false;
     g_stepping = want_stepping();
+    g_pm_stepping = false;
+    g_bp_reported = false;
+    if (g_mode == MACHINE_REPLAY && preempt_arm(g_cur, g_step) == PREEMPT_BAD) {
+        g_pick_stop = STOP_DIVERGED;
+        return false;
+    }
+    /* A point at the very instruction the segment starts with (#245): not
+     * every CPU reports a breakpoint there (QEMU 10's TCG does not on the
+     * first instruction after an IRET), so its state is checked now. */
+    g_point_at_start = at_armed_point(&g_cur->context);
+    if (g_stepping && g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, g_cur->context.rip);
     return true;
+}
+
+static bool complete_entry(void) {
+    uint64_t step = g_step;
+    deliver_wakes(step, false);           /* before the entry: same order in a replay */
+    trace_entry(step);
+    if (!g_diverged && handle_entry() == AFTER_CONTINUE && g_cur) preempt_decision(step);
+    if (g_diverged) {
+        g_pick_stop = STOP_DIVERGED;
+        return false;
+    }
+    g_step = step + 1;
+    g_insn = 1;
+    g_seg_hits = 0;
+    if (!pick_next()) return false;
+    if (!deliver_signals()) return false;
+    return start_segment();
 }
 
 /* A replay target at the very start of the segment (entry handled, nothing
@@ -358,24 +1015,69 @@ static bool stop_at_entry(void) {
         stop_here(STOP_REQUEST, 0);
         return true;
     }
-    if (g_pending.vector != VEC_SYSCALL) {
-        stop_here(STOP_FAULT, 0);
+    if (machine_entry_is_fault() && !ksig_fault_handled(g_cur, machine_fault_signal())) {
+        stop_here(STOP_FAULT, machine_fault_signal());
         return true;
     }
-    if (g_cur->context.rax == SYS_BREAK) {
+    if (g_pending.vector == VEC_SYSCALL && g_cur->context.rax == SYS_BREAK) {
         stop_here(STOP_BREAK, g_cur->context.rdi);
         return true;
     }
-    if (g_cur->context.rax == SYS_EXIT && proc_count() == 1) {
+    if (exit_ends_machine()) {
         stop_here(STOP_EXITED, g_cur->context.rdi);
         return true;
     }
     return false;
 }
 
+/* An entry at the matched preemption point (#245), during replay. */
+static void preemption_entry(void) {
+    g_pending.vector = VEC_TIMER;
+    g_pending.error = 0;
+    g_pending.cr2 = 0;
+    g_insn = 0;
+    g_at_entry = true;
+    preempt_disarm();
+    g_pm_stepping = false;
+    if (g_bp_reported && g_bp_rip == g_cur->context.rip) {
+        g_over_pid = (uint32_t)g_cur->pid;
+        g_over_rip = g_bp_rip;
+    }
+}
+
+/* Replay stopped inside a segment exactly at the armed preemption point: the
+ * point becomes the entry. False (g_stop filled) when the machine stops at
+ * it. */
+static bool entry_at_preemption_point(void) {
+    preemption_entry();
+    if (g_entry_hook) g_entry_hook(g_entry_hook_ctx, g_step);
+    return !stop_at_entry();
+}
+
+/* A segment that would start at its own preemption point takes that entry
+ * now, without running (again if the next one does too). False (g_stop
+ * filled) when the machine stops. */
+static bool take_points_at_start(void) {
+    while (g_point_at_start) {
+        g_point_at_start = false;
+        if (!entry_at_preemption_point()) return false;
+        if (!complete_entry()) {
+            stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
+            return false;
+        }
+        if (target_at_segment_start()) {
+            stop_here(STOP_TARGET, 0);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ---- Public run entry points (monitor stack) ---- */
 
 void machine_start(void) {
+    g_diverged = false;
+    g_point_at_start = false;
     g_cur = proc_next_ready(0);
     if (!g_cur) {
         stop_here(STOP_IDLE, 0);
@@ -387,17 +1089,41 @@ void machine_start(void) {
 }
 
 void machine_resume(void) {
+    g_diverged = false;
+    g_point_at_start = false;
+    /* Console input typed while the machine was stopped is not delivered. */
+    if (g_mode == MACHINE_LIVE) {
+        tty_discard_pending();
+        net_discard_pending();
+    }
     if (!g_cur) {
-        stop_here(STOP_IDLE, 0);
+        /* Stopped while everything waited: wait again, then run. */
+        if (!pick_next() || !deliver_signals() || !start_segment()) {
+            stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
+            return;
+        }
+        if (target_at_segment_start()) {
+            stop_here(STOP_TARGET, 0);
+            return;
+        }
+        enter();
         return;
     }
     if (!g_at_entry) {
-        /* Stopped inside a segment (single-step target or breakpoint): keep
-         * executing it. Step over an execution breakpoint with RF. */
-        g_stepping = want_stepping();
-        g_cur->context.rflags |= RFLAGS_RF;
-        enter();
-        return;
+        uint64_t rip;
+        if (g_mode == MACHINE_REPLAY && preempt_armed_for(g_cur, &rip) && g_cur->context.rip == rip &&
+            preempt_check(g_cur, &g_cur->context) == PM_MATCH) {
+            /* Stopped exactly at the recorded preemption point: it is the
+             * entry (#245), handled below. */
+            if (!entry_at_preemption_point()) return;
+        } else {
+            /* Stopped inside a segment (single-step target or breakpoint):
+             * keep executing it, stepping over an execution breakpoint. */
+            g_stepping = want_stepping();
+            g_step_over = true;
+            enter();
+            return;
+        }
     }
     if (g_mode == MACHINE_REPLAY && g_has_target &&
         g_step == g_target_step && g_target_insn == 0) {
@@ -405,7 +1131,7 @@ void machine_resume(void) {
         return;
     }
     if (!complete_entry()) {
-        stop_here(STOP_IDLE, 0);
+        stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
         return;
     }
     if (target_at_segment_start()) {
@@ -422,12 +1148,47 @@ static void on_timer(void) {
     if (g_mode == MACHINE_LIVE) {
         if (++g_slice >= MACHINE_SLICE_TICKS) g_need_resched = true;
         tt_on_tick();
+        tty_poll_uart();
+        net_poll_nic();
         if (serial_rx_ready(PORT_GDB) || serial_rx_ready(PORT_MCP)) g_stop_request = true;
     }
     pic_eoi(0);
 }
 
+/* A deadline (a waiting process's, or a signal timer's) has passed. */
+static bool deadline_due(void) {
+    if (!any_deadline()) return false;
+    uint64_t now = clock_now_unrecorded();
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        if (p->state == PROCESS_STATE_BLOCKED && p->wait_deadline && p->wait_deadline <= now) return true;
+        uint64_t d;
+        if (ksig_next_deadline(p, &d) && d <= now) return true;
+    }
+    return false;
+}
+
+/* Recording, a timer interrupt in user mode: does the machine want an entry
+ * here (#245)? The slice expired and another process is ready, a deadline
+ * passed, a keyframe is due, or a debugger asked to stop. */
+static bool async_entry_wanted(void) {
+    if (g_mode != MACHINE_LIVE || !g_cur) return false;
+    if (g_stop_request || tt_entry_wanted() || tty_pending() || net_pending()) return true;
+    if (g_need_resched) {
+        process_t* next = proc_next_ready(g_cur);
+        if (next && next != g_cur) return true;
+    }
+    return deadline_due();
+}
+
 static void kernel_trap(trap_frame_t* f) {
+    /* The words at the top of the kernel stack: after a call through a bad
+     * pointer, the first is the caller's return address. */
+    const uint64_t* sp = (const uint64_t*)f->rsp;
+    if (f->rsp >= LP_KERNEL_VMA || f->rsp >= LP_DIRECT_MAP) {
+        kprintf("kernel stack at %lx: %lx %lx %lx %lx %lx %lx\n", f->rsp, sp[0], sp[1], sp[2], sp[3],
+                sp[4], sp[5]);
+    }
     panic("trap %lu in kernel mode: err %lx rip %lx cr2 %lx",
           f->vector, f->error, f->rip, read_cr2());
 }
@@ -438,27 +1199,44 @@ static void save_segment_state(const trap_frame_t* f) {
     g_cur->context.rflags &= ~(RFLAGS_TF | RFLAGS_RF);
 }
 
-/* #DB from user mode during replay: single-step counting and/or a hardware
- * breakpoint or watchpoint (#228). */
-static void on_debug(trap_frame_t* f) {
-    uint64_t dr6 = read_dr6();
+/* #DB from user mode during replay: single-step counting, a hardware
+ * breakpoint or watchpoint (#228), or the armed preemption point (#245).
+ * True when that point matched: the interrupted instruction becomes the
+ * entry it was in the recording. */
+static bool on_debug(trap_frame_t* f) {
+    uint64_t raw = read_dr6();
     write_dr(6, 0);
-    bool stepped = (dr6 & (1ULL << 14)) != 0;
+    bool stepped = (raw & (1ULL << 14)) != 0;
+    bool pm_hit = g_pm_slot >= 0 && (raw & (1ULL << g_pm_slot)) != 0;
     /* Only enabled breakpoints count: B0-B3 may report matches that DR7
      * does not enable (Intel SDM 17.2.3). */
-    dr6 = (dr6 & ~0xFULL) | (dr6 & g_dr_enabled);
+    uint64_t dr6 = (raw & ~0xFULL) | (raw & g_dr_enabled);
+    bool skip = false;
     if (stepped) {
+        g_stepping_over = false;
+        g_bp_reported = false;
+    }
+    if (stepped && g_stepping) {
         g_insn++;
         if (g_count_insns) g_counted++;
+        if (g_insn_hook) g_insn_hook(g_insn_hook_ctx, g_cur, f->rip);
     }
     if (dr6 & 0xF) {
+        /* QEMU's TCG keeps a data watchpoint's hit flag until the watchpoint
+         * is set again (writing its address register), and would report it
+         * with every later single step. */
+        for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
+            if (dr6 & (1ULL << i)) write_dr(i, g_hwbp[i].addr);
+        }
         g_seg_hits++;
+        g_bp_reported = true;
+        g_bp_rip = f->rip;
         if (g_hit_hook) {
-            /* Searching: note the hit and keep going (RF steps over an
-             * execution breakpoint). The hit may also be the replay target,
+            /* Searching: note the hit and keep going, stepping over an
+             * execution breakpoint. The hit may also be the replay target,
              * which is checked below. */
             g_hit_hook(g_hit_hook_ctx, g_step - 1, g_seg_hits, g_stepping ? g_insn : 0, dr6);
-            f->rflags |= RFLAGS_RF;
+            skip = true;
             goto target_check;
         }
         save_segment_state(f);
@@ -469,21 +1247,92 @@ static void on_debug(trap_frame_t* f) {
         machine_exit();
     }
 target_check:
-    if (stepped && g_has_target && g_step == g_target_step + 1 && g_insn == g_target_insn) {
+    if (stepped && g_stepping && g_has_target && g_step == g_target_step + 1 && g_insn == g_target_insn) {
         save_segment_state(f);
         stop_here(STOP_TARGET, 0);
         machine_exit();
     }
-    if (g_stepping) f->rflags |= RFLAGS_TF;
+    uint64_t rip;
+    bool armed = preempt_armed_for(g_cur, &rip);
+    if (pm_hit && g_pm_moved) {
+        /* Past a string instruction that could not reach the point: watch
+         * the point again. */
+        write_dr(g_pm_slot, rip);
+        g_pm_moved = false;
+        pm_hit = false;
+    }
+    if ((pm_hit || stepped) && armed && f->rip == rip) {
+        process_context_t c;
+        ctx_from_frame(&c, f);
+        pm_verdict_t v = preempt_check(g_cur, &c);
+        if (v == PM_STEP) {
+            /* An earlier iteration of the recorded string instruction: run
+             * the iterations up to the recorded count, and look again. */
+            bool done = preempt_rep_forward(g_cur, &c);
+            f->rcx = c.rcx;
+            f->rsi = c.rsi;
+            f->rdi = c.rdi;
+            if (done) v = preempt_check(g_cur, &c);
+        }
+        if (v == PM_MATCH) return true;
+        if (preempt_cycled()) {
+            /* Looping where the point cannot be reached: the replay has left
+             * the recording. Verifying, the point is taken here, as at an
+             * entry that comes first. */
+            if (!g_lenient) {
+                stop_here(STOP_DIVERGED, 0);
+                machine_exit();
+            }
+            return true;
+        }
+        uint32_t len;
+        if (v == PM_NO && g_pm_slot >= 0 && (len = preempt_rep_len(g_cur, rip)) != 0) {
+            /* A string instruction that cannot reach the point: let it
+             * finish, with the breakpoint just past it. */
+            write_dr(g_pm_slot, rip + len);
+            g_pm_moved = true;
+        } else if (g_pm_slot >= 0) {
+            skip = true;                          /* run one step and look again */
+        }
+    }
+    if (skip) step_over(f);
+    if (g_stepping || g_pm_stepping || g_stepping_over) f->rflags |= RFLAGS_TF;
+    else f->rflags &= ~RFLAGS_TF;
+    return false;
+}
+
+/* Replay: f is exactly at the armed preemption point (#245). */
+/* The process resumes at f->rip without a breakpoint having been checked
+ * there (after a transparent fault, or an interrupt that is not an entry):
+ * is it the armed point? A string instruction's earlier iterations run here,
+ * as on_debug runs them. */
+static bool preemption_point_here(trap_frame_t* f) {
+    process_context_t c;
+    ctx_from_frame(&c, f);
+    bool here = at_armed_point(&c);
+    f->rcx = c.rcx;
+    f->rsi = c.rsi;
+    f->rdi = c.rdi;
+    return here;
 }
 
 void trap_dispatch(trap_frame_t* f) {
     bool from_user = (f->cs & 3) == 3;
+    uint64_t vector = f->vector, error = f->error;
+    bool irq_at_point = false;
     if (f->vector == VEC_TIMER) {
         on_timer();
-        return;
-    }
-    if (f->vector >= VEC_IRQ_BASE && f->vector < VEC_IRQ_BASE + 16) {
+        /* In user mode, the interrupted instruction becomes an entry when
+         * the machine wants one (#245). A replay resumes it, unless it is
+         * the armed point (no breakpoint is checked on the instruction an
+         * IRET returns to, on QEMU 10's TCG). */
+        if (!from_user) return;
+        if (!async_entry_wanted()) {
+            if (g_mode != MACHINE_REPLAY || !preemption_point_here(f)) return;
+            irq_at_point = true;
+        }
+        error = 0;
+    } else if (f->vector >= VEC_IRQ_BASE && f->vector < VEC_IRQ_BASE + 16) {
         pic_eoi((uint8_t)(f->vector - VEC_IRQ_BASE));
         return;
     }
@@ -495,44 +1344,91 @@ void trap_dispatch(trap_frame_t* f) {
          * the first. DR6 already holds both causes for that handler, so return
          * without touching it. */
         if (f->vector == VEC_DEBUG) return;
+        if (cpu_msr_probe_recover(f)) return;
         kernel_trap(f);
     }
 
+    bool preempted = irq_at_point;
+    bool handled = false;
     if (f->vector == VEC_PAGE_FAULT && (f->error & 0x3) == 0x3) {
         /* A user write to a present page: a snapshot-COW capture is invisible
          * to the program and is not a step. */
         uint64_t cr2 = read_cr2();
-        if (checkpoint_handle_write_fault(g_cur->address_space, cr2)) return;
+        handled = vmm_user_write_fault(g_cur->address_space, cr2);
+    }
+    if (!handled && f->vector == VEC_PAGE_FAULT && !(f->error & 0x1)) {
+        /* First touch of a page in a region that allows the access (#239):
+         * a function of the program and of which pages are present, so like
+         * a capture it is not a step. */
+        handled = vm_fault_in(g_cur->address_space, read_cr2(), (f->error & 0x2) != 0);
+    }
+    if (handled) {
+        /* The faulting instruction runs again, but a recording may have been
+         * preempted in between, with the page in place (#245). */
+        if (!preemption_point_here(f)) return;
+        preempted = true;
     }
     if (f->vector == VEC_DEBUG && g_mode == MACHINE_REPLAY) {
-        on_debug(f);
-        return;
+        if (!on_debug(f)) return;
+        preempted = true;          /* the recorded preemption point (#245) */
     }
 
     /* A kernel entry: one step of the machine. */
     ctx_from_frame(&g_cur->context, f);
     g_cur->context.rflags &= ~(RFLAGS_TF | RFLAGS_RF);
+    if (vector == VEC_LINUX_SYSCALL && (g_stepping || g_stepping_over || g_pm_stepping)) {
+        /* SYSCALL saved RFLAGS in r11, with the trap flag a debugger's or
+         * a preemption point's single step set: not the program's. */
+        g_cur->context.r11 &= ~(RFLAGS_TF | RFLAGS_RF);
+    }
+    if (vector == VEC_LINUX_SYSCALL && g_rf_over) g_cur->context.r11 &= ~RFLAGS_RF;
+    g_rf_over = false;
+    g_stepping_over = false;
     g_stepping = false;
-    g_pending.vector = f->vector;
-    g_pending.error = f->error;
-    g_pending.cr2 = f->vector == VEC_PAGE_FAULT ? read_cr2() : 0;
+    g_pending.vector = vector;
+    g_pending.error = error;
+    g_pending.cr2 = vector == VEC_PAGE_FAULT ? read_cr2() : 0;
     g_insn = 0;
     g_at_entry = true;
 
     if (g_mode == MACHINE_LIVE) {
         g_started = true;
+        /* Journaled before a keyframe can close the epoch: the point is
+         * the epoch's last step. */
+        if (vector == VEC_TIMER && !g_norecord) preempt_record(g_cur, g_step);
         tt_on_live_entry();        /* keyframes and writeback happen here */
-    } else if (g_entry_hook) {
-        g_entry_hook(g_entry_hook_ctx, g_step);
+    } else {
+        uint64_t pm_step;
+        if (preempted) {
+            preemption_entry();
+        } else if (preempt_armed(&pm_step)) {
+            /* A real entry before the recorded preemption point: the replay
+             * has left the recording. */
+            kio_note_diverged(IOREC_PREEMPT, pm_step);
+            preempt_disarm();
+            if (!g_lenient) {
+                stop_here(STOP_DIVERGED, 0);
+                machine_exit();
+            }
+            /* Verifying: take the point just before this entry (the system
+             * call runs again when the process resumes), keeping the
+             * recording's steps. */
+            if (vec_is_syscall(vector)) g_cur->context.rip -= 2;   /* syscall, int 0x80 */
+            g_pending.vector = VEC_TIMER;
+            g_pending.error = 0;
+            g_pending.cr2 = 0;
+        }
+        if (g_entry_hook) g_entry_hook(g_entry_hook_ctx, g_step);
     }
     if (stop_at_entry()) machine_exit();
     if (!complete_entry()) {
-        stop_here(STOP_IDLE, 0);
+        stop_here(g_pick_stop, g_pick_stop == STOP_SIGNAL ? g_stop_signal : 0);
         machine_exit();
     }
     if (target_at_segment_start()) {
         stop_here(STOP_TARGET, 0);
         machine_exit();
     }
+    if (!take_points_at_start()) machine_exit();
     load_current(f);
 }

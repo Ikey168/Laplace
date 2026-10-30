@@ -9,9 +9,11 @@
  *                       ("replaylog:end" / "replaylog:begin"); continuing at the
  *                       end of the recording leaves history and runs live
  *   Z0/Z1               execution breakpoints (debug registers), Z2-Z4
- *                       watchpoints; they belong to the process gdb has
- *                       selected when they are inserted
+ *                       watchpoints; they belong to the process (every thread
+ *                       of it) gdb has selected when they are inserted
  *   monitor <cmd>       where, window, verify, stats, goto E S [I], help
+ *   target.xml          amd64 GNU/Linux with x87, SSE, AVX, fs_base, gs_base (#252)
+ *   exec-file, vFile    the stopped program's binary, so gdb needs no file argument
  */
 
 #include "core/gdb_target.h"
@@ -21,8 +23,11 @@
 #include "core/proc.h"
 #include "core/mm.h"
 #include "core/console.h"
+#include "core/fpu.h"
 #include "gdbstub.h"
 #include "divergence.h"
+
+void* memcpy(void* dst, const void* src, size_t n);
 
 void* memset(void* dst, int c, size_t n);
 size_t strlen(const char* s);
@@ -91,11 +96,39 @@ static int op_cont(void* c) {
 
 static process_t* thread_proc(uint32_t tid) {
     if (tid) return proc_by_pid(tid);
-    return machine_current();
+    /* Stopped while every process waits (#246): no current one. */
+    if (machine_current()) return machine_current();
+    return proc_count() ? proc_at(0) : 0;
 }
 
 static void put_le(uint8_t* buf, uint32_t off, uint64_t v, uint32_t size) {
     for (uint32_t i = 0; i < size; i++) buf[off + i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint32_t get_le(const uint8_t* a, uint32_t off, uint32_t size) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < size; i++) v |= (uint32_t)a[off + i] << (8 * i);
+    return v;
+}
+
+/* The x87, SSE, and AVX registers from the saved area (#252). */
+static void put_fpu(uint8_t* buf, const uint8_t* a) {
+    for (int i = 0; i < 8; i++) {
+        for (int b = 0; b < 10; b++) buf[164 + i * 10 + b] = a[32 + i * 16 + b];
+    }
+    put_le(buf, 244, get_le(a, 0, 2), 4);                 /* fctrl */
+    put_le(buf, 248, get_le(a, 2, 2), 4);                 /* fstat */
+    uint32_t abridged = a[4], tag = 0;
+    for (int i = 0; i < 8; i++) tag |= ((abridged >> i) & 1 ? 0u : 3u) << (2 * i);   /* valid / empty */
+    put_le(buf, 252, tag, 4);                             /* ftag */
+    put_le(buf, 260, get_le(a, 8, 4), 4);                 /* fioff */
+    put_le(buf, 268, get_le(a, 16, 4), 4);                /* fooff */
+    put_le(buf, 272, get_le(a, 6, 2) & 0x7FF, 4);         /* fop */
+    for (int i = 0; i < 16 * 16; i++) buf[276 + i] = a[FPU_XMM_OFFSET + i];
+    put_le(buf, 532, get_le(a, 24, 4), 4);                /* mxcsr */
+    if (fpu_xcr0() & XCR0_AVX) {
+        for (int i = 0; i < 16 * 16; i++) buf[560 + i] = a[576 + i];   /* ymm0h-15h */
+    }
 }
 
 static int op_read_regs(void* c, uint32_t tid, uint8_t* buf) {
@@ -114,9 +147,157 @@ static int op_read_regs(void* c, uint32_t tid, uint8_t* buf) {
     put_le(buf, 144, SEL_UDATA, 4);   /* ss */
     put_le(buf, 148, SEL_UDATA, 4);   /* ds */
     put_le(buf, 152, SEL_UDATA, 4);   /* es */
-    put_le(buf, 244, 0x37F, 4);       /* fctrl: the x87 reset value (unused by programs) */
-    put_le(buf, 532, 0x1F80, 4);      /* mxcsr reset value */
+    machine_fpu_flush();
+    put_fpu(buf, proc_arch(p)->fpu);
+    put_le(buf, 536, ~0ULL, 8);                           /* orig_rax: not in a system call */
+    put_le(buf, 544, proc_arch(p)->fs_base, 8);
+    put_le(buf, 552, proc_arch(p)->gs_base, 8);
     return 0;
+}
+
+/* ---- The program, for gdb to read (#252) ---- */
+
+static int op_exec_file(void* c, uint32_t pid, char* out, uint32_t cap) {
+    (void)c;
+    process_t* p = pid ? proc_by_pid(pid) : thread_proc(0);
+    if (!p || !p->exe_path[0]) return -1;
+    const char* path = p->exe_path;
+    int n = ksnprintf(out, cap, "%s%s", path[0] == '/' ? "" : "/", path);
+    return n < (int)cap ? n : -1;
+}
+
+/* ---- Dynamically linked programs (#254) ---- */
+
+static process_t* group_of(uint32_t pid) {
+    process_t* p = pid ? proc_by_pid(pid) : thread_proc(0);
+    if (p && p->tgid && (uint32_t)p->pid != p->tgid) {
+        process_t* leader = proc_by_pid(p->tgid);
+        if (leader) p = leader;
+    }
+    return p;
+}
+
+static int op_auxv(void* c, uint32_t pid, uint8_t* out, uint32_t cap) {
+    (void)c;
+    process_t* p = group_of(pid);
+    if (!p) return -1;
+    const lp_arch_t* a = proc_arch(p);
+    const uint64_t v[][2] = {
+        { 3, a->at_phdr }, { 4, 56 }, { 5, a->at_phnum }, { 6, PAGE_SIZE },
+        { 7, a->at_base }, { 9, a->at_entry }, { 0, 0 },
+    };
+    if (sizeof(v) > cap) return -1;
+    memcpy(out, v, sizeof(v));
+    return (int)sizeof(v);
+}
+
+static bool rd(process_t* p, uint64_t addr, void* buf, uint32_t len) {
+    return addr && uaccess_read(p->address_space, addr, buf, len);
+}
+
+/* The dynamic loader's r_debug (through the program's DT_DEBUG), or 0. */
+static uint64_t find_r_debug(process_t* p) {
+    const lp_arch_t* a = proc_arch(p);
+    uint64_t bias = 0, dyn = 0;
+    bool have_bias = false;
+    for (uint32_t i = 0; i < a->at_phnum && i < 64; i++) {
+        uint32_t ph[2];
+        uint64_t vaddr;
+        if (!rd(p, a->at_phdr + 56ULL * i, ph, 8) || !rd(p, a->at_phdr + 56ULL * i + 16, &vaddr, 8)) return 0;
+        if (ph[0] == 6) { bias = a->at_phdr - vaddr; have_bias = true; }   /* PT_PHDR */
+        if (ph[0] == 2) dyn = vaddr;                                       /* PT_DYNAMIC */
+    }
+    if (!dyn || !have_bias) return 0;
+    for (uint32_t i = 0; i < 512; i++) {
+        uint64_t d[2];
+        if (!rd(p, bias + dyn + 16ULL * i, d, 16) || d[0] == 0) return 0;
+        if (d[0] == 21) return d[1];                                       /* DT_DEBUG */
+    }
+    return 0;
+}
+
+static void put_xml_str(char* out, uint32_t cap, uint32_t* n, const char* s) {
+    for (; *s && *n + 7 < cap; s++) {
+        const char* e = *s == '&' ? "&amp;" : *s == '<' ? "&lt;" : *s == '>' ? "&gt;" : *s == '"' ? "&quot;" : 0;
+        if (e) {
+            while (*e) out[(*n)++] = *e++;
+        } else {
+            out[(*n)++] = *s;
+        }
+    }
+}
+
+/* The loader's list of loaded objects (r_debug.r_map), the program first. */
+static int op_libraries(void* c, uint32_t pid, char* out, uint32_t cap) {
+    (void)c;
+    process_t* p = group_of(pid);
+    if (!p) return -1;
+    uint64_t rdebug = find_r_debug(p), map = 0;
+    if (rdebug) rd(p, rdebug + 8, &map, 8);
+    uint32_t n = (uint32_t)ksnprintf(out, cap, "<library-list-svr4 version=\"1.0\"");
+    if (map) n += (uint32_t)ksnprintf(out + n, cap - n, " main-lm=\"0x%lx\"", map);
+    n += (uint32_t)ksnprintf(out + n, cap - n, ">");
+    uint64_t lm = map;
+    for (uint32_t k = 0; lm && k < 64 && n + 300 < cap; k++) {
+        uint64_t f[4];                                  /* l_addr, l_name, l_ld, l_next */
+        if (!rd(p, lm, f, sizeof(f))) break;
+        char name[160];
+        uint32_t len = 0;
+        while (len < sizeof(name) - 1 && rd(p, f[1] + len, &name[len], 1) && name[len]) len++;
+        name[len] = 0;
+        if (k > 0 && name[0]) {                         /* the first is the program itself */
+            n += (uint32_t)ksnprintf(out + n, cap - n, "<library name=\"");
+            put_xml_str(out, cap, &n, name);
+            n += (uint32_t)ksnprintf(out + n, cap - n, "\" lm=\"0x%lx\" l_addr=\"0x%lx\" l_ld=\"0x%lx\"/>",
+                                     lm, f[0], f[2]);
+        }
+        lm = f[3];
+    }
+    n += (uint32_t)ksnprintf(out + n, cap - n, "</library-list-svr4>");
+    return n < cap ? (int)n : -1;
+}
+
+#define MAX_OPEN_IMAGES 16
+static const lp_image_t* g_open_images[MAX_OPEN_IMAGES];
+
+static int op_file_open(void* c, const char* path) {
+    (void)c;
+    const lp_image_t* img = proc_find_image(path);
+    if (!img && path[0] == '/') img = proc_find_image(path + 1);   /* embedded programs */
+    if (!img) return -1;
+    for (int i = 0; i < MAX_OPEN_IMAGES; i++) {
+        if (!g_open_images[i]) {
+            g_open_images[i] = img;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static const lp_image_t* open_image(int h) {
+    return h >= 0 && h < MAX_OPEN_IMAGES ? g_open_images[h] : 0;
+}
+
+static int64_t op_file_size(void* c, int h) {
+    (void)c;
+    const lp_image_t* img = open_image(h);
+    return img ? (int64_t)(img->end - img->start) : -1;
+}
+
+static int op_file_pread(void* c, int h, uint64_t off, uint8_t* buf, uint32_t len) {
+    (void)c;
+    const lp_image_t* img = open_image(h);
+    if (!img) return -1;
+    uint64_t size = (uint64_t)(img->end - img->start);
+    if (off >= size) return 0;
+    if (len > size - off) len = (uint32_t)(size - off);
+    for (uint32_t i = 0; i < len; i++) buf[i] = img->start[off + i];
+    return (int)len;
+}
+
+static void op_file_close(void* c, int h) {
+    (void)c;
+    if (h >= 0 && h < MAX_OPEN_IMAGES) g_open_images[h] = 0;
 }
 
 static int op_read_mem(void* c, uint32_t tid, uint64_t addr, uint8_t* buf, uint32_t len) {
@@ -152,7 +333,9 @@ static int op_breakpoint(void* c, int type, uint64_t addr, uint32_t kind, bool i
     uint8_t dr_kind = type <= 1 ? 0 : type == 2 ? 1 : 3;   /* x86 has no read-only watch */
     uint8_t len = type <= 1 ? 1 : (uint8_t)kind;
     if (type > 1 && len != 1 && len != 2 && len != 4 && len != 8) return -1;
-    uint32_t pid = op_current(0);
+    /* Every thread of the selected thread's process (#252). */
+    process_t* cur = proc_by_pid(op_current(0));
+    uint32_t pid = cur ? cur->tgid : op_current(0);
     for (int i = 0; i < MACHINE_MAX_HWBP; i++) {
         machine_hwbp_t* b = &g_bps[i];
         if (insert && !b->active) {
@@ -217,6 +400,13 @@ static gdbstub_ops_t g_target = {
     .breakpoint = op_breakpoint,
     .stop_reply = op_stop_reply,
     .monitor = op_monitor,
+    .exec_file = op_exec_file,
+    .file_open = op_file_open,
+    .file_size = op_file_size,
+    .file_pread = op_file_pread,
+    .file_close = op_file_close,
+    .auxv = op_auxv,
+    .libraries = op_libraries,
 };
 
 void gdb_target_init(void) {

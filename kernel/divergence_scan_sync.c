@@ -10,7 +10,7 @@
  * The component sources cover what "byte-exact" means for the recorded machine
  * (#225): the process table, the scheduler (current process, run order, and the
  * pending kernel entry), the contents of every mapped user page, and every
- * process's saved registers. Physical addresses and page-table permission bits
+ * process's saved registers, including its x87/SSE/AVX state (#237). Physical addresses and page-table permission bits
  * are excluded: a restored machine maps the same contents at the same virtual
  * addresses through different frames, and copy-on-write marking changes
  * permissions without changing anything a program can observe.
@@ -22,16 +22,18 @@
 #include "core/proc.h"           /* process table order */
 #include "core/mm.h"             /* vmm_for_each_page */
 #include "core/machine.h"        /* machine_current, machine_pending */
+#include "core/kstate.h"         /* kstate_register_checksums */
+#include "core/kfpages.h"        /* kfp_page_crc */
 #include <stddef.h>
 
 /* ---- Source registry ---- */
 
-static diverge_source_t g_sources[KDIVERGE_COMPONENT_COUNT];
+static diverge_source_t g_sources[DIVERGE_MAX_COMPONENTS];
 static uint32_t         g_nsources;
 
 /* Sums stashed by the last record scan, for journaling. */
-static uint32_t g_rec_ids[KDIVERGE_COMPONENT_COUNT];
-static uint32_t g_rec_sums[KDIVERGE_COMPONENT_COUNT];
+static uint32_t g_rec_ids[DIVERGE_MAX_COMPONENTS];
+static uint32_t g_rec_sums[DIVERGE_MAX_COMPONENTS];
 static uint32_t g_rec_count;
 
 void kdiverge_reset_sources(void) {
@@ -39,7 +41,7 @@ void kdiverge_reset_sources(void) {
 }
 
 void kdiverge_register(uint32_t component, diverge_source_fn source, void* ctx) {
-    if (!source || g_nsources >= KDIVERGE_COMPONENT_COUNT) return;
+    if (!source || g_nsources >= DIVERGE_MAX_COMPONENTS) return;
     g_sources[g_nsources].component = component;
     g_sources[g_nsources].source = source;
     g_sources[g_nsources].ctx = ctx;
@@ -59,6 +61,16 @@ static uint32_t sum_proctable(void* ctx) {
         crc = divergence_checksum(crc, &pid, sizeof(pid));
         crc = divergence_checksum(crc, &alive, sizeof(alive));
         crc = divergence_checksum(crc, p->name, sizeof(p->name));
+        /* Scheduling state and the wait (#246). */
+        uint64_t wait[8] = { (uint64_t)p->state, p->wait_reason, p->wait_obj, p->wait_deadline,
+                             p->wait_aux, p->wait_status, (uint64_t)p->ppid, p->tgid };
+        crc = divergence_checksum(crc, wait, sizeof(wait));
+        /* The address space's layout (#239): regions and the break. */
+        for (vm_region_t* r = p->address_space ? p->address_space->regions : 0; r; r = r->next) {
+            uint64_t reg[3] = { r->start_addr, r->end_addr, r->flags };
+            crc = divergence_checksum(crc, reg, sizeof(reg));
+        }
+        if (p->arch) crc = divergence_checksum(crc, &proc_arch(p)->brk_start, 2 * sizeof(uint64_t));
     }
     return crc;
 }
@@ -78,20 +90,27 @@ static uint32_t sum_scheduler(void* ctx) {
     return divergence_checksum(crc, &vec, sizeof(vec));
 }
 
-/* User memory: every mapped page's address and contents, per process. */
-typedef struct { uint32_t crc; } page_sum_t;
+/* User memory: every mapped page's address, user bit, and contents, per process. */
+typedef struct { uint32_t crc; uint32_t pid; } page_sum_t;
 static void sum_one_page(void* c, uint64_t virt, uint64_t phys, pte_t pte) {
-    (void)pte;
     page_sum_t* s = (page_sum_t*)c;
-    s->crc = divergence_checksum(s->crc, &virt, sizeof(virt));
-    s->crc = divergence_checksum(s->crc, (const void*)phys, PAGE_SIZE);
+    /* The user bit is the page's protection as mprotect left it (#239); the
+     * write bit is not, since snapshot-COW clears it until the first write.
+     * The contents enter as the page's CRC, cached for pages unchanged since
+     * the reference keyframe (#244), so a boundary hashes only dirty pages. */
+    uint64_t key = virt | ((pte & PAGE_USER) ? 1 : 0);
+    uint32_t pc = kfp_page_crc(s->pid, virt, phys, pte);
+    s->crc = divergence_checksum(s->crc, &key, sizeof(key));
+    s->crc = divergence_checksum(s->crc, &pc, sizeof(pc));
 }
 static uint32_t sum_user_pages(void* ctx) {
     (void)ctx;
-    page_sum_t s = { 0 };
+    page_sum_t s = { 0, 0 };
     for (uint32_t i = 0; i < proc_count(); i++) {
         process_t* p = proc_at(i);
+        if (!proc_space_owner(p)) continue;   /* a thread: its group's pages count once (#251) */
         uint32_t pid = (uint32_t)p->pid;
+        s.pid = pid;
         s.crc = divergence_checksum(s.crc, &pid, sizeof(pid));
         vmm_for_each_page(p->address_space, sum_one_page, &s);
     }
@@ -104,6 +123,7 @@ static uint32_t sum_user_pages(void* ctx) {
 static uint32_t sum_contexts(void* ctx) {
     (void)ctx;
     uint32_t crc = 0;
+    machine_fpu_flush();
     for (uint32_t i = 0; i < proc_count(); i++) {
         const process_context_t* c = &proc_at(i)->context;
         uint64_t regs[19] = {
@@ -112,6 +132,12 @@ static uint32_t sum_contexts(void* ctx) {
             c->rip, c->rflags & 0xED5ULL, (uint64_t)proc_at(i)->pid,
         };
         crc = divergence_checksum(crc, regs, sizeof(regs));
+        /* x87/SSE/AVX state (#237), FS/GS base (#238). */
+        if (proc_at(i)->arch) {
+            const lp_arch_t* a = proc_arch(proc_at(i));
+            crc = fpu_checksum(crc, a->fpu);
+            crc = divergence_checksum(crc, &a->fs_base, 2 * sizeof(uint64_t));
+        }
     }
     return crc;
 }
@@ -122,6 +148,7 @@ void kdiverge_register_kernel_sources(void) {
     kdiverge_register(KDIVERGE_SCHEDULER, sum_scheduler, NULL);
     kdiverge_register(KDIVERGE_USER_PAGES, sum_user_pages, NULL);
     kdiverge_register(KDIVERGE_CONTEXTS, sum_contexts, NULL);
+    kstate_register_checksums();   /* one component per kernel subsystem (#243) */
 }
 
 /* ---- Record side ---- */

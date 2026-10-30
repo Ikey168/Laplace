@@ -17,27 +17,46 @@
 #include <stdbool.h>
 #include "process.h"
 #include "core/cpu.h"
+#include "core/fpu.h"
 
-#define LP_MAX_PROCS     16
+#define LP_MAX_PROCS     256   /* PM_MAX_PROCESSES; the keyframe format has no cap (#243) */
 #define LP_STACK_TOP     0x80000000ULL
 #define LP_STACK_PAGES   4
 
-/* An embedded user program (user_images.asm). */
+/* An embedded user program (user_images.asm). A Linux program (#238) starts
+ * with the System V initial stack (argc, argv, envp, auxv) and a larger stack;
+ * a Laplace program's _start takes nothing. */
 typedef struct {
     const char*    name;
     const uint8_t* start;
     const uint8_t* end;
+    bool           linux_abi;
 } lp_image_t;
 
 const lp_image_t* proc_find_image(const char* name);
 const lp_image_t* proc_images(uint32_t* count);
 
-/* Create a process from an embedded image, append it to the table (READY).
- * Returns NULL on a bad image or out of memory. */
+/* Create a process from an image, append it to the table (READY). Returns
+ * NULL on a bad image or out of memory. A Linux image gets argv and envp on
+ * its initial stack (#240); proc_spawn passes argv = { name }. */
 process_t* proc_spawn(const lp_image_t* image);
+process_t* proc_spawn_args(const lp_image_t* image, uint32_t argc, const char* const* argv,
+                           uint32_t envc, const char* const* envp);
 
-/* Remove a process from the table and free it (address space included). */
+/* Programs passed as Multiboot modules (QEMU -initrd "path args,..."). */
+void     proc_register_modules(const uint32_t* mbi);
+/* The filesystem seed (#247): the module named `root` (path or last
+ * component), else the first that is a cpio archive; NULL if none. */
+const lp_image_t* proc_seed_module(const char* root);
+uint32_t proc_image_crc(const lp_image_t* image);
+
+/* Remove a process from the table and free it (address space included,
+ * unless a thread of its group still uses it). */
 void proc_destroy(process_t* p);
+/* Threads (#251): p is the first in the table with its address space (the
+ * one whose pages keyframes list), and the live threads of a group. */
+bool     proc_space_owner(const process_t* p);
+uint32_t proc_group_size(uint32_t tgid);
 void proc_destroy_all(void);
 
 uint32_t   proc_count(void);
@@ -52,10 +71,43 @@ process_t* proc_next_ready(const process_t* p);
 /* pid counter, captured in keyframes so a restored machine keeps numbering. */
 uint32_t proc_next_pid(void);
 void     proc_set_next_pid(uint32_t pid);
+/* Use the next pid (fork). */
+uint32_t proc_take_pid(void);
+/* Processes not yet exited (zombies excluded). */
+uint32_t proc_live_count(void);
+/* Replace p's program with `image` (#248): a fresh address space, registers,
+ * and FPU/TLS state, the arguments and environment on the new stack. On
+ * failure p is unchanged. Returns 0 or -errno. */
+int      proc_exec(process_t* p, const lp_image_t* image, uint32_t argc, const char* const* argv,
+                   uint32_t envc, const char* const* envp);
 
 /* Build an empty process with a given pid (restore path). */
 process_t* proc_alloc(uint32_t pid, const char* name);
 void       proc_append(process_t* p);
+
+/* Per-process architectural state beyond the general registers (#237). */
+typedef struct {
+    uint64_t fs_base;
+    uint64_t gs_base;
+    uint64_t clear_child_tid;        /* set_tid_address (#238) */
+    uint64_t brk_start;              /* the heap (#239): first byte */
+    uint64_t brk_cur;                /*   and the current break */
+    /* What the auxiliary vector said (#254), for gdb's qXfer:auxv. */
+    uint64_t at_phdr;
+    uint64_t at_entry;
+    uint64_t at_base;                /* the dynamic loader's, or 0 */
+    uint32_t at_phnum;
+    uint8_t  reserved[60];
+    uint8_t  fpu[FPU_AREA_MAX];      /* 64-byte aligned: lp_arch_t is */
+} __attribute__((aligned(64))) lp_arch_t;
+
+static inline lp_arch_t* proc_arch(const process_t* p) { return (lp_arch_t*)p->arch; }
+
+/* A keyframe context record (one page): the process_context_t at 0, the
+ * lp_arch_t at LP_CTX_ARCH_OFFSET. */
+#define LP_CTX_ARCH_OFFSET 256
+uint32_t proc_context_record(process_t* p, uint8_t* page);
+void     proc_context_load(process_t* p, const uint8_t* page);
 
 /* Frame <-> saved context. */
 void ctx_from_frame(process_context_t* c, const trap_frame_t* f);

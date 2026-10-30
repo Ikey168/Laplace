@@ -39,5 +39,8 @@ void kputs(const char* s);
 void console_write(const char* s, uint32_t len);
 
 void panic(const char* fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+/* After a panic, leave QEMU through isa-debug-exit (status 3, a failure)
+ * instead of halting: the `exit` option, so a test fails at once. */
+void panic_exits(bool on);
 
 #endif /* CORE_CONSOLE_H */

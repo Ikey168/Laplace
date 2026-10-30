@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# qemu-system-x86_64, with QEMU's `max` CPU for a TCG guest unless the
+# command line picks a CPU or KVM.
+#
+# A program built on a distribution compiled for x86-64-v3 (Ubuntu 26.04 on
+# GitHub's runners: its musl libc.a, glibc, and lua5.4 use BMI2 and AVX2)
+# needs those features in the guest; QEMU's default CPU, qemu64, has none
+# of them. The kernel itself is built for baseline x86-64 and boots on
+# either. CI sets QEMU to this script.
+real=${QEMU_BIN:-qemu-system-x86_64}
+for a in "$@"; do
+    case "$a" in -cpu|-enable-kvm) exec "$real" "$@" ;; esac
+done
+exec "$real" -cpu max "$@"

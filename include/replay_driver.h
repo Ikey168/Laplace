@@ -129,6 +129,9 @@ void             replay_kernel_bind(void);
 replay_engine_t* replay_kernel_engine(void);
 void             replay_set_insn_target(uint64_t insn);
 void             replay_perturb_next(bool on);
+/* The last perturbation found an input to corrupt (an epoch with no clock,
+ * entropy, or preemption inputs replays the same regardless). */
+bool             replay_perturb_applied(void);
 int              replay_load_epoch(uint64_t epoch);
 bool             replay_loaded_epoch_len(uint64_t* len);
 int              replay_to(uint64_t target_epoch, uint64_t target_offset);

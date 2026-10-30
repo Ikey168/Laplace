@@ -10,6 +10,15 @@
 
 /* Page size and alignment */
 #define PAGE_SIZE           4096
+
+/* A physical frame as the code reading it sees it (#238): through the
+ * kernel's direct map in the booted kernel, the address itself in the host
+ * tests (whose mock frames are ordinary host memory). */
+#ifdef LAPLACE_KERNEL
+#define PHYS_TO_VIRT(p) ((void*)((uint64_t)(p) + 0xFFFF800000000000ULL))
+#else
+#define PHYS_TO_VIRT(p) ((void*)(uintptr_t)(p))
+#endif
 #define PAGE_ALIGN(addr)    (((addr) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 #define PAGE_FRAME(addr)    ((addr) >> 12)
 #define FRAME_ADDR(frame)   ((frame) << 12)
@@ -39,6 +48,9 @@
 #define PAGE_GLOBAL         0x100   /* Global page (not flushed on CR3 reload) */
 /* Bits 9-11 are available for software use and ignored by the CPU. */
 #define PAGE_SNAPSHOT_COW   0x200   /* Page is copy-on-write for a checkpoint snapshot (issue #111) */
+#define PAGE_KF_KNOWN       0x400   /* Content equals the reference keyframe's page (#244) */
+#define PAGE_FORK_COW       0x800   /* Frame shared with a forked space until written (#248) */
+#define PAGE_PM_NEW         (1ULL << 52) /* Mapped on demand since the last preemption record (#245) */
 #define PAGE_NX             0x8000000000000000ULL /* No-execute bit */
 #define PAGE_NO_EXECUTE     0x8000000000000000ULL /* NX bit */
 

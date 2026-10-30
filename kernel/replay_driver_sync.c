@@ -20,6 +20,8 @@
 #include "journal_capture.h"     /* journal_capture_load, JOURNAL_EV_DIVERGE */
 #include "checkpoint_journal.h"  /* journal_reader_t, journal_reader_next */
 #include "core/timetravel.h"     /* tt_restore_keyframe, tt_drive */
+#include "core/kjournal.h"        /* kj_replay_begin, kj_replay_add (#241) */
+#include "core/kio.h"             /* the input journal's test hook (#242) */
 #include <stddef.h>
 
 int tt_drive(uint64_t epoch, uint64_t step, uint64_t insn, uint64_t epoch_len);
@@ -30,10 +32,12 @@ static journal_reader_t g_reader;
 static bool             g_reader_ok;
 static uint64_t         g_insn_target;
 static bool             g_perturb;
+static bool             g_perturb_applied;
 
 static int src_begin_epoch(void* ctx, uint64_t epoch) {
     (void)ctx;
     g_reader_ok = journal_capture_load(epoch, &g_reader) == JOURNAL_OK;
+    kj_replay_begin(epoch);
     return g_reader_ok ? 0 : -1;
 }
 
@@ -44,6 +48,7 @@ static int src_next(void* ctx, replay_event_t* out) {
     int rc = journal_reader_next(&g_reader, &ev);
     if (rc == JOURNAL_ERR_NO_JOURNAL) return 0;   /* epoch exhausted */
     if (rc != JOURNAL_OK) return -1;
+    if (ev.type >= JOURNAL_EV_EXTENDED_BASE) kj_replay_add(ev.type, ev.len, ev.lclock, ev.value);
     out->type = ev.type;
     out->len = ev.len;
     out->lclock = ev.lclock;
@@ -62,12 +67,17 @@ static int drv_load_subsystems(uint64_t epoch,
                                const uint8_t* entropy, uint32_t n_entropy) {
     if (g_perturb) {
         /* Test hook: corrupt the recorded inputs so the replay must diverge.
-         * Every entropy byte is flipped (a single byte can be masked off or
-         * overwritten before the epoch ends, leaving the end state intact). */
+         * Clock values and random bytes are journaled inputs (#242): every
+         * one of this epoch's is changed as it is replayed (a single byte can
+         * be masked off or overwritten before the epoch ends, leaving the end
+         * state intact). An epoch with neither has its first preemption moved
+         * one step later. */
         g_perturb = false;
-        for (uint32_t i = 0; i < n_entropy; i++) g_driver.entropy[i] ^= 0x5A;
-        if (n_entropy == 0) {
-            for (uint32_t i = 0; i < n_times; i++) g_driver.times[i] += 1000000;
+        if (kio_perturb_applied()) {
+            g_perturb_applied = true;
+        } else if (n_pts > 0) {
+            g_driver.pts[0] += 1;
+            g_perturb_applied = true;
         }
     }
     return replay_load_subsystems(epoch, pts, n_pts, times, n_times, entropy, n_entropy);
@@ -100,6 +110,12 @@ void replay_set_insn_target(uint64_t insn) {
 
 void replay_perturb_next(bool on) {
     g_perturb = on;
+    kio_perturb_next(on);
+    if (on) g_perturb_applied = false;
+}
+
+bool replay_perturb_applied(void) {
+    return g_perturb_applied;
 }
 
 /* Load `epoch`'s journal into the wrappers without restoring or running. */

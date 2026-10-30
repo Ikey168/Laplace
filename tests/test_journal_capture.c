@@ -9,6 +9,8 @@
  *   3. Skips a delta class whose source pointer is NULL.
  *   4. Round-trips crash-consistently: after capture the journal loads back
  *      with the committed epoch.
+ *   5. Writes extended events (#241) verbatim, in order, after the entropy
+ *      run and before the epoch length.
  *
  * Build: gcc -I../include -o test_journal_capture \
  *            test_journal_capture.c ../kernel/journal_capture.c \
@@ -96,6 +98,16 @@ static uint32_t src_entropy(const uint8_t** out) {
 }
 
 /* Reassemble entropy bytes from an event (packed little-endian, len valid). */
+static const journal_capture_event_t k_ext[] = {
+    { JOURNAL_EV_EXTENDED_BASE + 0, 0, 15, 0xABCDEF0123456789ULL },
+    { JOURNAL_EV_EXTENDED_BASE + 3, 5, 31, 0x0000000504030201ULL },
+};
+static uint32_t src_ext(const journal_capture_event_t** out) {
+    *out = k_ext;
+    return 2;
+}
+static uint64_t src_len(void) { return 77; }
+
 static uint32_t unpack_entropy(const journal_event_t* ev, uint8_t* out) {
     for (uint32_t b = 0; b < ev->len; b++) {
         out[b] = (uint8_t)(ev->value >> (8u * b));
@@ -185,6 +197,27 @@ int main(void) {
     CHECK(all_sched, "sched-only journal holds only scheduler events");
 
     /* --- param guard --- */
+    /* --- 5: extended events ride after entropy, before the epoch length --- */
+    CHECK(journal_store_format(&store) == JOURNAL_OK, "re-format store (ext)");
+    journal_capture_sources_t ext = {
+        .entropy_bytes   = src_entropy,
+        .epoch_length    = src_len,
+        .extended_events = src_ext,
+    };
+    CHECK(journal_capture_epoch(&store, 9, 0, &ext) == JOURNAL_OK, "capture with extended events");
+    CHECK(journal_store_load(&store, &rd) == JOURNAL_OK, "load ext journal");
+    /* 2 entropy chunks, 2 extended events, 1 epoch length. */
+    CHECK(rd.event_count == 5, "ext journal has 5 events");
+    journal_event_t evs[5];
+    for (int i = 0; i < 5; i++) journal_reader_next(&rd, &evs[i]);
+    CHECK(evs[0].type == JOURNAL_EV_ENTROPY && evs[1].type == JOURNAL_EV_ENTROPY,
+          "entropy first");
+    CHECK(evs[2].type == k_ext[0].type && evs[2].lclock == 15 && evs[2].value == k_ext[0].value,
+          "first extended event verbatim");
+    CHECK(evs[3].type == k_ext[1].type && evs[3].len == 5 && evs[3].lclock == 31 &&
+          evs[3].value == k_ext[1].value, "second extended event verbatim (len kept)");
+    CHECK(evs[4].type == JOURNAL_EV_EPOCH_LEN && evs[4].value == 77, "epoch length last");
+
     CHECK(journal_capture_epoch(NULL, 1, 0, &src) == JOURNAL_ERR_PARAM,
           "NULL store rejected");
     CHECK(journal_capture_epoch(&store, 1, 0, NULL) == JOURNAL_ERR_PARAM,

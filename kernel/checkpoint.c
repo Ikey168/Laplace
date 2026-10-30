@@ -115,7 +115,7 @@ bool checkpoint_resolve_pte(pte_t* pte) {
     }
     /* Restore write permission and drop the snapshot tag: the pre-write image
      * has been captured, so the page may be written normally again. */
-    entry &= ~(pte_t)PAGE_SNAPSHOT_COW;
+    entry &= ~(pte_t)(PAGE_SNAPSHOT_COW | PAGE_KF_KNOWN);   /* about to change (#244) */
     entry |= PAGE_WRITABLE;
     *pte = entry;
     return true;
@@ -305,10 +305,15 @@ bool checkpoint_handle_write_fault(vm_space_t* space, uint64_t fault_addr) {
         return true;
     }
 
-    /* The faulting page is mapped at page_addr in the current address space,
-     * so its current contents are readable there. */
-    int rc = checkpoint_capture_page(space->owner_pid, page_addr,
-                                     (const void*)page_addr, pte);
+    /* Read the page's current contents. In the booted kernel, through the
+     * direct map (the space need not be the current one); in the host tests,
+     * at page_addr, where the mock space maps it. */
+#ifdef LAPLACE_KERNEL
+    const void* contents = PHYS_TO_VIRT(*pte & 0x000FFFFFFFFFF000ULL);
+#else
+    const void* contents = (const void*)page_addr;
+#endif
+    int rc = checkpoint_capture_page(space->owner_pid, page_addr, contents, pte);
     if (rc != CHECKPOINT_OK) {
         return false;
     }
@@ -361,7 +366,7 @@ static int writeback_clean_pages(snapshot_writer_t* writer) {
                 }
                 /* Physical frames are directly addressable in the kernel, the
                  * same convention vmm.c uses to walk page tables. */
-                memcpy(buf, (const void*)phys, PAGE_SIZE);
+                memcpy(buf, PHYS_TO_VIRT(phys), PAGE_SIZE);
                 uint32_t flags = (action == CHECKPOINT_PAGE_PERSIST_RO)
                                      ? CHECKPOINT_REC_READONLY : 0;
                 if (snapshot_writer_add_page(writer, space->owner_pid, addr, flags,
@@ -553,7 +558,7 @@ static int checkpoint_restore_apply_kernel(void* ctx, const snapshot_page_record
 
     /* Physical frames are directly addressable in the kernel (same convention
      * vmm.c uses); load the checkpointed page contents into the new frame. */
-    memcpy((void*)phys, rec->page_data, PAGE_SIZE);
+    memcpy(PHYS_TO_VIRT(phys), rec->page_data, PAGE_SIZE);
 
     /* Read-only pages (code) are re-mapped without write permission so they keep
      * their original protection; writable pages get PAGE_WRITABLE. */
@@ -664,6 +669,17 @@ int checkpoint_persistence_init(snapshot_store_t* store, fat_block_device_t* dev
 
 /* ----- Take ----- */
 
+static checkpoint_context_fn g_context_fn;
+static checkpoint_mark_fn    g_mark_fn;
+
+void checkpoint_set_mark_fn(checkpoint_mark_fn fn) {
+    g_mark_fn = fn;
+}
+
+void checkpoint_set_context_fn(checkpoint_context_fn fn) {
+    g_context_fn = fn;
+}
+
 uint64_t checkpoint_take(void) {
     uint64_t epoch = g_checkpoint.current_epoch + 1;
     uint64_t spaces = 0;
@@ -682,7 +698,8 @@ uint64_t checkpoint_take(void) {
         if (!proc || !proc->address_space) {
             continue;
         }
-        int marked = checkpoint_mark_space(proc->address_space, epoch);
+        int marked = g_mark_fn ? g_mark_fn(proc->address_space, epoch)
+                               : checkpoint_mark_space(proc->address_space, epoch);
         if (marked < 0) {
             continue;
         }
@@ -692,7 +709,13 @@ uint64_t checkpoint_take(void) {
         /* Snapshot the process's CPU context now, at the consistent checkpoint
          * point. Unlike pages it is not copy-on-write, so it is captured eagerly
          * (it is tiny); the writeback pass streams it to disk with the pages. */
-        checkpoint_capture_context(proc->pid, &proc->context, sizeof(proc->context));
+        if (g_context_fn) {
+            static uint8_t page[PAGE_SIZE];
+            uint32_t n = g_context_fn(proc, page);
+            checkpoint_capture_context(proc->pid, page, n);
+        } else {
+            checkpoint_capture_context(proc->pid, &proc->context, sizeof(proc->context));
+        }
     }
 
     g_checkpoint.current_epoch = epoch;

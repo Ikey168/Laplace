@@ -101,11 +101,113 @@ bool gdbstub_reg_slot(uint32_t regno, uint32_t* offset, uint32_t* size) {
     else if (regno < 40) { off = 244 + (regno - 32) * 4;    sz = 4; }   /* x87 control */
     else if (regno < 56) { off = 276 + (regno - 40) * 16;   sz = 16; }  /* xmm0-15 */
     else if (regno == 56){ off = 532;                       sz = 4; }   /* mxcsr */
+    else if (regno < 60) { off = 536 + (regno - 57) * 8;    sz = 8; }   /* orig_rax, fs/gs base */
+    else if (regno < 76) { off = 560 + (regno - 60) * 16;   sz = 16; }  /* ymm0h-15h */
     else return false;
     if (offset) *offset = off;
     if (size) *size = sz;
     return true;
 }
+
+/* The target description (#252): amd64 for GNU/Linux with the x87, SSE,
+ * segment-base, and AVX features, numbered as gdbstub_reg_slot lays them out. */
+static const char g_tdesc[] =
+    "<?xml version=\"1.0\"?><!DOCTYPE target SYSTEM \"gdb-target.dtd\">"
+    "<target version=\"1.0\"><architecture>i386:x86-64</architecture><osabi>GNU/Linux</osabi>"
+    "<feature name=\"org.gnu.gdb.i386.core\">"
+    "<reg name=\"rax\" bitsize=\"64\" type=\"int64\" regnum=\"0\"/>"
+    "<reg name=\"rbx\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"rcx\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"rdx\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"rsi\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"rdi\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"rbp\" bitsize=\"64\" type=\"data_ptr\"/>"
+    "<reg name=\"rsp\" bitsize=\"64\" type=\"data_ptr\"/>"
+    "<reg name=\"r8\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"r9\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"r10\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"r11\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"r12\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"r13\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"r14\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"r15\" bitsize=\"64\" type=\"int64\"/>"
+    "<reg name=\"rip\" bitsize=\"64\" type=\"code_ptr\"/>"
+    "<reg name=\"eflags\" bitsize=\"32\" type=\"int32\"/>"
+    "<reg name=\"cs\" bitsize=\"32\" type=\"int32\"/>"
+    "<reg name=\"ss\" bitsize=\"32\" type=\"int32\"/>"
+    "<reg name=\"ds\" bitsize=\"32\" type=\"int32\"/>"
+    "<reg name=\"es\" bitsize=\"32\" type=\"int32\"/>"
+    "<reg name=\"fs\" bitsize=\"32\" type=\"int32\"/>"
+    "<reg name=\"gs\" bitsize=\"32\" type=\"int32\"/>"
+    "<reg name=\"st0\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"st1\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"st2\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"st3\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"st4\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"st5\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"st6\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"st7\" bitsize=\"80\" type=\"i387_ext\"/>"
+    "<reg name=\"fctrl\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "<reg name=\"fstat\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "<reg name=\"ftag\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "<reg name=\"fiseg\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "<reg name=\"fioff\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "<reg name=\"foseg\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "<reg name=\"fooff\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "<reg name=\"fop\" bitsize=\"32\" type=\"int\" group=\"float\"/>"
+    "</feature><feature name=\"org.gnu.gdb.i386.sse\">"
+    "<vector id=\"v4f\" type=\"ieee_single\" count=\"4\"/>"
+    "<vector id=\"v2d\" type=\"ieee_double\" count=\"2\"/>"
+    "<vector id=\"v16i8\" type=\"int8\" count=\"16\"/>"
+    "<vector id=\"v8i16\" type=\"int16\" count=\"8\"/>"
+    "<vector id=\"v4i32\" type=\"int32\" count=\"4\"/>"
+    "<vector id=\"v2i64\" type=\"int64\" count=\"2\"/>"
+    "<union id=\"vec128\"><field name=\"v4_float\" type=\"v4f\"/><field name=\"v2_double\" type=\"v2d\"/>"
+    "<field name=\"v16_int8\" type=\"v16i8\"/><field name=\"v8_int16\" type=\"v8i16\"/>"
+    "<field name=\"v4_int32\" type=\"v4i32\"/><field name=\"v2_int64\" type=\"v2i64\"/>"
+    "<field name=\"uint128\" type=\"uint128\"/></union>"
+    "<reg name=\"xmm0\" bitsize=\"128\" type=\"vec128\" regnum=\"40\"/>"
+    "<reg name=\"xmm1\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm2\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm3\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm4\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm5\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm6\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm7\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm8\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm9\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm10\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm11\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm12\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm13\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm14\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"xmm15\" bitsize=\"128\" type=\"vec128\"/>"
+    "<reg name=\"mxcsr\" bitsize=\"32\" type=\"int\" group=\"vector\"/>"
+    "</feature><feature name=\"org.gnu.gdb.i386.linux\">"
+    "<reg name=\"orig_rax\" bitsize=\"64\" type=\"int\" regnum=\"57\"/>"
+    "</feature><feature name=\"org.gnu.gdb.i386.segments\">"
+    "<reg name=\"fs_base\" bitsize=\"64\" type=\"int\" regnum=\"58\"/>"
+    "<reg name=\"gs_base\" bitsize=\"64\" type=\"int\"/>"
+    "</feature><feature name=\"org.gnu.gdb.i386.avx\">"
+    "<reg name=\"ymm0h\" bitsize=\"128\" type=\"uint128\" regnum=\"60\"/>"
+    "<reg name=\"ymm1h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm2h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm3h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm4h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm5h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm6h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm7h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm8h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm9h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm10h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm11h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm12h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm13h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm14h\" bitsize=\"128\" type=\"uint128\"/>"
+    "<reg name=\"ymm15h\" bitsize=\"128\" type=\"uint128\"/>"
+    "</feature></target>";
+
+const char* gdbstub_target_xml(void) { return g_tdesc; }
 
 typedef struct { char* buf; uint32_t cap; uint32_t len; bool ovf; } out_t;
 
@@ -124,6 +226,38 @@ static void put_hex_num(out_t* o, uint64_t v) {
     while (n) put(o, tmp[--n]);
 }
 static int done(out_t* o) { return o->ovf ? -1 : (int)o->len; }
+
+/* Binary data in a reply: '#', '$', '}' and '*' are escaped as '}' and the
+ * byte xor 0x20. */
+static void put_bin(out_t* o, const uint8_t* b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t c = b[i];
+        if (c == '#' || c == '$' || c == '}' || c == '*') {
+            put(o, '}');
+            put(o, (char)(c ^ 0x20));
+        } else {
+            put(o, (char)c);
+        }
+    }
+}
+
+/* qXfer reads of a string: "m" and a chunk, or "l" and the last one. */
+static int xfer_string(out_t* o, const char* s, uint64_t slen, uint64_t off, uint64_t len) {
+    if (off >= slen) {
+        put(o, 'l');
+        return done(o);
+    }
+    uint64_t n = slen - off;
+    if (len > GDBSTUB_PACKET_MAX / 2) len = GDBSTUB_PACKET_MAX / 2;
+    put(o, n > len ? 'm' : 'l');
+    if (n > len) n = len;
+    put_bin(o, (const uint8_t*)s + off, (uint32_t)n);
+    return done(o);
+}
+
+static void put_be32(uint8_t* b, uint32_t v) {
+    b[0] = (uint8_t)(v >> 24); b[1] = (uint8_t)(v >> 16); b[2] = (uint8_t)(v >> 8); b[3] = (uint8_t)v;
+}
 
 /* Parse a hex number at p[*i], stopping at a non-hex character. */
 static bool parse_hex(const char* p, uint32_t plen, uint32_t* i, uint64_t* out) {
@@ -172,6 +306,10 @@ int gdbstub_handle_session(const gdbstub_ops_t* ops, gdbstub_session_t* s,
         puts_(&o, "PacketSize=1000;ReverseStep+;ReverseContinue+");
         if (ops && ops->breakpoint) puts_(&o, ";swbreak+;hwbreak+");
         if (ops && ops->cont) puts_(&o, ";vContSupported+");
+        if (ops && ops->read_regs) puts_(&o, ";qXfer:features:read+");
+        if (ops && ops->exec_file) puts_(&o, ";qXfer:exec-file:read+");
+        if (ops && ops->auxv) puts_(&o, ";qXfer:auxv:read+");
+        if (ops && ops->libraries) puts_(&o, ";qXfer:libraries-svr4:read+");
         return done(&o);
     }
 
@@ -276,6 +414,119 @@ int gdbstub_handle_session(const gdbstub_ops_t* ops, gdbstub_session_t* s,
         int n = ops->thread_name(ops->ctx, parse_tid(packet, plen, 17), name, sizeof(name));
         for (int k = 0; k < n; k++) put_hex_byte(&o, (uint8_t)name[k]);
         return done(&o);
+    }
+    /* The target description (#252). */
+    if (has_prefix(packet, plen, "qXfer:features:read:") && ops->read_regs) {
+        uint32_t i = 20;
+        if (!has_prefix(packet + i, plen - i, "target.xml:")) return emit(out, outcap, "E00");
+        i += 11;
+        uint64_t off, len;
+        if (!parse_hex(packet, plen, &i, &off) || i >= plen || packet[i] != ',') return emit(out, outcap, "E01");
+        i++;
+        if (!parse_hex(packet, plen, &i, &len)) return emit(out, outcap, "E01");
+        return xfer_string(&o, g_tdesc, sizeof(g_tdesc) - 1, off, len);
+    }
+    /* The auxiliary vector and the shared libraries (#254): "qXfer:auxv:read:",
+     * "qXfer:libraries-svr4:read:", an annex (ignored), ':', then off,len. */
+    bool want_auxv = has_prefix(packet, plen, "qXfer:auxv:read:") && ops->auxv;
+    bool want_libs = has_prefix(packet, plen, "qXfer:libraries-svr4:read:") && ops->libraries;
+    if (want_auxv || want_libs) {
+        uint32_t i = want_auxv ? 16 : 26;
+        while (i < plen && packet[i] != ':') i++;          /* annex (ignored) */
+        if (i >= plen) return emit(out, outcap, "E01");
+        i++;
+        uint64_t off, len;
+        if (!parse_hex(packet, plen, &i, &off) || i >= plen || packet[i] != ',') return emit(out, outcap, "E01");
+        i++;
+        if (!parse_hex(packet, plen, &i, &len)) return emit(out, outcap, "E01");
+        static char doc[8192];
+        int n = want_auxv ? ops->auxv(ops->ctx, 0, (uint8_t*)doc, sizeof(doc))
+                          : ops->libraries(ops->ctx, 0, doc, sizeof(doc));
+        if (n < 0) return emit(out, outcap, "E00");
+        return xfer_string(&o, doc, (uint64_t)n, off, len);
+    }
+    /* The program, so gdb needs no file argument (#252). */
+    if (has_prefix(packet, plen, "qXfer:exec-file:read:") && ops->exec_file) {
+        uint32_t i = 21;
+        uint64_t pid = 0, off, len;
+        parse_hex(packet, plen, &i, &pid);
+        if (i >= plen || packet[i] != ':') return emit(out, outcap, "E01");
+        i++;
+        if (!parse_hex(packet, plen, &i, &off) || i >= plen || packet[i] != ',') return emit(out, outcap, "E01");
+        i++;
+        if (!parse_hex(packet, plen, &i, &len)) return emit(out, outcap, "E01");
+        char path[256];
+        int n = ops->exec_file(ops->ctx, (uint32_t)pid, path, sizeof(path));
+        if (n < 0) return emit(out, outcap, "E00");
+        return xfer_string(&o, path, (uint64_t)n, off, len);
+    }
+    /* Host I/O: gdb reads the program through "target:" paths. */
+    if (has_prefix(packet, plen, "vFile:")) {
+        uint32_t i = 6;
+        if (has_prefix(packet + i, plen - i, "setfs:")) return emit(out, outcap, "F0");
+        if (has_prefix(packet + i, plen - i, "open:") && ops->file_open) {
+            i += 5;
+            char path[256];
+            uint32_t n = 0;
+            while (i + 1 < plen && packet[i] != ',' && n + 1 < sizeof(path)) {
+                int hi = hex_val(packet[i]), lo = hex_val(packet[i + 1]);
+                if (hi < 0 || lo < 0) break;
+                path[n++] = (char)((hi << 4) | lo);
+                i += 2;
+            }
+            path[n] = 0;
+            int h = ops->file_open(ops->ctx, path);
+            if (h < 0) return emit(out, outcap, "F-1,2");     /* ENOENT */
+            put(&o, 'F');
+            put_hex_num(&o, (uint64_t)h);
+            return done(&o);
+        }
+        if (has_prefix(packet + i, plen - i, "pread:") && ops->file_pread) {
+            i += 6;
+            uint64_t h, count, off;
+            if (!parse_hex(packet, plen, &i, &h) || i >= plen || packet[i++] != ',' ||
+                !parse_hex(packet, plen, &i, &count) || i >= plen || packet[i++] != ',' ||
+                !parse_hex(packet, plen, &i, &off)) {
+                return emit(out, outcap, "F-1,16");             /* EINVAL (gdb's) */
+            }
+            if (count > GDBSTUB_PACKET_MAX / 2 - 16) count = GDBSTUB_PACKET_MAX / 2 - 16;
+            uint8_t buf[GDBSTUB_PACKET_MAX / 2];
+            int n = ops->file_pread(ops->ctx, (int)h, off, buf, (uint32_t)count);
+            if (n < 0) return emit(out, outcap, "F-1,9");        /* EBADF */
+            put(&o, 'F');
+            put_hex_num(&o, (uint64_t)n);
+            put(&o, ';');
+            put_bin(&o, buf, (uint32_t)n);
+            return done(&o);
+        }
+        if (has_prefix(packet + i, plen - i, "fstat:") && ops->file_size) {
+            i += 6;
+            uint64_t h;
+            parse_hex(packet, plen, &i, &h);
+            int64_t size = ops->file_size(ops->ctx, (int)h);
+            if (size < 0) return emit(out, outcap, "F-1,9");
+            /* gdb's struct stat: big-endian dev, ino, mode, nlink, uid, gid,
+             * rdev (4 each), size, blksize, blocks (8 each), atime, mtime,
+             * ctime (4 each). */
+            uint8_t st[64];
+            for (uint32_t k = 0; k < sizeof(st); k++) st[k] = 0;
+            put_be32(st + 8, 0100555);                         /* a regular file */
+            put_be32(st + 12, 1);
+            put_be32(st + 28, (uint32_t)((uint64_t)size >> 32));
+            put_be32(st + 32, (uint32_t)size);
+            put_be32(st + 40, 4096);
+            puts_(&o, "F40;");
+            put_bin(&o, st, sizeof(st));
+            return done(&o);
+        }
+        if (has_prefix(packet + i, plen - i, "close:") && ops->file_close) {
+            i += 6;
+            uint64_t h;
+            parse_hex(packet, plen, &i, &h);
+            ops->file_close(ops->ctx, (int)h);
+            return emit(out, outcap, "F0");
+        }
+        return emit(out, outcap, "F-1,58");                     /* ENOSYS (gdb's) */
     }
     if (eq_lit(packet, plen, "qAttached")) return emit(out, outcap, "1");
     if (eq_lit(packet, plen, "qOffsets")) return emit(out, outcap, "Text=0;Data=0;Bss=0");

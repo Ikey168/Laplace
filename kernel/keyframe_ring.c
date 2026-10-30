@@ -5,21 +5,13 @@
  * Pure ring-index core: no allocator, no hardware, no I/O.
  */
 
+#include "crc32_ieee.h"
 #include "keyframe_ring.h"
 
-/* IEEE 802.3 reflected CRC32 (poly 0xEDB88320), bitwise. Local copy so this
+/* IEEE 802.3 reflected CRC32 (poly 0xEDB88320), via crc32_ieee.h so this
  * core stays dependency-free, like the journal and divergence cores. */
 uint32_t keyframe_ring_crc32(uint32_t crc, const void* data, uint32_t len) {
-    const uint8_t* p = (const uint8_t*)data;
-    crc = ~crc;
-    for (uint32_t i = 0; i < len; i++) {
-        crc ^= p[i];
-        for (int b = 0; b < 8; b++) {
-            uint32_t mask = -(crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
-        }
-    }
-    return ~crc;
+    return crc32_ieee(crc, data, len);
 }
 
 int keyframe_ring_init(keyframe_ring_t* r, uint32_t capacity) {

@@ -15,6 +15,7 @@
 #include "time_record.h"      /* ktime_values */
 #include "entropy_record.h"   /* kentropy_bytes */
 #include "divergence_scan.h"  /* kdiverge_record_epoch, kdiverge_journal_sums */
+#include "core/kjournal.h"     /* kj_events (#241) */
 #include <stddef.h>
 
 /* The scheduler's preemption record (core/machine.c). */
@@ -32,6 +33,7 @@ static const journal_capture_sources_t g_live_sources = {
     .entropy_bytes   = kentropy_bytes,
     .divergence_sums = kdiverge_journal_sums,
     .epoch_length    = epoch_length,
+    .extended_events = kj_events,
 };
 
 int journal_capture_init(fat_block_device_t* dev, uint32_t base_sector,

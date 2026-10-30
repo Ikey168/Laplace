@@ -14,10 +14,12 @@
 #include "reverse.h"
 #include "revbreak.h"
 #include "core/timetravel.h"
+#include "core/kstate.h"
 #include "core/machine.h"
 #include "core/monitor.h"
 #include "core/proc.h"
 #include "core/mm.h"
+#include "core/fpu.h"
 
 static mcp_probe_fn g_probe;
 static void*        g_probe_ctx;
@@ -155,6 +157,15 @@ static int op_get_registers(void* c, uint32_t pid, mcp_regs_t* r) {
     r->r12 = x->r12; r->r13 = x->r13; r->r14 = x->r14; r->r15 = x->r15;
     r->rip = x->rip;
     r->rflags = x->rflags & 0xED5ULL;
+    r->fs_base = proc_arch(p)->fs_base;
+    r->gs_base = proc_arch(p)->gs_base;
+    machine_fpu_flush();
+    const uint8_t* a = proc_arch(p)->fpu;
+    r->has_vector = true;
+    r->mxcsr = (uint32_t)a[24] | (uint32_t)a[25] << 8 | (uint32_t)a[26] << 16 | (uint32_t)a[27] << 24;
+    for (int i = 0; i < 16; i++) {
+        for (int b = 0; b < 16; b++) r->xmm[i][b] = a[FPU_XMM_OFFSET + i * 16 + b];
+    }
     return 0;
 }
 
@@ -165,6 +176,7 @@ static uint32_t op_list_processes(void* c, mcp_proc_t* out, uint32_t max) {
     for (uint32_t i = 0; i < proc_count() && n < max; i++) {
         process_t* p = proc_at(i);
         out[n].pid = (uint32_t)p->pid;
+        out[n].tgid = p->tgid;
         uint32_t k = 0;
         for (; k + 1 < sizeof(out[n].name) && p->name[k]; k++) out[n].name[k] = p->name[k];
         out[n].name[k] = 0;
@@ -183,6 +195,22 @@ static int op_verify(void* c, mcp_verify_t* out) {
     out->epochs_diverged = v.epochs_diverged;
     out->first_epoch = v.first_epoch;
     out->first_component = v.first_component;
+    {
+        const char* n = kstate_component_name(v.first_component);
+        uint32_t i = 0;
+        for (; n[i] && i < sizeof(out->component_name) - 1; i++) out->component_name[i] = n[i];
+        out->component_name[i] = 0;
+    }
+    out->diag_step_lo = v.diag_step_lo;
+    out->diag_step_hi = v.diag_step_hi;
+    out->leak[0] = 0;
+    if (v.leak_found) {
+        uint32_t i = 0;
+        for (; v.leak_what[i] && i < sizeof(out->leak) - 1; i++) out->leak[i] = v.leak_what[i];
+        out->leak[i] = 0;
+        out->leak_pid = v.leak_pid;
+        out->leak_rip = v.leak_rip;
+    }
     return 0;
 }
 

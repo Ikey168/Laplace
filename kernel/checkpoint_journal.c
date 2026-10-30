@@ -8,6 +8,7 @@
  * handles) so it needs no allocator.
  */
 
+#include "crc32_ieee.h"
 #include "checkpoint_journal.h"
 #include <stddef.h>
 
@@ -17,20 +18,11 @@ extern void* memcpy(void* dest, const void* src, size_t size);
 
 /* ============================ CRC32 ============================ */
 
-/* IEEE 802.3 reflected CRC32 (poly 0xEDB88320), bitwise so no table init is
- * required. Identical to snapshot_crc32; duplicated to keep this core
- * dependency-free and host-testable on its own. */
+/* IEEE 802.3 reflected CRC32 (poly 0xEDB88320), from crc32_ieee.h, which
+ * keeps this core dependency-free and host-testable on its own. Identical to
+ * snapshot_crc32. */
 uint32_t journal_crc32(uint32_t crc, const void* data, uint32_t len) {
-    const uint8_t* p = (const uint8_t*)data;
-    crc = ~crc;
-    for (uint32_t i = 0; i < len; i++) {
-        crc ^= p[i];
-        for (int b = 0; b < 8; b++) {
-            uint32_t mask = -(crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
-        }
-    }
-    return ~crc;
+    return crc32_ieee(crc, data, len);
 }
 
 /* ===================== Sector I/O wrappers ===================== */

@@ -34,29 +34,243 @@ of that epoch has trapped and not been handled; with an instruction index,
 `(epoch, step, i)` for `i >= 1` is the moment entry `step` has been handled and
 `i - 1` further user instructions have run (`include/core/machine.h`).
 
-**Determinism.** A timer interrupt never changes user-visible state: it only
-marks the time slice expired. Context switches happen only at kernel entries,
-through `sched_record_decide()`, which records the step of every preemption on
-a live run and forces the same switches on replay. This is what makes the
-logical clock execution-derived; the original design counted timer ticks, which
-land at a different instruction on every run. The clock (`SYS_TIME`) and
+**Determinism.** Context switches happen only at kernel entries, through
+`sched_record_decide()`, which records the step of every preemption on a live
+run and forces the same switches on replay. This is what makes the logical
+clock execution-derived; the original design counted timer ticks, which land
+at a different instruction on every run. A timer interrupt that lands in user
+mode becomes an entry of its own when the machine wants one there (#245,
+below); otherwise it only marks the time slice expired. The clock (`SYS_TIME`) and
 entropy (`SYS_RANDOM`) system calls go through `ktime_read()` and
-`kentropy_fill()`. Everything else a program can observe is a function of its
-memory and registers, so re-executing from a keyframe with the journal
-reproduces the run exactly.
+`kentropy_fill()`. User-mode `rdtsc` and `rdtscp` raise #GP (CR4.TSD) and are
+emulated from `ktime_read()`; with CPUID faulting, user `cpuid` raises #GP too
+and is answered from a masked table captured in every keyframe's kernel state
+(#241). Each emulated instruction is a kernel entry, so a step. Everything else
+a program observes is a function of its memory and registers, so re-executing
+from a keyframe with the journal reproduces the run exactly, unless it
+executes an instruction nothing can trap (`rdrand`, `rdseed`, `rdpid`), which
+the table hides and verification reports.
+
+**Extended state** (#237). The kernel never touches x87/XMM/YMM registers
+(`-mgeneral-regs-only`), so between entries the register file holds the state
+of the last process that ran. Switching to another process saves that state
+and restores the next one's (`kernel/core/fpu.c`); nothing traps, so the steps
+are the same in recording and replay. Saved areas are made canonical
+(components the CPU left in their initial state are written out as such), live
+in a keyframe's context record next to the general registers, and are part of
+the register checksum (control words, MXCSR, ST0-7, XMM0-15, the upper YMM
+halves; the last-instruction pointers are not, as CPUs differ in storing
+them).
+
+**Linux programs** (#238). The kernel runs in the top 2 GiB and reaches RAM
+through a direct map, so the lower half of every address space is free for
+programs linked at 0x400000. `syscall` enters through a stub that builds the
+same trap frame `int 0x80` does (vector 129, `VEC_LINUX_SYSCALL`), so a Linux
+system call is a step like any other. `kernel/core/linux.c` implements the
+calls; FS/GS base (TLS) is per process, loaded on switch, kept in keyframes,
+and checksummed. Times are a journaled TSC read converted through a clock base
+(TSC frequency, wall clock at boot) that is part of every keyframe's kernel
+state; resuming after a power cut re-anchors it to the new boot's TSC and takes
+a keyframe at once. There is no vDSO, so libc reads the time through a system
+call.
+
+**Process memory** (#239, `kernel/core/vm.c`). An address space is a sorted
+list of regions and the pages present in them, at fixed places (no
+randomization): ELF segments, the `brk` heap after the highest one, `mmap`
+top-down from 0x7FFF00000000, and for Linux programs an 8 MiB stack below
+0x7FFFFFFF0000. Pages appear on first touch: a not-present fault inside a
+region that allows the access maps a zeroed page and resumes the instruction.
+Which pages are present is part of every keyframe, so a replay takes the same
+faults at the same instructions, and like snapshot-COW captures they are not
+steps. A system call reading an untouched page sees zeros without mapping it,
+and so does a debugger, so inspecting memory never changes the machine. Before
+any change to regions or pages while recording, a pending keyframe writeback
+is finished, since it reads them. The kernel-state blob holds every region
+(start, end, protection, kind) in one flat list; restore re-creates them and
+maps each saved page with its region's protection (no user bit for
+`PROT_NONE`). The process-table checksum covers the regions and the break, the
+user-page checksum each page's user bit.
+
+**Files** (#247, `include/memfs.h`, `include/core/files.h`). The filesystem
+is inside the recording. It starts from a read-only seed image, a cpio
+"newc" archive passed as a Multiboot module (`tools/mkcpio.py` packs
+`rootfs/` deterministically), which the recording pins by CRC: seed files are
+read straight from the image and need no journal, and a recording refuses to
+resume with a different image. Whatever programs create or change is kernel
+state: the tree (inodes, directories, sizes, times) is the `fs` section of
+the keyframe, file pages go in the page pool next to user memory (as a page
+provider with pseudo pids, tracked unchanged-or-not the same way), and open
+file descriptions, descriptor tables, working directories, and umasks are the
+`files` section. Both are divergence components of their own. A seed file is
+copied into pages at its first change. File times follow the last wall-clock
+time a program read through a journaled call, so they replay too. Programs
+can also be started from the image (`run=/bin/lua`).
+
+**Inputs** (#242, `include/iorec.h`, `include/core/kio.h`). Everything that
+enters the machine from outside is one kind of record: (step, kind, call
+number, argument digest, return value, payload). Clock reads (`ktime_read`)
+and entropy (`kentropy_fill`) go through it now, and console and network
+input will. While recording, the live source runs and its result is
+appended; payload bytes go into one byte stream per epoch whose pages are
+written to the page pool as they fill (owned by the epoch's keyframe and
+freed with it), so a large input costs pool pages and a few journal events
+(two per record, one per run of pages), not a fixed-size journal stream. While
+replaying, the source never runs: the call must be the one recorded at this
+step with the same kind, call number, and argument digest, and it gets the
+recorded result and payload. A call that does not match stops the replay at
+that step, and `verify` reports the epoch as diverged in the `inputs`
+component (15): the leak is caught at its first visible effect. Journal slots
+are sized from the disk (640 to 2560 sectors) and the label records the size.
+Programs reach devices only through `machine_device_write`, which does
+nothing while replaying, so a replay never repeats an external side effect.
+
+**Blocking and idle** (#246, `include/core/machine.h`). A process that
+waits leaves the run queue with a reason, the object it waits on, and an
+optional deadline; the wait is part of the `procs` section and of the
+process-table checksum. A wake caused by another process's call is
+deterministic. A deadline passing is an input: while recording, the kernel
+compares deadlines with the clock at every entry and while idle, wakes the
+process, and journals the wake (a `kio_event`) with the step it was delivered
+at; a replay delivers it at that step and never waits. When nothing can run,
+the kernel halts with interrupts enabled until a wake is due or a debugger
+asks to stop: idle time adds no steps. `nanosleep` and `clock_nanosleep` use
+this; futexes, `wait4`, `poll`, and console input reuse it.
+
+**Processes** (#248, `include/core/pctl.h`). `fork` (and `vfork`, `clone`
+without `CLONE_VM`) shares every frame read-only between parent and child
+with `PAGE_FORK_COW`; a table of shared frames counts their mappings, and
+the first write copies the frame. Snapshot COW and fork COW meet in one
+write-fault path (`vmm_user_write_fault`): the keyframe image is captured
+first, then the frame is unshared; a keyframe stores a shared frame in one
+pool slot. `execve` loads through the loader into a fresh address space,
+then closes close-on-exec descriptors. An exiting process with a living
+parent stays a zombie (pid and wait status) until `wait4` reaps it, and a
+parent already waiting is woken at once; orphans go to pid 1. The pid
+counter, the parent links, the zombies' statuses, and the wait4 operands are
+kernel state.
+
+**Threads** (#251, `include/core/pctl.h`). A thread is a process-table
+entry of its own (registers, extended state, FS base, signal mask and
+pending set) in its group, whose leader's pid is the group's; the threads
+share the leader's address space, descriptor table, and handlers. Keyframes
+list a shared address space's pages once (under the first table entry that
+uses it), the procs section records each thread's group and restores the
+threads into one space, and the "files" section writes a shared table once.
+Preemption between threads at any instruction is #245's, so a lost update
+between two threads is recorded and replayed like any other interleaving.
+futex waits block in WAIT_FUTEX on (address space, address) and wake in
+table order.
+
+**Signals** (#250, `include/core/ksig.h`). Each process has 64 actions, a
+blocked and a pending set (with each pending signal's siginfo), an alternate
+stack, and up to eight timers (`setitimer`/`alarm` and `timer_create`); all
+of it is the `signals` keyframe section and divergence component. Delivery
+happens only when a process is about to run after a kernel entry, so it is a
+function of the step. A handler gets a Linux x86-64 `rt_sigframe`
+(`sa_restorer` as its return address, a ucontext with the sigcontext and
+signal mask, the siginfo, and the x87/SSE/AVX state with the XSAVE markers),
+and `rt_sigreturn` restores from it. A process blocked in a wait that a
+signal interrupts returns `-EINTR`. Faults become signals at the faulting
+instruction (#PF/#GP -> SIGSEGV with `si_addr`, #DE/#MF/#XM -> SIGFPE, #UD
+-> SIGILL, int3 -> SIGTRAP, #AC -> SIGBUS). With no handler, a fault stops
+the machine for the debugger (gdb sees the signal and the faulting line), as
+does any other core-dumping signal (`abort()`); other fatal signals end the
+process with the signal as its wait status, and an exiting child sends its
+parent SIGCHLD. Timer expiries are inputs: noticed against the clock while
+recording, journaled with the step they are delivered at, and replayed there.
+
+**Preemption at any instruction** (#245, `include/core/preempt.h`,
+`include/pmatch.h`). While recording, a timer interrupt in user mode becomes a
+kernel entry (vector 32, a step like any other) when the slice expired and
+another process is ready, a timer deadline passed, a keyframe is due, or a
+debugger asked to stop. So a program that never makes a system call is
+preempted, signalled, keyframed, and stoppable. No counter says how far it
+got, so the entry's journal record describes the point by state: the
+registers, the FS/GS bases, a checksum of the x87/SSE/AVX state, and a hash
+of every page the CPU marked dirty since the previous such record (which
+clears the marks). Pages outside that set are the same at every point of the
+segment, because only that process ran. A replay arms a hardware breakpoint
+at the recorded rip, for the process that runs the segment, in a slot the
+debugger leaves free; each hit compares the registers, then the extended
+state, then the pages (the one that differed last time first), and the first
+match becomes the entry. A page the record saw present must be present: an
+untouched page is not one that reads as zeros. Since a recording can be
+preempted between a demand-paging fault and the retry of its instruction,
+the point is checked again after every such fault. When the same state
+occurs more than once (a spin),
+every occurrence has the same future, so the first is as good as the
+recorded one. A point inside `rep movs`/`rep stos` (rip on the instruction,
+rcx/rsi/rdi partly advanced) is reached by running the remaining iterations
+in the kernel, exactly as the CPU would; other string instructions are
+single-stepped; one that cannot reach the point runs to its end with the
+breakpoint moved past it. A replay that reaches the segment's next real entry
+first has diverged, and is reported in the "inputs" component. Stepping over
+a breakpoint uses RF together with a single step: QEMU's TCG applies RF to a
+whole translated block, so RF alone would let a loop run past every later
+hit. The cost is a trap or two per execution of the recorded instruction
+before the point; a branch counter, where a CPU has one, can skip most of
+them (#236).
+
+**Diagnosing a divergence** (#241). Every 16 entries the recorder journals a
+rolling hash of the registers at each entry (`KJ_EV_TRACE` in the extended
+journal, `include/core/kjournal.h`). When `verify` finds a diverged epoch, the
+first trace sample that differs bounds the divergence to 16 entries (or the
+whole epoch, when only memory differs); the window is then single-stepped and
+the first untrappable instruction in it is reported with its pid, address, and
+position.
 
 **Recording** (`kernel/core/timetravel.c`). At the first entry, and then
 whenever the interval elapses or a record buffer fills, the kernel closes the
 epoch (its journal goes to the journal ring) and takes a keyframe at that entry:
 `checkpoint_take()` marks every writable user page copy-on-write and captures
-registers, and a kernel-state blob captures the process table, each space's
-regions, the run order, and the pending entry. Writeback to the keyframe store
+registers, and a kernel-state blob captures the kernel's own state. Writeback to the keyframe store
 runs at a later entry, so programs write in between and the COW hook preserves
 the checkpoint-time images.
 
+**Kernel state** (#243, `include/kstate_format.h`, `kernel/core/kstate.c`).
+The blob is a set of sections, one per kernel subsystem, each with its own
+version and CRC; there is no fixed cap on processes, regions, or other
+objects. A subsystem registers a save, a restore, and optionally a checksum:
+`procs` (pid, parent, state, name, executable, and every region), `cpuid`,
+`clock`, `machine` (epoch, current process, next pid, pending entry), and
+`probe`, a one-word test subsystem. Restore runs them in registration order,
+so a subsystem whose objects name another's (a file descriptor its process)
+registers after it and resolves the reference by id; a blob with an unknown
+section, or without a registered one, is refused. Registers and pages stay
+keyframe records of their own. Each subsystem with a checksum is its own
+divergence component (6 and up), and every report names the component:
+`verify` says `component 6 (probe)`, the self-test perturbs the probe's
+restore and requires that name.
+
 **Storage.** The first IDE disk (or a RAM disk) holds a label, the keyframe
-store (a ring index plus N double-buffered regions), and the journal ring: one
-journal per retained keyframe (`kernel/journal_ring.c`). Journal E holds the
+store (a ring index plus N double-buffered regions), the journal ring (one
+journal per retained keyframe, `kernel/journal_ring.c`), and the page pool.
+Region sizes follow the disk size at format time: a keyframe region gets
+1/16 of the disk's share per keyframe (512 to 4096 sectors), the pool the
+rest.
+
+**Incremental keyframes** (#244, `include/page_store.h`,
+`include/core/kfpages.h`). A keyframe region holds the kernel state, the
+registers, and a page manifest: runs of (pid, address, count, first slot)
+into the pool, where each slot holds one page. The kernel knows which pages
+are unchanged since a reference keyframe (the newest one taken, or the one
+last restored) from a software PTE bit, `PAGE_KF_KNOWN`: taking or restoring
+a keyframe sets it on every page, and the snapshot-COW write fault (or an
+mremap move) clears it. A keyframe reuses the slots of the pages still KNOWN
+and writes only the others, so its cost follows the pages its epoch dirtied,
+not resident memory: with 256 MiB resident and a 64-page working set, about
+90 pages per keyframe (`tests/qemu/scale_gate.sh`). Slots are
+reference-counted by the retained manifests; evicting a keyframe frees only
+slots no other keyframe names, so the full keyframe written while memory
+filled can go while the ones after it still restore. Counts live in memory
+and are rebuilt at boot from the manifests on the disk. A keyframe is also
+taken early when its epoch has dirtied `dirty=` pages (default 8192).
+
+The same bit makes the epoch-boundary checksum of user memory cheap: a KNOWN
+page's CRC is its slot's, computed once when the slot was written. And it
+makes restore cheap: the frames of KNOWN pages whose slot the target
+keyframe also names are kept, replay saves a pristine copy of a page at its
+first write, and only the rest is read from the pool. Journal E holds the
 inputs from keyframe E to keyframe E+1 (or to the stop point, for the newest
 epoch): preemption steps, time reads, entropy, the divergence checksums of the
 state at its end, and its length in steps.
@@ -87,14 +301,36 @@ the recording and continues live, still recording.
 ### Limits
 
 - One CPU. Deterministic replay of SMP is not attempted.
-- Preemption is at kernel-entry granularity: a process that never enters the
-  kernel is not preempted while recording.
+- A recorded preemption point is found again by trapping on its instruction:
+  replaying a preempted hot loop costs a trap or two per iteration before the
+  point (no branch counter is used yet).
 - The journaled inputs are the ones programs can see today: preemption, time,
-  and entropy. There is no device input (keyboard, network) to journal yet.
-- Programs may not use x87/SSE state (the context switch saves the general
-  registers only); user programs are built with `-mgeneral-regs-only`.
+  entropy, and console input (#249: bytes typed on COM1, journaled with the
+  step they are delivered at, `kernel/core/tty.c`), and network frames
+  (#253: each frame the e1000 received, journaled with the step it is
+  delivered at, `kernel/core/net.c`; what the stack transmits is suppressed
+  in a replay).
+- `rdrand`, `rdseed`, and `rdpid` cannot be trapped: the CPUID table hides
+  them, and executing them anyway is a divergence that `verify` names. Without
+  CPUID faulting (QEMU TCG), user `cpuid` runs natively: deterministic on one
+  host, but a recording moved to another CPU may diverge (#241).
+- The page pool must hold every distinct page the retained keyframes need:
+  resident memory plus what the window's epochs dirtied. A full pool stops the
+  recording with a message naming its size; give it a larger disk (or `pool=`
+  for the RAM disk).
+- An epoch that maps a lot of new memory (a program filling its heap) has a
+  keyframe at each end that differ in most pages, so replaying across it
+  rereads those pages from the pool.
+- x87, SSE, and AVX are saved (XSAVE with XCR0 = x87|SSE|AVX, or FXSAVE);
+  AVX-512 and the XSAVE optimizations (XSAVEOPT, XSAVEC, XGETBV1) are not
+  offered to programs.
 - Recorded history is read-only: gdb memory and register writes are refused.
-- The workloads are the embedded programs in `user/laplace/`.
+- The workloads are the embedded programs in `user/laplace/` (Laplace ABI) and
+  `user/linux/` (unmodified static musl programs, Linux ABI).
+- KVM works (`make selftest` passes under `-enable-kvm -cpu host`, checked on a
+  GitHub-hosted runner on 2026-10-21), but those runners expose no PMU, so
+  instruction-precise preemption does not rely on a hardware branch counter
+  (#245).
 
 ## Modules
 
@@ -102,6 +338,7 @@ the recording and continues live, still recording.
 |-------|---------|
 | Boot, CPU, memory, processes, system calls | `kernel/core/{boot.asm,isr.asm,cpu.c,mm.c,proc.c,machine.c,main.c}` |
 | Recording, keyframes, restore, replay, verify, navigation | `kernel/core/timetravel.c` |
+| Kernel state in keyframes: sectioned format, subsystems | `kernel/kstate_format.c`, `kernel/core/kstate.c` |
 | Input journal (double-buffered store) and live capture | `kernel/checkpoint_journal.c`, `kernel/journal_capture.c`, `kernel/journal_capture_sync.c` |
 | Journal ring (one journal per retained keyframe) | `kernel/journal_ring.c` |
 | Deterministic preemption, time, entropy | `kernel/sched_record.c`, `kernel/time_record*.c`, `kernel/entropy_record*.c` |
@@ -141,7 +378,14 @@ This section is the spike deliverable for the catalog. Every source that can mak
 diverge must be either recorded and replayed, virtualized, or gated to a deterministic
 point. Each entry below is grounded in the current code.
 
-#### Spike findings (current code)
+#### Spike findings (the IKOS-era code)
+
+> These findings describe the IKOS-era kernel this plan started from. Its
+> files (`kernel/scheduler.c`, `kernel/interrupts.c`, `kernel/auth_core.c`,
+> and the rest named below) were never part of the bootable kernel and were
+> removed in #233. What the booted kernel journals today, and where, is in
+> "Inputs" and the module map above.
+
 
 A read of the kernel established the facts that shape the plan:
 

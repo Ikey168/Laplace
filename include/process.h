@@ -169,6 +169,30 @@ typedef struct process {
     /* Process arguments */
     char** argv;                        /* Command line arguments */
     char** envp;                        /* Environment variables */
+
+    /* Laplace core (#237): FS/GS base and the x87/SSE/AVX area (lp_arch_t,
+     * include/core/proc.h), and the allocation it lives in. */
+    void* arch;
+    void* arch_block;
+    /* The executable (#240): its path and a CRC of its image. */
+    char     exe_path[64];
+    uint32_t exe_crc;
+    /* Open files, cwd, umask (#247): include/core/files.h. */
+    void*    files;
+    /* Blocked (#246): why, on what, and until when (monotonic ns; 0: no
+     * deadline). See include/core/machine.h. */
+    uint32_t wait_reason;
+    uint64_t wait_obj;
+    uint64_t wait_deadline;
+    uint64_t wait_aux;       /* a second operand, e.g. wait4's status pointer */
+    /* A zombie's wait status (#248): exit code << 8, or the signal. */
+    uint32_t wait_status;
+    /* Signal state (#250): include/core/ksig.h. */
+    void*    sig;
+    /* Thread group (#251): the leader's pid; the leader's own pid for a
+     * process with one thread. Threads share the leader's address space,
+     * descriptor table, and signal handlers. */
+    uint32_t tgid;
 } process_t;
 
 /* Process management functions */

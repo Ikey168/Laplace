@@ -52,10 +52,16 @@ typedef struct {
     uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
     uint64_t rip, rflags;
+    /* #252: the TLS bases and the vector registers (when has_vector). */
+    uint64_t fs_base, gs_base;
+    bool     has_vector;
+    uint32_t mxcsr;
+    uint8_t  xmm[16][16];      /* little-endian, as in memory */
 } mcp_regs_t;
 
 typedef struct {
-    uint32_t pid;
+    uint32_t pid;              /* a thread id (#251) */
+    uint32_t tgid;             /* its process (thread group); 0: the same as pid */
     char     name[32];
     bool     current;
 } mcp_proc_t;
@@ -65,6 +71,12 @@ typedef struct {
     uint32_t epochs_diverged;
     uint64_t first_epoch;
     uint32_t first_component;
+    char     component_name[24];   /* the subsystem that diverged (#243) */
+    /* Diagnosis of the first diverging epoch (#241). */
+    uint64_t diag_step_lo, diag_step_hi;
+    char     leak[8];            /* "" when no untrappable instruction was found */
+    uint32_t leak_pid;
+    uint64_t leak_rip;
 } mcp_verify_t;
 
 /* Operations the tools drive. Each returns 0 on success. The first four (and

@@ -30,6 +30,7 @@ typedef struct {
     uint32_t interval_ticks;     /* keyframe cadence */
     uint32_t keyframes;          /* retained keyframes (rewind horizon) */
     uint32_t stop_after;         /* stop for the debugger after N keyframes (0: never) */
+    uint32_t dirty_pages;        /* also take one when an epoch dirties this many (0: never) */
 } tt_config_t;
 
 /* Arm the stores on `dev` (formatting it if it holds none). Returns 0. Sets
@@ -41,12 +42,18 @@ bool tt_ready(void);
 void tt_bind_verbs(void);
 /* A RAM-backed block device for when no disk is attached (volatile). */
 fat_block_device_t* tt_ram_device(uint32_t sectors);
-uint32_t tt_required_sectors(uint32_t keyframes);
+uint32_t tt_required_sectors(uint32_t keyframes, uint32_t pool_mib);
 
 /* ---- Machine hooks (live recording) ---- */
 void tt_on_tick(void);
 void tt_on_live_entry(void);
+/* An entry is wanted now (a keyframe is due, or a writeback): a timer
+ * interrupt in user mode becomes one (#245). */
+bool tt_entry_wanted(void);
 void tt_before_process_exit(process_t* p);
+/* A space's regions or pages are about to change (#239): finish a pending
+ * keyframe writeback, which reads them. */
+void tt_before_mapping_change(void);
 
 /* ---- Stopping and resuming ---- */
 
@@ -138,6 +145,17 @@ typedef struct {
     uint32_t first_component;    /* KDIVERGE_* */
     uint32_t expected;
     uint32_t actual;
+    /* Diagnosis of the first diverging epoch (#241): the register trace
+     * bounds the divergence to entries (diag_step_lo, diag_step_hi]; the
+     * first instruction in that window the recorder cannot replay, if any. */
+    uint64_t diag_step_lo;
+    uint64_t diag_step_hi;
+    bool        leak_found;
+    const char* leak_what;       /* "rdrand", "rdseed", "rdpid", "cpuid" */
+    uint32_t    leak_pid;
+    uint64_t    leak_rip;
+    uint64_t    leak_step;
+    uint64_t    leak_insn;
 } tt_verify_t;
 
 /* Replay every retained epoch from its keyframe to its end and compare the
@@ -148,6 +166,9 @@ int tt_verify(tt_verify_t* out);
 /* Deliberately perturb the next replay (for testing the detector): flip one
  * entropy byte of the loaded journal. */
 void tt_perturb_next_replay(bool on);
+/* Flip one bit of the first process's XMM15 in the next restored keyframe
+ * (#237): the extended state must be part of what verification compares. */
+void tt_perturb_next_restore(bool on);
 
 /* ---- Boot resume (#231) ---- */
 
@@ -167,6 +188,7 @@ typedef struct {
     uint64_t journals_written;
     uint64_t restores;
     uint64_t replayed_steps;
+    uint64_t recorded_steps;     /* in the journals written */
 } tt_stats_t;
 const tt_stats_t* tt_stats(void);
 

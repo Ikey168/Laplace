@@ -2,13 +2,29 @@
  *
  * Kernel command line (Multiboot; QEMU -append):
  *   run=a,b,c      programs to start on a cold boot (default heisenbug,noise,noise)
+ *   root=PATH      the filesystem's seed image: a cpio module (default: the
+ *                  first module that is a cpio archive, #247)
  *   interval=N     keyframe cadence in timer ticks (default 100; 1 tick = 1 ms)
  *   keyframes=N    retained keyframes, the rewind horizon (default 16)
+ *   dirty=N        also take a keyframe once an epoch dirties N pages (default
+ *                  8192, 32 MiB; 0: never)
+ *   pool=N         without an IDE disk: the RAM disk's page pool in MiB
+ *                  (default 64; it takes memory only as keyframes fill it)
  *   fresh          ignore a recording on the disk and cold-boot
  *   stop_after=N   stop the machine for the debugger after N keyframes
  *   selftest       after the machine stops, verify the recording and halt
  *   exit           with selftest: leave QEMU through isa-debug-exit (port 0xF4)
  *                  with status 1 on success, 3 on failure
+ *   sabotage=clock|entropy  every replay is wrong on purpose (#256): each
+ *                  replayed clock read one tick (1 ms) late, or one bit of
+ *                  each replayed random payload flipped; verify must notice
+ *   bench          after the machine stops, print "bench:" lines (run time,
+ *                  what the recording wrote, verify, rewind, replay, and
+ *                  reverse-stepi times) instead of the self-test (#255);
+ *                  bench=run: the run line only
+ *   norecord       run without recording (with bench: the baseline run time)
+ *   stepover=tf|rf step over execution breakpoints with RF and a single step,
+ *                  or RF alone (default: tf under QEMU's TCG, rf elsewhere)
  */
 
 #include "core/cpu.h"
@@ -17,7 +33,19 @@
 #include "core/proc.h"
 #include "core/machine.h"
 #include "core/timetravel.h"
+#include "core/kstate.h"
+#include "core/files.h"
+#include "core/kio.h"
+#include "core/ksig.h"
+#include "core/preempt.h"
+#include "core/ahci.h"
+#include "core/bmide.h"
+#include "core/pmu.h"
+#include "core/tty.h"
+#include "core/net.h"
+#include "core/kfpages.h"
 #include "core/monitor.h"
+#include "core/clock.h"
 #include "checkpoint.h"
 #include "checkpoint_ide_boot.h"
 #include "time_record.h"
@@ -25,20 +53,34 @@
 #include "divergence.h"
 #include "divergence_scan.h"
 #include "revbreak.h"
+#include "replay_driver.h"
+
+#ifndef LAPLACE_VERSION
+#define LAPLACE_VERSION "dev"   /* the Makefile passes VERSION */
+#endif
 
 int strncmp(const char* a, const char* b, size_t n);
+int strcmp(const char* a, const char* b);
 size_t strlen(const char* s);
 
 #define MB_FLAG_CMDLINE (1u << 2)
 
 typedef struct {
-    char     run[128];
+    char     run[512];
+    char     env[256];
+    char     root[64];
     uint32_t interval;
     uint32_t keyframes;
     uint32_t stop_after;
+    uint32_t dirty;
+    uint32_t pool_mib;
     bool     fresh;
     bool     selftest;
     bool     exit;
+    bool     bench;
+    bool     bench_run_only;
+    bool     norecord;
+    int      stepover;           /* 0 default, 1 tf, 2 rf */
 } boot_options_t;
 
 static boot_options_t g_opts;
@@ -49,37 +91,77 @@ static uint32_t parse_u32(const char* s, uint32_t len) {
     return v;
 }
 
+/* Copy a token's value, dropping the double quotes that let it hold spaces
+ * (run="/bin/lua /t.lua"). */
+static void copy_value(char* dst, uint32_t cap, const char* v, uint32_t len) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < len && n + 1 < cap; i++) {
+        if (v[i] != '"') dst[n++] = v[i];
+    }
+    dst[n] = 0;
+}
+
 static void parse_cmdline(const char* cmd) {
     const char* dflt = "heisenbug,noise,noise";
     for (uint32_t i = 0; dflt[i]; i++) g_opts.run[i] = dflt[i];
     g_opts.interval = 100;
     g_opts.keyframes = 16;
+    g_opts.dirty = 8192;
+    g_opts.pool_mib = 64;
     if (!cmd) return;
     while (*cmd) {
         while (*cmd == ' ') cmd++;
         const char* tok = cmd;
-        while (*cmd && *cmd != ' ') cmd++;
+        bool quoted = false;
+        while (*cmd && (quoted || *cmd != ' ')) {
+            if (*cmd == '"') quoted = !quoted;
+            cmd++;
+        }
         uint32_t len = (uint32_t)(cmd - tok);
-        if (len > 4 && strncmp(tok, "run=", 4) == 0 && len - 4 < sizeof(g_opts.run)) {
-            for (uint32_t i = 0; i < sizeof(g_opts.run); i++) g_opts.run[i] = 0;
-            for (uint32_t i = 0; i < len - 4; i++) g_opts.run[i] = tok[4 + i];
+        if (len > 4 && strncmp(tok, "run=", 4) == 0) {
+            copy_value(g_opts.run, sizeof(g_opts.run), tok + 4, len - 4);
+        } else if (len > 5 && strncmp(tok, "root=", 5) == 0) {
+            copy_value(g_opts.root, sizeof(g_opts.root), tok + 5, len - 5);
+        } else if (len > 4 && strncmp(tok, "env=", 4) == 0) {
+            copy_value(g_opts.env, sizeof(g_opts.env), tok + 4, len - 4);
         } else if (len > 9 && strncmp(tok, "interval=", 9) == 0) {
             g_opts.interval = parse_u32(tok + 9, len - 9);
         } else if (len > 10 && strncmp(tok, "keyframes=", 10) == 0) {
             g_opts.keyframes = parse_u32(tok + 10, len - 10);
         } else if (len > 11 && strncmp(tok, "stop_after=", 11) == 0) {
             g_opts.stop_after = parse_u32(tok + 11, len - 11);
+        } else if (len > 6 && strncmp(tok, "dirty=", 6) == 0) {
+            g_opts.dirty = parse_u32(tok + 6, len - 6);
+        } else if (len > 5 && strncmp(tok, "pool=", 5) == 0) {
+            g_opts.pool_mib = parse_u32(tok + 5, len - 5);
         } else if (len == 5 && strncmp(tok, "fresh", 5) == 0) {
             g_opts.fresh = true;
         } else if (len == 8 && strncmp(tok, "selftest", 8) == 0) {
             g_opts.selftest = true;
         } else if (len == 4 && strncmp(tok, "exit", 4) == 0) {
             g_opts.exit = true;
+            panic_exits(true);
+        } else if (len == 5 && strncmp(tok, "bench", 5) == 0) {
+            g_opts.bench = true;
+        } else if (len == 9 && strncmp(tok, "bench=run", 9) == 0) {
+            g_opts.bench = true;
+            g_opts.bench_run_only = true;
+        } else if (len == 8 && strncmp(tok, "norecord", 8) == 0) {
+            g_opts.norecord = true;
+        } else if (len == 11 && strncmp(tok, "stepover=tf", 11) == 0) {
+            g_opts.stepover = 1;
+        } else if (len == 11 && strncmp(tok, "stepover=rf", 11) == 0) {
+            g_opts.stepover = 2;
+        } else if (len == 14 && strncmp(tok, "sabotage=clock", 14) == 0) {
+            kio_sabotage(KIO_SABOTAGE_CLOCK);
+        } else if (len == 16 && strncmp(tok, "sabotage=entropy", 16) == 0) {
+            kio_sabotage(KIO_SABOTAGE_ENTROPY);
         }
     }
     if (g_opts.interval == 0) g_opts.interval = 1;
     if (g_opts.keyframes < 2) g_opts.keyframes = 2;
     if (g_opts.keyframes > 64) g_opts.keyframes = 64;
+    if (g_opts.pool_mib < 8) g_opts.pool_mib = 8;
 }
 
 /* Live entropy: RDRAND when the CPU has it, else a cycle-counter mix. Either
@@ -103,22 +185,45 @@ static int entropy_source(void* ctx, void* buf, uint32_t len) {
     return 0;
 }
 
+/* Split `s` at spaces into words (in place), at most `max`. */
+static uint32_t split_words(char* s, const char** out, uint32_t max) {
+    uint32_t n = 0;
+    while (*s && n < max) {
+        while (*s == ' ') *s++ = 0;
+        if (!*s) break;
+        out[n++] = s;
+        while (*s && *s != ' ') s++;
+    }
+    return n;
+}
+
+/* run= is a comma-separated list of programs, each with its arguments:
+ * run="/bin/lua /scripts/t.lua,noise". env= is the environment for every
+ * Linux program, space-separated. */
 static void spawn_run_list(void) {
+    static char envbuf[sizeof(g_opts.env)];
+    const char* envp[32];
+    for (uint32_t i = 0; i < sizeof(envbuf); i++) envbuf[i] = g_opts.env[i];
+    uint32_t envc = split_words(envbuf, envp, 32);
+
     const char* p = g_opts.run;
     while (*p) {
-        char name[32];
+        static char entry[256];
         uint32_t n = 0;
-        while (*p && *p != ',' && n < sizeof(name) - 1) name[n++] = *p++;
-        name[n] = 0;
+        while (*p && *p != ',' && n < sizeof(entry) - 1) entry[n++] = *p++;
+        entry[n] = 0;
         if (*p == ',') p++;
-        const lp_image_t* img = proc_find_image(name);
+        const char* argv[32];
+        uint32_t argc = split_words(entry, argv, 32);
+        if (argc == 0) continue;
+        const lp_image_t* img = proc_find_image(argv[0]);
         if (!img) {
-            kprintf("boot: no program named '%s'\n", name);
+            kprintf("boot: no program named '%s'\n", argv[0]);
             continue;
         }
-        process_t* proc = proc_spawn(img);
-        if (!proc) panic("boot: cannot start %s", name);
-        kprintf("boot: started %s as pid %d\n", name, proc->pid);
+        process_t* proc = proc_spawn_args(img, argc, argv, envc, envp);
+        if (!proc) panic("boot: cannot start %s", argv[0]);
+        kprintf("boot: started %s as pid %d\n", argv[0], proc->pid);
     }
 }
 
@@ -157,25 +262,102 @@ static bool selftest(void) {
             "%lu COW captures, %lu journals\n",
             w.oldest, w.newest, w.count, w.end_step, s->keyframes_taken, s->cow_captures,
             s->journals_written);
+    const kfp_stats_t* ps = kfp_stats();
+    kprintf("selftest: inputs: %lu records, %lu payload bytes journaled\n", kio_stats()->records,
+            kio_stats()->bytes);
+    kprintf("selftest: keyframe pages: %lu written, %lu kept their slot; the newest keyframe has "
+            "%lu pages and wrote %lu; pool %u of %u slots in use\n", ps->pages_written,
+            ps->pages_reused, ps->last_pages, ps->last_written, ps->slots_used, ps->slots_total);
     tt_verify_t v;
+    uint64_t t0 = clock_now_unrecorded();
     int rc = tt_verify(&v);
+    uint64_t verify_ms = (clock_now_unrecorded() - t0) / 1000000;
+    const preempt_stats_t* pm = preempt_stats();
+    kprintf("selftest: preemption points: %lu recorded in user code (%lu inside string "
+            "instructions, %lu pages hashed); replays found %lu by state (%lu inside string "
+            "instructions, %lu run forward in the kernel) in %lu checks\n", pm->recorded,
+            pm->recorded_rep, pm->record_pages, pm->matched, pm->matched_rep, pm->forwarded,
+            pm->candidates);
     kprintf("selftest: verify rc=%d: %u epochs replayed, %u diverged\n", rc, v.epochs_checked,
             v.epochs_diverged);
+    kprintf("selftest: verify took %lu ms\n", verify_ms);
     if (v.diverged) {
-        kprintf("selftest: first divergence epoch %lu component %u expected %x actual %x\n",
-                v.first_epoch, v.first_component, v.expected, v.actual);
+        kprintf("selftest: first divergence epoch %lu component %u (%s) expected %x actual %x, "
+                "between steps %lu..%lu\n", v.first_epoch, v.first_component,
+                kstate_component_name(v.first_component), v.expected, v.actual, v.diag_step_lo,
+                v.diag_step_hi);
+        if (v.leak_found) {
+            kprintf("selftest: leak: %s at rip %lx in pid %u (step %lu insn %lu)\n", v.leak_what,
+                    v.leak_rip, v.leak_pid, v.leak_step, v.leak_insn);
+        }
     }
     bool ok = rc == TT_OK && !v.diverged && v.epochs_checked > 0;
 
-    /* The detector must notice a corrupted replay. */
+    /* By pid: every restore rebuilds the process table, so a process_t
+     * pointer does not survive tt_verify. */
+    uint32_t hb_pid = 0;
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        if (strncmp(proc_at(i)->name, "heisenbug", 9) == 0) hb_pid = (uint32_t)proc_at(i)->pid;
+    }
+    /* The detector must notice a corrupted replay. Only the heisenbug's
+     * recording is sure to show it: programs that do not interact end in the
+     * same state under another schedule, and a process that exits takes its
+     * corrupted registers with it. Elsewhere the results are reported. */
+    bool strict = hb_pid != 0;
     tt_verify_t bad;
     tt_perturb_next_replay(true);
     rc = tt_verify(&bad);
-    kprintf("selftest: perturbed replay: %s (epoch %lu component %u)\n",
+    if (!replay_perturb_applied()) {
+        kprintf("selftest: perturbed replay: the oldest epoch has no inputs to perturb (skipped)\n");
+    } else {
+        kprintf("selftest: perturbed replay: %s (rc %d, epoch %lu component %u)\n",
+                bad.diverged ? "divergence detected" : "NOT detected", rc, bad.first_epoch,
+                bad.first_component);
+        ok = ok && (bad.diverged || !strict);
+    }
+
+    /* ... and a corrupted register in a keyframe's extended state (#237). */
+    tt_perturb_next_restore(true);
+    rc = tt_verify(&bad);
+    kprintf("selftest: perturbed XMM15 in a keyframe: %s (epoch %lu component %u)\n",
             bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
             bad.first_component);
-    ok = ok && bad.diverged;
+    ok = ok && (bad.diverged || !strict);
+
+    /* ... and a kernel subsystem restored wrongly, named by the report (#243).
+     * The probe's state lasts the whole epoch, so this holds for any program. */
+    kstate_perturb_next_restore(KS_ID_PROBE);
+    rc = tt_verify(&bad);
+    const char* who = bad.diverged ? kstate_component_name(bad.first_component) : "-";
+    kprintf("selftest: perturbed kernel-state section 'probe': %s (epoch %lu component %u: %s)\n",
+            bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
+            bad.first_component, who);
+    ok = ok && bad.diverged && strcmp(who, "probe") == 0;
+    /* ... and the filesystem (#247), which every machine has. */
+    kstate_perturb_next_restore(KS_ID_FS);
+    rc = tt_verify(&bad);
+    who = bad.diverged ? kstate_component_name(bad.first_component) : "-";
+    kprintf("selftest: perturbed kernel-state section 'fs': %s (epoch %lu component %u: %s)\n",
+            bad.diverged ? "divergence detected" : "NOT detected", bad.first_epoch,
+            bad.first_component, who);
+    ok = ok && bad.diverged && strcmp(who, "fs") == 0;
+    /* ... and a replay whose input call is not the recorded one (#242),
+     * caught at that call's step. */
+    kio_perturb_record_next(true);
+    rc = tt_verify(&bad);
+    who = bad.diverged ? kstate_component_name(bad.first_component) : "-";
+    if (!kio_perturb_record_applied()) {
+        kprintf("selftest: input record with other arguments: the oldest epoch has no input "
+                "records (skipped)\n");
+    } else {
+        kprintf("selftest: input record with other arguments: %s (epoch %lu component %u: %s, "
+                "step %lu)\n", bad.diverged ? "divergence detected" : "NOT detected",
+                bad.first_epoch, bad.first_component, who, bad.diag_step_lo);
+        ok = ok && bad.diverged && strcmp(who, "inputs") == 0;
+    }
     tt_verify(&v);   /* back to the end of the recording, clean */
+    kprintf("selftest: restored pages: %lu frames kept, %lu from the cache, %lu read from the pool\n",
+            kfp_stats()->restore_kept, kfp_stats()->restore_cached, kfp_stats()->restore_read);
 
     /* A scan of the newest epoch visits every position through the stop
      * point, and nothing else. */
@@ -189,12 +371,8 @@ static bool selftest(void) {
 
     /* Who last wrote the heisenbug's batch_limit? Found by value, to the
      * exact instruction (#228). */
-    process_t* hb = 0;
-    for (uint32_t i = 0; i < proc_count(); i++) {
-        if (strncmp(proc_at(i)->name, "heisenbug", 9) == 0) hb = proc_at(i);
-    }
-    if (hb) {
-        uint32_t pid = (uint32_t)hb->pid;
+    if (hb_pid) {
+        uint32_t pid = hb_pid;
         g_watch_pid = pid;
         tt_pos_t end, w1, w2;
         tt_position(&end);
@@ -224,7 +402,7 @@ static bool selftest(void) {
 
         /* Step back and forth over instructions and land on the same state. */
         tt_goto_pos(&end);
-        uint32_t ids[KDIVERGE_COMPONENT_COUNT], a_sums[KDIVERGE_COMPONENT_COUNT];
+        uint32_t ids[DIVERGE_MAX_COMPONENTS], a_sums[DIVERGE_MAX_COMPONENTS];
         kdiverge_record_epoch(machine_epoch());
         uint32_t na = kdiverge_journal_sums(0, 0);
         const uint32_t* pids;
@@ -274,41 +452,157 @@ static bool selftest(void) {
     return ok;
 }
 
+/* ---- Benchmarks (#255) ---- */
+
+/* The store's device, counting the bytes the recording writes. */
+static fat_block_device_t  g_counted;
+static fat_block_device_t* g_inner;
+static uint64_t            g_disk_written;
+
+static int counted_read(void* d, uint32_t sector, uint32_t count, void* buf) {
+    (void)d;
+    return g_inner->read_sectors(g_inner->private_data, sector, count, buf);
+}
+
+static int counted_write(void* d, uint32_t sector, uint32_t count, const void* buf) {
+    (void)d;
+    g_disk_written += (uint64_t)count * g_inner->sector_size;
+    return g_inner->write_sectors(g_inner->private_data, sector, count, buf);
+}
+
+static fat_block_device_t* counting(fat_block_device_t* dev) {
+    g_inner = dev;
+    g_counted = *dev;
+    g_counted.read_sectors = counted_read;
+    g_counted.write_sectors = counted_write;
+    g_counted.private_data = 0;
+    return &g_counted;
+}
+
+static uint64_t elapsed_us(uint64_t t0) { return (clock_now_unrecorded() - t0) / 1000; }
+
+/* After the run: what it cost, then how fast the recording is navigated. All
+ * times are the guest's (TSC), from the start of the first program. */
+static void bench(uint64_t run_us) {
+    if (g_opts.norecord) {
+        kprintf("bench: norecord run_us=%lu steps=%lu\n", run_us, machine_step());
+        return;
+    }
+    tt_pos_t end;
+    tt_position(&end);
+    const tt_stats_t* s = tt_stats();
+    kprintf("bench: record run_us=%lu steps=%lu keyframes=%lu keyframe_bytes=%lu disk_bytes=%lu "
+            "input_bytes=%lu input_records=%lu cow_pages=%lu\n", run_us, s->recorded_steps,
+            s->keyframes_taken, kfp_stats()->pages_written * PAGE_SIZE, g_disk_written,
+            kio_stats()->bytes, kio_stats()->records, s->cow_captures);
+    if (g_opts.bench_run_only) return;
+    tt_window_t w;
+    if (!tt_window(&w)) return;
+    uint64_t window_steps = 0;
+    for (uint64_t e = w.oldest; e <= w.newest; e++) {
+        uint64_t len;
+        if (tt_epoch_len(e, &len)) window_steps += len;
+    }
+    tt_verify_t v;
+    uint64_t t0 = clock_now_unrecorded();
+    int rc = tt_verify(&v);
+    kprintf("bench: verify us=%lu rc=%d epochs=%u diverged=%u\n", elapsed_us(t0), rc,
+            v.epochs_checked, v.epochs_diverged);
+    t0 = clock_now_unrecorded();
+    rc = tt_goto(w.oldest, 0, 0);
+    kprintf("bench: rewind us=%lu rc=%d to_epoch=%lu\n", elapsed_us(t0), rc, w.oldest);
+    /* Replay: every retained epoch re-executed from its keyframe to its end,
+     * without verify's comparisons. */
+    uint64_t replay_us = 0;
+    rc = TT_OK;
+    for (uint64_t e = w.oldest; e <= w.newest && rc == TT_OK; e++) {
+        uint64_t len;
+        if (!tt_epoch_len(e, &len)) continue;
+        t0 = clock_now_unrecorded();
+        rc = tt_goto(e, len, 0);
+        replay_us += elapsed_us(t0);
+    }
+    const preempt_stats_t* pm = preempt_stats();
+    kprintf("bench: replay us=%lu rc=%d window_steps=%lu window_epochs=%u preemption_points=%lu "
+            "breakpoint_checks=%lu\n", replay_us, rc, window_steps, w.count, pm->recorded,
+            pm->candidates);
+    tt_goto_pos(&end);
+    uint64_t total = 0, worst = 0;
+    uint32_t n = 0;
+    for (; n < 10; n++) {
+        t0 = clock_now_unrecorded();
+        if (tt_reverse_stepi() != TT_OK) break;
+        uint64_t us = elapsed_us(t0);
+        total += us;
+        if (us > worst) worst = us;
+    }
+    kprintf("bench: rstepi avg_us=%lu max_us=%lu n=%u\n", n ? total / n : 0, worst, n);
+}
+
 void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     serial_init(COM1);
     serial_init(COM2);
     serial_init(COM3);
-    kprintf("\nLaplace: a time-traveling debugger built as an operating system\n");
+    kprintf("\nLaplace %s: a time-traveling debugger built as an operating system\n", LAPLACE_VERSION);
     if (mb_magic != 0x2BADB002) panic("not booted by a Multiboot loader (magic %x)", mb_magic);
 
-    const uint32_t* mbi = (const uint32_t*)(uint64_t)mb_info;
-    parse_cmdline((mbi[0] & MB_FLAG_CMDLINE) ? (const char*)(uint64_t)mbi[4] : 0);
+    const uint32_t* mbi = (const uint32_t*)P2V(mb_info);
+    parse_cmdline((mbi[0] & MB_FLAG_CMDLINE) ? (const char*)P2V(mbi[4]) : 0);
 
     cpu_init();
-    mm_init(mb_info);
+    cpu_cpuid_init();
+    pmu_init();
+    mm_init(mbi);
+    proc_register_modules(mbi);
     pic_init();
     pit_init(MACHINE_TIMER_HZ);
-    kprintf("boot: %lu MiB free, timer %u Hz\n", pmm_free_frames() / 256, MACHINE_TIMER_HZ);
+    clock_init();
+    kprintf("boot: %lu MiB free, timer %u Hz, TSC %lu MHz\n", pmm_free_frames() / 256,
+            MACHINE_TIMER_HZ, clock_base()->tsc_hz / 1000000);
+    kprintf("boot: user FPU state: %s (%u bytes)\n",
+            !fpu_has_xsave() ? "x87+SSE (FXSAVE)" :
+            (fpu_xcr0() & XCR0_AVX) ? "x87+SSE+AVX (XSAVE)" : "x87+SSE (XSAVE)", fpu_area_size());
+    kprintf("boot: user rdtsc/rdtscp emulated; user cpuid %s\n",
+            cpu_cpuid_faulting() ? "answered from the recorded table (CPUID faulting)"
+                                 : "native (no CPUID faulting on this CPU)");
 
     ktime_init();
     kentropy_init();
     g_rdrand = cpu_has_rdrand();
     kentropy_set_source(entropy_source, 0);
     machine_init();
+    if (g_opts.stepover) machine_set_step_over_tf(g_opts.stepover == 1);
+    kstate_init();
+    kio_init();
+    const lp_image_t* seed = proc_seed_module(g_opts.root);
+    files_init(seed ? seed->start : 0, seed ? (uint64_t)(seed->end - seed->start) : 0,
+               seed ? seed->name : "");
+    tty_init();
+    net_init();
+    ksig_init();
+    preempt_init();
     kdiverge_init();
     kdiverge_register_kernel_sources();
     checkpoint_init();
+    checkpoint_set_context_fn(proc_context_record);
 
-    /* Durable store: the first IDE drive, else a volatile RAM disk. */
+    /* Durable store: the first IDE drive, else the first AHCI (SATA) disk
+     * (#236), else a volatile RAM disk. */
     fat_block_device_t* dev = checkpoint_ide_boot_bind();
     if (dev) {
-        kprintf("boot: recording to the IDE disk (%u sectors)\n", dev->total_sectors);
+        fat_block_device_t* dma = bmide_boot_bind(dev);
+        if (dma) dev = dma;
+        kprintf("boot: recording to the IDE disk (%u sectors%s)\n", dev->total_sectors,
+                dma ? ", bus-master DMA" : ", PIO");
+    } else if ((dev = ahci_boot_bind()) != 0) {
+        kprintf("boot: recording to the AHCI disk (%u sectors)\n", dev->total_sectors);
     } else {
-        dev = tt_ram_device(tt_required_sectors(g_opts.keyframes));
+        dev = tt_ram_device(tt_required_sectors(g_opts.keyframes, g_opts.pool_mib));
         if (!dev) panic("no disk and no memory for a RAM disk");
-        kprintf("boot: no IDE disk; recording to a RAM disk (lost at power-off)\n");
+        kprintf("boot: no IDE or AHCI disk; recording to a RAM disk (lost at power-off)\n");
     }
-    tt_config_t cfg = { g_opts.interval, g_opts.keyframes, g_opts.stop_after };
+    if (g_opts.bench) dev = counting(dev);
+    tt_config_t cfg = { g_opts.interval, g_opts.keyframes, g_opts.stop_after, g_opts.dirty };
     bool had_keyframe = false;
     if (tt_init(dev, &cfg, &had_keyframe) != 0) panic("cannot arm the recording store");
     tt_bind_verbs();
@@ -326,10 +620,18 @@ void laplace_main(uint32_t mb_magic, uint32_t mb_info) {
     if (!resumed) spawn_run_list();
 
     monitor_init();
+    machine_set_norecord(g_opts.norecord);
     machine_set_mode(MACHINE_LIVE);
+    uint64_t t_start = clock_now_unrecorded();
     if (resumed) machine_resume(); else machine_start();
+    uint64_t run_us = elapsed_us(t_start);
 
     monitor_live_stopped();
+    if (g_opts.bench) {
+        bench(run_us);
+        if (g_opts.exit) boot_qemu_exit(0);
+        cpu_halt_forever();
+    }
     if (g_opts.selftest) {
         bool ok = selftest();
         if (g_opts.exit) boot_qemu_exit(ok ? 0 : 1);

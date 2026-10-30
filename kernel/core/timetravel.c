@@ -19,6 +19,12 @@
 #include "time_record.h"
 #include "entropy_record.h"
 #include "sched_record.h"
+#include "core/kjournal.h"
+#include "core/clock.h"
+#include "core/vm.h"
+#include "core/kstate.h"
+#include "core/kfpages.h"
+#include "core/kio.h"
 
 void* memset(void* dst, int c, size_t n);
 void* memcpy(void* dst, const void* src, size_t n);
@@ -26,15 +32,28 @@ void* memcpy(void* dst, const void* src, size_t n);
 /* ---- On-disk layout ----
  *
  *   sector 0                      label (geometry + magic)
- *   [KF_BASE, KF_BASE + kf)       keyframe store: ring index + N regions
+ *   [KF_BASE, KF_BASE + kf)       keyframe store: ring index + N regions, each
+ *                                 a keyframe's kernel state, registers, and
+ *                                 page manifest
  *   [J_BASE, J_BASE + j)          journal ring: N regions
+ *   [POOL_BASE, end)              page pool: one slot (8 sectors) per distinct
+ *                                 page the retained keyframes hold (#244)
+ *
+ * Region sizes follow the disk's: a keyframe region gets 1/16 of the disk's
+ * share per keyframe (512..4096 sectors), the pool the rest.
  */
 #define LABEL_MAGIC       0x3145434150414C4CULL   /* "LLAPACE1" */
-#define LABEL_VERSION     1
+#define LABEL_VERSION     7   /* 2: CPUID (#241); 3: clock (#238); 4: executables (#240);
+                                 5: region list (#239); 6: sectioned kernel state (#243);
+                                 7: page pool (#244) */
 #define KF_BASE           8
 #define KF_INDEX_SECTORS  4
-#define KF_SLOT_SECTORS   2048   /* per region slot: up to 227 page records */
-#define J_SLOT_SECTORS    640    /* per journal slot: up to 10224 events */
+#define KF_SLOT_MIN       512    /* per keyframe region (x2, double-buffered) */
+#define KF_SLOT_MAX       4096
+#define J_SLOT_MIN        640    /* per journal slot: 10224 events ... */
+#define J_SLOT_MAX        2560   /* ... to 40944 */
+#define POOL_MIN_SLOTS    1024
+#define KFP_TAG           0x4D50u   /* "PM": the page manifest blob */
 
 typedef struct {
     uint64_t magic;
@@ -44,41 +63,46 @@ typedef struct {
     uint32_t j_slot_sectors;
     uint32_t kf_base;
     uint32_t j_base;
+    uint32_t pool_base;
+    uint32_t pool_slots;
     uint32_t crc;
 } tt_label_t;
 
-/* Kernel-state blob captured with every keyframe (#224). */
+typedef struct {
+    uint32_t slot;          /* keyframe region sectors */
+    uint32_t jslot;         /* journal slot sectors */
+    uint32_t j_base;
+    uint32_t pool_base;
+    uint32_t pool_slots;
+} geom_t;
+
+static uint32_t meta_sectors(uint32_t keyframes, uint32_t slot, uint32_t jslot) {
+    return KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, slot)
+         + journal_ring_total_sectors(keyframes, jslot);
+}
+
+static bool geometry(uint32_t total, uint32_t keyframes, geom_t* g) {
+    uint32_t slot = total / (keyframes * 16);
+    if (slot < KF_SLOT_MIN) slot = KF_SLOT_MIN;
+    if (slot > KF_SLOT_MAX) slot = KF_SLOT_MAX;
+    slot &= ~7u;
+    uint32_t jslot = total / (keyframes * 128);
+    if (jslot < J_SLOT_MIN) jslot = J_SLOT_MIN;
+    if (jslot > J_SLOT_MAX) jslot = J_SLOT_MAX;
+    jslot &= ~7u;
+    uint32_t base = (meta_sectors(keyframes, slot, jslot) + 7) & ~7u;
+    if (base > total || (total - base) / 8 < POOL_MIN_SLOTS) return false;
+    g->slot = slot;
+    g->jslot = jslot;
+    g->j_base = KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, slot);
+    g->pool_base = base;
+    g->pool_slots = (total - base) / 8;
+    return true;
+}
+
+/* Kernel-state blob captured with every keyframe (#224, #243): one section per
+ * kernel subsystem, see include/core/kstate.h. */
 #define KSTATE_TAG        0x4C50u               /* "LP" */
-#define KSTATE_MAGIC      0x3145544154534B4CULL /* "LKSTATE1" */
-#define KSTATE_MAX_REGIONS 8
-
-typedef struct {
-    uint64_t start, end;
-    uint32_t flags, type;
-    char     name[16];
-} kstate_region_t;
-
-typedef struct {
-    uint32_t pid;
-    uint32_t state;
-    char     name[MAX_PROCESS_NAME];
-    uint32_t nregions;
-    uint32_t reserved;
-    kstate_region_t regions[KSTATE_MAX_REGIONS];
-} kstate_proc_t;
-
-typedef struct {
-    uint64_t magic;
-    uint64_t epoch;
-    uint32_t nproc;
-    uint32_t current_pid;
-    uint32_t next_pid;
-    uint32_t reserved;
-    uint64_t pending_vector;
-    uint64_t pending_error;
-    uint64_t pending_cr2;
-    kstate_proc_t procs[LP_MAX_PROCS];
-} kstate_t;
 
 /* ---- State ---- */
 
@@ -91,6 +115,7 @@ static uint32_t    g_wb_tick;          /* tick count when the keyframe was taken
 static uint32_t    g_ticks;
 
 static bool        g_sealed;           /* the open epoch's journal is on disk */
+static bool        g_force_keyframe;   /* take one at the next live entry */
 static uint64_t    g_end_epoch;        /* the recording's stop point */
 static uint64_t    g_end_step;
 
@@ -129,13 +154,15 @@ static uint64_t* g_ram_frames;
 static uint32_t  g_ram_sectors;
 static fat_block_device_t g_ram_dev;
 
+/* Frames are allocated on first write; an unwritten sector reads as zeros. */
 static int ram_read(void* d, uint32_t s, uint32_t n, void* buf) {
     (void)d;
     if ((uint64_t)s + n > g_ram_sectors) return -1;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t sec = s + i;
-        memcpy((uint8_t*)buf + (uint64_t)i * 512,
-               (const void*)(g_ram_frames[sec / 8] + (sec % 8) * 512), 512);
+        uint64_t f = g_ram_frames[sec / 8];
+        if (f) memcpy((uint8_t*)buf + (uint64_t)i * 512, P2V(f + (sec % 8) * 512), 512);
+        else memset((uint8_t*)buf + (uint64_t)i * 512, 0, 512);
     }
     return 0;
 }
@@ -145,7 +172,8 @@ static int ram_write(void* d, uint32_t s, uint32_t n, const void* buf) {
     if ((uint64_t)s + n > g_ram_sectors) return -1;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t sec = s + i;
-        memcpy((void*)(g_ram_frames[sec / 8] + (sec % 8) * 512),
+        if (!g_ram_frames[sec / 8] && !(g_ram_frames[sec / 8] = pmm_alloc())) return -1;
+        memcpy(P2V(g_ram_frames[sec / 8] + (sec % 8) * 512),
                (const uint8_t*)buf + (uint64_t)i * 512, 512);
     }
     return 0;
@@ -153,12 +181,8 @@ static int ram_write(void* d, uint32_t s, uint32_t n, const void* buf) {
 
 fat_block_device_t* tt_ram_device(uint32_t sectors) {
     uint32_t pages = (sectors + 7) / 8;
-    g_ram_frames = (uint64_t*)kmalloc(pages * sizeof(uint64_t));
+    g_ram_frames = (uint64_t*)kzalloc((uint64_t)pages * sizeof(uint64_t));
     if (!g_ram_frames) return 0;
-    for (uint32_t i = 0; i < pages; i++) {
-        g_ram_frames[i] = pmm_alloc();
-        if (!g_ram_frames[i]) return 0;
-    }
     g_ram_sectors = pages * 8;
     g_ram_dev.read_sectors = ram_read;
     g_ram_dev.write_sectors = ram_write;
@@ -168,9 +192,11 @@ fat_block_device_t* tt_ram_device(uint32_t sectors) {
     return &g_ram_dev;
 }
 
-uint32_t tt_required_sectors(uint32_t keyframes) {
-    return KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, keyframes, KF_SLOT_SECTORS)
-         + journal_ring_total_sectors(keyframes, J_SLOT_SECTORS);
+uint32_t tt_required_sectors(uint32_t keyframes, uint32_t pool_mib) {
+    /* Enough for the largest keyframe regions plus the pool asked for. */
+    uint64_t n = ((meta_sectors(keyframes, KF_SLOT_MAX, J_SLOT_MAX) + 7) & ~7u) +
+                 (uint64_t)pool_mib * 2048;
+    return n > 0xFFFFFFF8u ? 0xFFFFFFF8u : (uint32_t)n;
 }
 
 /* ---- Setup ---- */
@@ -179,14 +205,16 @@ static uint32_t label_crc(const tt_label_t* l) {
     return snapshot_crc32(0, l, (uint32_t)__builtin_offsetof(tt_label_t, crc));
 }
 
+static uint8_t* load_blob(uint64_t epoch, uint32_t tag, uint32_t* len);
+
 int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe) {
     *had_keyframe = false;
     g_cfg = *cfg;
     uint32_t capacity = cfg->keyframes;
-    while (capacity > 2 && tt_required_sectors(capacity) > dev->total_sectors) capacity--;
-    if (tt_required_sectors(capacity) > dev->total_sectors) {
-        kprintf("timetravel: disk too small (%u sectors, need %u)\n",
-                dev->total_sectors, tt_required_sectors(capacity));
+    geom_t g;
+    while (capacity > 2 && !geometry(dev->total_sectors, capacity, &g)) capacity--;
+    if (!geometry(dev->total_sectors, capacity, &g)) {
+        kprintf("timetravel: disk too small (%u sectors)\n", dev->total_sectors);
         return -1;
     }
     g_cfg.keyframes = capacity;
@@ -196,10 +224,12 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
     want.magic = LABEL_MAGIC;
     want.version = LABEL_VERSION;
     want.capacity = capacity;
-    want.kf_slot_sectors = KF_SLOT_SECTORS;
-    want.j_slot_sectors = J_SLOT_SECTORS;
+    want.kf_slot_sectors = g.slot;
+    want.j_slot_sectors = g.jslot;
     want.kf_base = KF_BASE;
-    want.j_base = KF_BASE + keyframe_store_total_sectors(KF_INDEX_SECTORS, capacity, KF_SLOT_SECTORS);
+    want.j_base = g.j_base;
+    want.pool_base = g.pool_base;
+    want.pool_slots = g.pool_slots;
     want.crc = label_crc(&want);
 
     static uint8_t sector[512];
@@ -210,26 +240,34 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
         reuse = have.crc == label_crc(&have) && have.magic == want.magic &&
                 have.version == want.version && have.capacity == want.capacity &&
                 have.kf_slot_sectors == want.kf_slot_sectors &&
-                have.j_slot_sectors == want.j_slot_sectors;
+                have.j_slot_sectors == want.j_slot_sectors && have.pool_base == want.pool_base &&
+                have.pool_slots == want.pool_slots;
     }
 
     if (!reuse) {
         /* A blank or foreign disk: invalidate any stale keyframe index first,
-         * then provision both stores and write the label last. */
+         * then provision the stores and write the label last. */
         memset(sector, 0, sizeof(sector));
         for (uint32_t s = 0; s < KF_BASE + KF_INDEX_SECTORS; s++) {
             dev->write_sectors(dev->private_data, s, 1, sector);
         }
     }
-    if (keyframe_store_arm(dev, KF_BASE, KF_INDEX_SECTORS, capacity, KF_SLOT_SECTORS)
-            != KEYFRAME_STORE_OK) {
+    if (keyframe_store_arm(dev, KF_BASE, KF_INDEX_SECTORS, capacity, g.slot) != KEYFRAME_STORE_OK) {
         kprintf("timetravel: keyframe store failed\n");
         return -1;
     }
-    if (journal_capture_init(dev, want.j_base, J_SLOT_SECTORS, capacity, !reuse) != JOURNAL_OK) {
+    if (journal_capture_init(dev, want.j_base, g.jslot, capacity, !reuse) != JOURNAL_OK) {
         kprintf("timetravel: journal ring failed\n");
         return -1;
     }
+    if (kfp_init(dev, g.pool_base, g.pool_slots) != 0) {
+        kprintf("timetravel: no memory for the page pool's counts\n");
+        return -1;
+    }
+    checkpoint_set_mark_fn(kfp_mark_space);
+    /* The extended journal (inputs, traces) gets what the slot holds beyond
+     * room for the preemption points and checksums. */
+    kj_set_limit((g.jslot - 1) * 16 - 4096);
     if (!reuse) {
         memset(sector, 0, sizeof(sector));
         memcpy(sector, &want, sizeof(want));
@@ -240,58 +278,51 @@ int tt_init(fat_block_device_t* dev, const tt_config_t* cfg, bool* had_keyframe)
     }
 
     const keyframe_ring_t* ring = keyframe_store_ring(keyframe_store_get());
-    *had_keyframe = reuse && keyframe_ring_count(ring) > 0;
     g_ready = true;
-    kprintf("timetravel: store %s: %u keyframes x %u sectors, journal ring at %u, %u sectors total\n",
-            reuse ? "reused" : "formatted", capacity, 1 + 2 * KF_SLOT_SECTORS, want.j_base,
-            tt_required_sectors(capacity));
+    if (reuse && keyframe_ring_count(ring) > 0) {
+        /* The retained keyframes' manifests say which pool slots are in use. */
+        tt_window_t w;
+        bool all = tt_window(&w);
+        for (uint64_t e = w.oldest; all && e <= w.newest; e++) {
+            uint32_t slot;
+            uint64_t found;
+            if (!keyframe_ring_find(ring, e, &slot, &found) || found != e) continue;
+            uint32_t len = 0;
+            uint8_t* blob = load_blob(e, KFP_TAG, &len);
+            if (!blob || kfp_adopt(e, blob, len) != 0) all = false;
+            if (blob) kfree(blob);
+            kio_adopt_journal(e);         /* its input payload pages (#242) */
+        }
+        if (!all) kprintf("timetravel: a retained keyframe's page manifest is unreadable\n");
+        *had_keyframe = all;
+    }
+    kprintf("timetravel: store %s: %u keyframes x %u sectors, journal ring at %u (%u-sector "
+            "slots), page pool of %u slots (%u MiB) at %u\n",
+            reuse ? "reused" : "formatted", capacity, 1 + 2 * g.slot, want.j_base, g.jslot,
+            g.pool_slots, g.pool_slots / 256, g.pool_base);
     return 0;
 }
 
 /* ---- Kernel-state blob ---- */
 
 static void capture_kstate(uint64_t epoch) {
-    static kstate_t ks;
-    memset(&ks, 0, sizeof(ks));
-    ks.magic = KSTATE_MAGIC;
-    ks.epoch = epoch;
-    ks.nproc = proc_count();
-    process_t* cur = machine_current();
-    ks.current_pid = cur ? (uint32_t)cur->pid : 0;
-    ks.next_pid = proc_next_pid();
-    ks.pending_vector = machine_pending()->vector;
-    ks.pending_error = machine_pending()->error;
-    ks.pending_cr2 = machine_pending()->cr2;
-    for (uint32_t i = 0; i < ks.nproc; i++) {
-        process_t* p = proc_at(i);
-        kstate_proc_t* kp = &ks.procs[i];
-        kp->pid = (uint32_t)p->pid;
-        kp->state = (uint32_t)p->state;
-        memcpy(kp->name, p->name, sizeof(kp->name));
-        for (vm_region_t* r = p->address_space->regions; r && kp->nregions < KSTATE_MAX_REGIONS;
-             r = r->next) {
-            kstate_region_t* kr = &kp->regions[kp->nregions++];
-            kr->start = r->start_addr;
-            kr->end = r->end_addr;
-            kr->flags = r->flags;
-            kr->type = (uint32_t)r->type;
-            memcpy(kr->name, r->name, sizeof(kr->name) - 1);
-        }
-    }
-    uint32_t size = (uint32_t)((uint8_t*)&ks.procs[ks.nproc] - (uint8_t*)&ks);
-    if (checkpoint_capture_kernel_blob(KSTATE_TAG, &ks, size) != CHECKPOINT_OK) {
+    uint32_t size = 0;
+    uint8_t* blob = kstate_encode(epoch, &size);
+    if (!blob || checkpoint_capture_kernel_blob(KSTATE_TAG, blob, size) != CHECKPOINT_OK) {
         panic("timetravel: cannot capture kernel state");
     }
+    kfree(blob);
 }
 
 /* ---- Recording ---- */
 
+#define KIO_EPOCH_BUDGET (256ULL << 20)   /* input payload bytes per epoch */
+
 static bool record_pressure(void) {
     const uint64_t* p64;
-    const uint8_t* p8;
-    if (ktime_values(&p64) >= KTIME_LOG_MAX * 3 / 4) return true;
-    if (kentropy_bytes(&p8) >= KENTROPY_LOG_MAX * 3 / 4) return true;
     if (sched_record_points(machine_sched_record(), &p64) >= 3072) return true;
+    if (kj_count() >= kj_limit() * 3 / 4) return true;
+    if (kio_epoch_bytes() >= KIO_EPOCH_BUDGET) return true;
     return false;
 }
 
@@ -301,7 +332,7 @@ static void do_writeback(void) {
     for (checkpoint_capture_t* c = checkpoint_captures(); c; c = c->next) {
         if (c->flags == 0) pages++;
     }
-    int rc = checkpoint_writeback_keyframe();
+    int rc = kfp_writeback();
     if (rc != CHECKPOINT_OK) panic("timetravel: keyframe writeback failed (%d)", rc);
     g_wb_pending = false;
     g_stats.writebacks++;
@@ -309,25 +340,32 @@ static void do_writeback(void) {
 }
 
 static void close_epoch(uint64_t epoch, uint64_t steps) {
+    kio_close_epoch(epoch);       /* the inputs' last page, and who owns the pages */
     int rc = journal_capture_close_epoch(epoch, steps);
     if (rc != JOURNAL_OK) panic("timetravel: journal for epoch %lu failed (%d)", epoch, rc);
     len_cache_put(epoch, steps);
     g_stats.journals_written++;
+    g_stats.recorded_steps += steps;
 }
 
 static void take_keyframe(void) {
     uint64_t steps = machine_step();
+    machine_fpu_flush();
     do_writeback();
     if (machine_epoch() > 0) close_epoch(machine_epoch(), steps);
 
+    kfp_begin_take();             /* which pages changed since the last keyframe */
     uint64_t e = checkpoint_take();
     if (e == 0) panic("timetravel: checkpoint_take failed");
+    kfp_end_take(e, KFP_TAG);
     machine_set_position(e, 0);
     capture_kstate(e);
 
     sched_record_begin_epoch(machine_sched_record(), e);
     ktime_begin_epoch(e);
     kentropy_begin_epoch(e);
+    kj_begin_epoch(e);
+    kio_begin_epoch(e);
 
     g_wb_pending = true;
     g_wb_tick = g_ticks;
@@ -342,12 +380,22 @@ void tt_on_tick(void) {
     g_ticks_since_kf++;
 }
 
+bool tt_entry_wanted(void) {
+    if (!g_ready || machine_norecord()) return false;
+    return (g_wb_pending && g_ticks != g_wb_tick) || g_ticks_since_kf >= g_cfg.interval_ticks ||
+           g_force_keyframe;
+}
+
 void tt_on_live_entry(void) {
-    if (!g_ready) return;
+    if (!g_ready || machine_norecord()) return;
     /* Writeback runs at a later entry than the take, so the processes write
      * pages in between and the COW hook preserves their keyframe images. */
     if (g_wb_pending && g_ticks != g_wb_tick) do_writeback();
-    if (machine_epoch() == 0 || g_ticks_since_kf >= g_cfg.interval_ticks || record_pressure()) {
+    /* A keyframe when the interval elapses, or early when the epoch has
+     * dirtied enough pages that a restore would replay a lot of writes (#244). */
+    if (machine_epoch() == 0 || g_ticks_since_kf >= g_cfg.interval_ticks || record_pressure() ||
+        g_force_keyframe || (g_cfg.dirty_pages && kfp_dirty() >= g_cfg.dirty_pages)) {
+        g_force_keyframe = false;
         take_keyframe();
     }
 }
@@ -359,8 +407,14 @@ void tt_before_process_exit(process_t* p) {
     if (machine_mode() == MACHINE_LIVE) do_writeback();
 }
 
+void tt_before_mapping_change(void) {
+    if (machine_mode() == MACHINE_LIVE) do_writeback();
+}
+
 int tt_seal(void) {
-    if (!g_ready || !machine_started() || machine_mode() != MACHINE_LIVE) return TT_ERR_STATE;
+    if (!g_ready || !machine_started() || machine_mode() != MACHINE_LIVE || machine_norecord()) {
+        return TT_ERR_STATE;
+    }
     do_writeback();
     close_epoch(machine_epoch(), machine_step());
     g_sealed = true;
@@ -383,89 +437,88 @@ bool tt_window(tt_window_t* w) {
 
 /* ---- Restore ---- */
 
-typedef struct {
-    uint32_t pid;
-    process_context_t ctx;
-} saved_ctx_t;
+static bool g_perturb_xmm;
+void tt_perturb_next_restore(bool on) { g_perturb_xmm = on; }
+
+/* A kernel blob of the keyframe for `epoch`, reassembled; kmalloc'd. */
+static uint8_t* load_blob(uint64_t epoch, uint32_t tag, uint32_t* len) {
+    keyframe_store_t* ks = keyframe_store_get();
+    snapshot_reader_t rd;
+    snapshot_page_record_t rec;
+    uint64_t sel = 0;
+    if (!ks || keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK || sel != epoch) {
+        return 0;
+    }
+    uint8_t* blob = 0;
+    uint32_t blob_size = 0;
+    rec.page_data = g_pagebuf;
+    while (snapshot_reader_next(&rd, &rec) == SNAPSHOT_OK) {
+        if (!(rec.flags & CHECKPOINT_REC_KERNEL) || rec.pid != tag) continue;
+        uint32_t size = (uint32_t)(rec.virt_addr >> 32);
+        uint32_t off = (uint32_t)rec.virt_addr * PAGE_SIZE;
+        if (!blob) {
+            blob = (uint8_t*)kmalloc(size);
+            if (!blob) return 0;
+            blob_size = size;
+        }
+        if (size != blob_size || off >= size) {
+            kfree(blob);
+            return 0;
+        }
+        memcpy(blob + off, g_pagebuf, size - off < PAGE_SIZE ? size - off : PAGE_SIZE);
+    }
+    *len = blob_size;
+    return blob;
+}
 
 int tt_restore_keyframe(uint64_t epoch) {
     keyframe_store_t* ks = keyframe_store_get();
     if (!ks) return TT_ERR_STATE;
-    snapshot_reader_t rd;
-    snapshot_page_record_t rec;
-    uint64_t sel = 0;
-    if (keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK || sel != epoch) {
-        return TT_ERR_RANGE;
-    }
+    if (!kfp_has(epoch)) return TT_ERR_RANGE;
 
-    /* Pass 1: the kernel-state blob and the saved registers. */
-    static kstate_t kst;
-    static saved_ctx_t ctxs[LP_MAX_PROCS];
-    uint32_t nctx = 0;
+    /* The kernel-state blob. */
     uint32_t blob_size = 0;
-    memset(&kst, 0, sizeof(kst));
-    rec.page_data = g_pagebuf;
-    while (snapshot_reader_next(&rd, &rec) == SNAPSHOT_OK) {
-        if ((rec.flags & CHECKPOINT_REC_KERNEL) && rec.pid == KSTATE_TAG) {
-            uint32_t size = (uint32_t)(rec.virt_addr >> 32);
-            uint32_t idx = (uint32_t)rec.virt_addr;
-            uint32_t off = idx * PAGE_SIZE;
-            if (size > sizeof(kst) || off >= size) return TT_ERR_RESTORE;
-            uint32_t n = size - off < PAGE_SIZE ? size - off : PAGE_SIZE;
-            memcpy((uint8_t*)&kst + off, g_pagebuf, n);
-            blob_size = size;
-        } else if (rec.flags & CHECKPOINT_REC_CONTEXT) {
-            if (nctx >= LP_MAX_PROCS) return TT_ERR_RESTORE;
-            ctxs[nctx].pid = rec.pid;
-            memcpy(&ctxs[nctx].ctx, g_pagebuf, sizeof(process_context_t));
-            nctx++;
-        }
-    }
-    if (!blob_size || kst.magic != KSTATE_MAGIC || kst.epoch != epoch || kst.nproc > LP_MAX_PROCS) {
+    uint8_t* blob = load_blob(epoch, KSTATE_TAG, &blob_size);
+    uint64_t blob_epoch = 0;
+    if (!blob || !kstate_blob_epoch(blob, blob_size, &blob_epoch) || blob_epoch != epoch) {
+        if (blob) kfree(blob);
         return TT_ERR_RESTORE;
     }
 
-    /* Discard the live machine and rebuild it from the keyframe. */
-    vmm_switch_address_space(0);
-    proc_destroy_all();
-    for (uint32_t i = 0; i < kst.nproc; i++) {
-        kstate_proc_t* kp = &kst.procs[i];
-        process_t* p = proc_alloc(kp->pid, kp->name);
-        if (!p) return TT_ERR_RESTORE;
-        p->state = (process_state_t)kp->state;
-        for (uint32_t r = 0; r < kp->nregions && r < KSTATE_MAX_REGIONS; r++) {
-            kstate_region_t* kr = &kp->regions[r];
-            vmm_create_region(p->address_space, kr->start, kr->end - kr->start, kr->flags,
-                              (vmm_region_type_t)kr->type, kr->name);
-        }
-        for (uint32_t c = 0; c < nctx; c++) {
-            if (ctxs[c].pid == kp->pid) p->context = ctxs[c].ctx;
-        }
-        proc_append(p);
+    /* Keep the frames of unchanged pages, then discard the live machine and
+     * rebuild it from the keyframe. */
+    kfp_harvest();
+    uint32_t failed = 0;
+    int krc = kstate_restore(blob, blob_size, &failed);
+    kfree(blob);
+    if (krc != KSF_OK) {
+        kprintf("timetravel: keyframe %lu: kernel state section %u (%s) did not restore (%d)\n",
+                epoch, failed, kstate_subsys_name(failed), krc);
+        return TT_ERR_RESTORE;
     }
-    proc_set_next_pid(kst.next_pid);
 
-    /* Pass 2: the pages. */
+    /* The registers, then the pages. */
+    snapshot_reader_t rd;
+    snapshot_page_record_t rec;
+    uint64_t sel = 0;
     if (keyframe_store_load_epoch(ks, epoch, &rd, &sel) != KEYFRAME_STORE_OK) return TT_ERR_RESTORE;
     rec.page_data = g_pagebuf;
     while (snapshot_reader_next(&rd, &rec) == SNAPSHOT_OK) {
-        if (rec.flags & (CHECKPOINT_REC_KERNEL | CHECKPOINT_REC_CONTEXT)) continue;
+        if (!(rec.flags & CHECKPOINT_REC_CONTEXT)) continue;
         process_t* p = proc_by_pid(rec.pid);
         if (!p) return TT_ERR_RESTORE;
-        uint64_t phys = vmm_get_physical_addr(p->address_space, rec.virt_addr);
-        if (!phys) {
-            phys = pmm_alloc();
-            uint32_t flags = PAGE_USER | ((rec.flags & CHECKPOINT_REC_READONLY) ? 0 : PAGE_WRITABLE);
-            if (!phys || vmm_map_page(p->address_space, rec.virt_addr, phys, flags) != 0) {
-                return TT_ERR_RESTORE;
-            }
+        proc_context_load(p, g_pagebuf);
+        if (g_perturb_xmm && p == proc_at(0)) {
+            /* Test hook: flip a bit of XMM15, which programs rarely touch. */
+            g_perturb_xmm = false;
+            proc_arch(p)->fpu[FPU_XMM_OFFSET + 15 * 16] ^= 0x01;
         }
-        memcpy((void*)(phys & ~0xFFFULL), g_pagebuf, PAGE_SIZE);
+    }
+    if (kfp_map(epoch) != 0) {
+        kprintf("timetravel: keyframe %lu: its pages did not restore\n", epoch);
+        return TT_ERR_RESTORE;
     }
 
-    pending_entry_t pe = { kst.pending_vector, kst.pending_error, kst.pending_cr2 };
-    machine_set_pending(&pe);
-    machine_set_current(proc_by_pid(kst.current_pid));
     machine_set_position(epoch, 0);
     machine_set_mode(MACHINE_REPLAY);
     g_stats.restores++;
@@ -563,6 +616,7 @@ int tt_resume_live(void) {
      * consumed; switching to RECORD appends the continuation after it. */
     checkpoint_set_epoch(g_end_epoch);
     machine_set_mode(MACHINE_LIVE);
+    kio_continue();
     g_sealed = false;
     return TT_OK;
 }
@@ -573,7 +627,104 @@ void tt_perturb_next_replay(bool on) {
 
 /* ---- Verification ---- */
 
+/* Instructions whose result the recorder cannot reproduce (#241): RDRAND and
+ * RDSEED cannot be trapped, RDPID reads TSC_AUX, and CPUID runs natively when
+ * the CPU has no CPUID faulting. Decodes the instruction at `rip` past legacy
+ * and REX prefixes; returns its name, or NULL. */
+static const char* leak_at(process_t* p, uint64_t rip) {
+    uint8_t b[8];
+    if (!uaccess_read(p->address_space, rip, b, sizeof(b)) &&
+        !uaccess_read(p->address_space, rip, b, 4)) {
+        return 0;
+    }
+    uint32_t i = 0;
+    bool rep = false;
+    while (i < 4 && (b[i] == 0x66 || b[i] == 0xF2 || b[i] == 0xF3 || (b[i] & 0xF0) == 0x40)) {
+        if (b[i] == 0xF3) rep = true;
+        i++;
+    }
+    if (b[i] != 0x0F) return 0;
+    uint8_t op = b[i + 1], modrm = b[i + 2];
+    if (op == 0xA2 && !cpu_cpuid_faulting()) return "cpuid";
+    if (op == 0xC7 && (modrm >> 6) == 3) {
+        uint32_t reg = (modrm >> 3) & 7;
+        if (reg == 6) return "rdrand";
+        if (reg == 7) return rep ? "rdpid" : "rdseed";
+    }
+    return 0;
+}
+
+typedef struct {
+    tt_verify_t* out;
+    uint64_t     budget;
+} leak_scan_t;
+
+static void leak_visit(void* c, process_t* p, uint64_t rip) {
+    leak_scan_t* ls = (leak_scan_t*)c;
+    if (ls->out->leak_found) return;
+    if (ls->budget == 0) {
+        machine_stop_counting();   /* the window is too long to search: run the rest */
+        return;
+    }
+    ls->budget--;
+    const char* what = leak_at(p, rip);
+    if (!what) return;
+    machine_stop_counting();
+    ls->out->leak_found = true;
+    ls->out->leak_what = what;
+    ls->out->leak_pid = (uint32_t)p->pid;
+    ls->out->leak_rip = rip;
+    ls->out->leak_step = machine_step();
+    ls->out->leak_insn = machine_insn();
+}
+
+/* The first epoch diverged: bound where (from the register trace) and look
+ * for an instruction the recorder cannot replay in that window. */
+static void diagnose(uint64_t epoch, uint64_t len, tt_verify_t* out) {
+    uint64_t bad, lo = 0, hi = len;
+    if (machine_trace_mismatch(&bad)) {
+        /* The sample KJ_TRACE_EVERY entries earlier still matched. */
+        hi = bad;
+        lo = bad >= KJ_TRACE_EVERY ? bad - KJ_TRACE_EVERY : 0;
+    }
+    out->diag_step_lo = lo;
+    out->diag_step_hi = hi;
+    if (tt_goto(epoch, lo, 0) != TT_OK) return;
+    leak_scan_t ls = { out, 2000000 };
+    machine_set_insn_hook(leak_visit, &ls);
+    machine_set_count_insns(true);
+    tt_drive(epoch, hi, 0, len);
+    machine_set_count_insns(false);
+    machine_set_insn_hook(0, 0);
+}
+
+/* The replay made an input call the recording does not have (#242), or could
+ * not find a preemption point (#245): diverged at that step, in the inputs. */
+static void inputs_diverged(tt_verify_t* out, uint64_t epoch, const kio_mismatch_t* mis) {
+    out->epochs_diverged++;
+    if (out->diverged) return;
+    out->diverged = true;
+    out->first_epoch = epoch;
+    out->first_component = KDIVERGE_INPUTS;
+    out->expected = mis->exhausted ? 0 : (mis->rec_kind << 16) | mis->rec_nr;
+    out->actual = (mis->kind << 16) | mis->nr;
+    out->diag_step_lo = mis->step;
+    out->diag_step_hi = mis->step;
+}
+
+static int verify_window(tt_verify_t* out);
+
 int tt_verify(tt_verify_t* out) {
+    /* A preemption point the replay cannot find is noted and taken at the
+     * next entry, so the epoch still runs to its end and its checksums name
+     * what differs (#245). */
+    machine_set_lenient(true);
+    int rc = verify_window(out);
+    machine_set_lenient(false);
+    return rc;
+}
+
+static int verify_window(tt_verify_t* out) {
     memset(out, 0, sizeof(*out));
     tt_window_t w;
     if (!tt_window(&w)) return TT_ERR_STATE;
@@ -583,11 +734,19 @@ int tt_verify(tt_verify_t* out) {
     for (;;) {
         uint64_t len;
         if (tt_epoch_len(epoch, &len)) {
-            uint32_t ids[KDIVERGE_COMPONENT_COUNT], sums[KDIVERGE_COMPONENT_COUNT], n = 0;
-            if (replay_recorded_sums(epoch, ids, sums, KDIVERGE_COMPONENT_COUNT, &n) != 0 || n == 0) {
+            uint32_t ids[DIVERGE_MAX_COMPONENTS], sums[DIVERGE_MAX_COMPONENTS], n = 0;
+            if (replay_recorded_sums(epoch, ids, sums, DIVERGE_MAX_COMPONENTS, &n) != 0 || n == 0) {
                 return TT_ERR_JOURNAL;
             }
+            kio_clear_mismatch();
             int rc = tt_goto(epoch, len, 0);
+            const kio_mismatch_t* mis = kio_mismatch();
+            if (rc != TT_OK && mis->valid) {
+                out->epochs_checked++;
+                inputs_diverged(out, epoch, mis);
+                kio_clear_mismatch();
+                goto next_epoch;
+            }
             if (rc != TT_OK) return rc;
             kdiverge_reset();
             kdiverge_set_mode(DIVERGE_REPLAY);
@@ -604,9 +763,14 @@ int tt_verify(tt_verify_t* out) {
                     out->first_component = d->diverged_component;
                     out->expected = d->diverged_expected;
                     out->actual = d->diverged_actual;
+                    diagnose(epoch, len, out);
                 }
+            } else if (mis->valid) {
+                inputs_diverged(out, epoch, mis);   /* a preemption point, and nothing else differs */
             }
+            kio_clear_mismatch();
         }
+    next_epoch:
         if (epoch == w.newest) break;
         /* Next retained keyframe after `epoch`. */
         uint64_t next = w.newest;
@@ -626,12 +790,30 @@ int tt_resume_from_store(void) {
     if (!tt_window(&w)) return TT_ERR_STATE;
     int rc = tt_restore_keyframe(w.newest);
     if (rc != TT_OK) return rc;
-    /* Continue live from the keyframe: a new timeline from (newest, 0). */
+    /* The recording's programs must be the ones this boot has (#240): the
+     * debuggers read their symbols from these binaries. */
+    for (uint32_t i = 0; i < proc_count(); i++) {
+        process_t* p = proc_at(i);
+        const lp_image_t* img = p->exe_path[0] ? proc_find_image(p->exe_path) : 0;
+        if (p->exe_path[0] && (!img || proc_image_crc(img) != p->exe_crc)) {
+            kprintf("timetravel: the recording ran %s, which this boot %s\n", p->exe_path,
+                    img ? "has in a different version" : "does not have");
+            proc_destroy_all();
+            return TT_ERR_RESTORE;
+        }
+    }
+    /* Continue live from the keyframe: a new timeline from (newest, 0). This
+     * boot's TSC is not the recording's: keep the recorded clocks running from
+     * the keyframe's time, and record the new base in a keyframe at once. */
+    clock_reanchor(kstate_restored_now_ns());
+    g_force_keyframe = true;
     checkpoint_set_epoch(w.newest);
     machine_set_mode(MACHINE_LIVE);
     sched_record_begin_epoch(machine_sched_record(), w.newest);
     ktime_begin_epoch(w.newest);
     kentropy_begin_epoch(w.newest);
+    kj_begin_epoch(w.newest);
+    kio_begin_epoch(w.newest);
     g_ticks_since_kf = 0;
     g_sealed = false;
     return TT_OK;

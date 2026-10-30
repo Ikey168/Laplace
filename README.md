@@ -33,7 +33,7 @@ stopped:
 
 - **gdb**: stock gdb attaches with `target remote` and debugs the recorded
   machine in both directions: `reverse-stepi`, `reverse-continue`, hardware
-  watchpoints and breakpoints, registers, memory, one thread per process.
+  watchpoints and breakpoints, registers, memory, and every thread of every process as a gdb thread.
 - **MCP**: an MCP client (an AI agent) connects through `tools/laplace-mcp` and
   gets tools like `watch_last_write`, `rewind_to`, `reverse_stepi`,
   `read_memory`, and `verify_replay`. Agents are bad at exactly what this is
@@ -90,11 +90,36 @@ make selftest                         # in-kernel: verify every epoch, catch a p
 bash scripts/test/qemu_persistence_demo.sh   # pull the power, boot, resume
 ```
 
+## Install a release
+
+Each [release](https://github.com/Ikey168/Laplace/releases) has a tarball with
+the kernel, a GRUB ISO, a seed image with Lua, SQLite, and a dynamically linked
+program, the user programs with their symbols, and the tools. It needs only
+`qemu-system-x86_64` (and gdb to debug):
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf laplace-0.1.0-x86_64.tar.gz && cd laplace-0.1.0-x86_64
+tools/laplace-run                                  # the heisenbug demo, recording to ./laplace-disk.img
+gdb programs/heisenbug.elf -ex 'target remote :1235'   # once the machine stops
+tools/laplace-run --disk lua.img 'run="/bin/lua /scripts/gate.lua"'
+tools/laplace-run --disk test.img selftest exit    # record, verify every epoch, exit 0 on success
+```
+
+`tools/laplace-run --help` lists its options (`--kvm`, `--disk`, `--seed`,
+`--mem`, `--cpu`). Under TCG it gives the guest QEMU's `max` CPU: the release's
+Linux programs are built on a distribution compiled for x86-64-v3, so under
+KVM or on a physical machine they need a Haswell-or-later CPU
+([details](docs/architecture/hardware.md#which-cpu-the-guest-needs)). `boot/laplace.iso` boots a BIOS machine or `qemu -cdrom`. From a
+source tree, `make dist` builds the tarball and `make dist-test` boots it
+unpacked elsewhere. Changes per version: [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Using the debugger
 
 ```bash
 make run    # QEMU: console on stdio, gdb on :1235 (COM2), MCP on :1236 (COM3),
-            # recording to build/disk.img. APPEND="run=counter" picks programs.
+            # recording to build/disk.img, guest port 8080 on the host's :8080.
+            # APPEND="run=counter" picks programs (APPEND="run=musl_httpd": a web server).
 ```
 
 When the machine stops (an assertion, a fault, the last process exiting, or a
@@ -129,8 +154,10 @@ and between keyframes a CRC-protected **journal** of every nondeterministic
 input the programs can observe:
 
 - preemption: the step (kernel entry) at which every involuntary context switch
-  happened; timer interrupts only mark the slice expired, so switches happen at
-  kernel entries and replay forces the same ones
+  happened, and replay forces the same ones; a timer interrupt in user code
+  becomes an entry of its own, journaled by the program's state at that
+  instruction (registers, extended state, the pages it dirtied), which a replay
+  finds again with a hardware breakpoint
 - clock reads (`SYS_TIME`)
 - entropy (`SYS_RANDOM`)
 
@@ -170,8 +197,10 @@ with SIGKILL, and boots again, four times:
 PASSED: the booted machine resumed from the IDE disk after every power cut
 ```
 
-A power cut loses only the work since the newest keyframe on the disk (at most
-one keyframe interval, 100 ms by default); the demo checks that bound. (Recording:
+A power cut loses only the work since the newest keyframe the disk has made
+durable: about one keyframe interval (100 ms by default), plus the time the
+disk takes to write and flush it. The demo checks that the loss stays a small
+part of each boot's work. (Recording:
 `asciinema play docs/media/qemu-resume.cast`.) A checkpoint marks
 every writable page read-only and copy-on-write; the first write to a marked
 page makes the kernel preserve its pre-checkpoint image, and the keyframe is
@@ -187,46 +216,106 @@ Everything in this table runs in the booted kernel and is exercised in CI
 
 | Capability | Tested by |
 |------------|-----------|
+| **Practical targets**, each recorded to its end, verified byte-exact, caught when replay is sabotaged (`sabotage=clock`: every clock read a tick late; `sabotage=entropy`: one random bit flipped), and debugged backward over MCP (`watch_last_write`) and stock gdb with no file argument (reverse-continue to a breakpoint): hello world; Lua 5.4 running a script from the seed image (floats, tables, the collector, file I/O); the SQLite 3.44 shell creating, filling, indexing, and querying a database file; a pthreads lost-update race | `tests/qemu/targets_gate.py`, `tests/qemu/threads_gate.sh` |
 | Multiboot boot (QEMU `-kernel`, GRUB ISO), long mode, paging, ring-3 processes, system calls | every QEMU job; `make iso` |
-| Recording: keyframes with deferred copy-on-write writeback, one journal per keyframe, on the IDE disk | `make selftest`, e2e |
+| Recording: keyframes with deferred copy-on-write writeback, one journal per keyframe, on an IDE or AHCI (SATA) disk | `make selftest`, e2e, `LAPLACE_DISK=ahci qemu_persistence_demo.sh` |
+| Under KVM (`-enable-kvm -cpu host`) as under TCG: the selftest, preemption, and e2e gates; the boot log reports the PMU (none on hosted runners) | CI KVM step; [`docs/architecture/hardware.md`](docs/architecture/hardware.md) |
 | Replay by re-executing the processes to any (epoch, step, instruction) | e2e, `make selftest` |
 | Byte-exact verification of every retained epoch; a perturbed replay is caught | `make selftest`, `verify_replay`, `monitor verify` |
-| gdb: registers, memory, threads, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e |
-| MCP: protocol handshake, 13 tools, stdio bridge | e2e, `tests/test_mcp.c` |
+| Raw `rdtsc`/`rdtscp`/`cpuid` in user code replay exactly; a divergence names the instruction that caused it | `tests/qemu/determinism_gate.sh` |
+| x87/SSE/AVX state survives preemption, is in every keyframe, and is part of what replay verifies | `tests/qemu/fpu_gate.sh`, `make selftest` |
+| Unmodified static Linux programs (musl) run; their clock and random reads replay exactly | `tests/qemu/linux_gate.sh` |
+| Dynamically linked programs: a musl PIE through `ld-musl`, and the distribution's `lua5.4` package through glibc's `ld-linux` with libc, libm, libreadline, and libtinfo from the seed image, record and replay byte-exact (sabotage caught); gdb, with no file argument, lists the shared libraries (`qXfer:libraries-svr4`, `qXfer:auxv`), loads their symbols, and reverse-continues to `write` in libc | `tests/qemu/dynamic_gate.py` |
+| Programs load from outside the kernel (Multiboot modules, static and static-PIE) with argv and envp; a recording refuses to resume with changed binaries | `tests/qemu/loader_gate.sh` |
+| malloc, `mmap`/`munmap`/`mprotect`/`mremap`, `brk`, and a demand-paged stack replay exactly with keyframes between the calls, at 512 MiB and 4 GiB of RAM | `tests/qemu/vm_gate.sh` |
+| Files: a seed image, then a program's own files, in keyframes and checksums; unmodified Lua 5.4 runs a script from the image, writes a file and reads it back, and replays byte-exact; a recording refuses another seed | `tests/qemu/files_gate.sh` |
+| Inputs (clock reads, entropy, and later console and network) are one journaled record with payloads of any size: 10 MiB read in one epoch replays byte-exact; a replay whose input call differs from the recording stops at that step and is reported | `tests/qemu/input_gate.sh` |
+| Processes: 50 children fork (copy-on-write), exec, exit, and are reaped with their statuses; kill ends a child; rewinding between a fork and its exec shows both processes in gdb and MCP | `tests/qemu/proc_gate.sh` |
+| Threads: unmodified musl pthreads (mutexes, condition variables, join) record and replay byte-exact; two threads racing on a counter lose updates while recording, replay the same losses, and MCP's watch_last_write traces the overwritten update to the other thread's store | `tests/qemu/threads_gate.sh` |
+| Networking: an HTTP server (epoll, accept4) on the machine's e1000 answers requests from the host through QEMU's port forward while recording (one at a time, four at once, 64 KiB over many segments); the received frames are journaled, and the recording replays byte-exact with the link down; a loopback TCP/UDP client and server pair replays byte-exact | `tests/qemu/net_gate.py` |
+| Console input and pipes: a Lua REPL session typed on COM1 (with line editing) is journaled at the steps it is delivered and replays byte-exact with nothing attached; a shell-style `producer \| consumer` pipeline moves 300000 bytes through read, poll, and select with keyframes mid-pipeline; EOF, EAGAIN, poll timeouts, and EPIPE | `tests/qemu/console_gate.py` |
+| Preemption at any instruction without a counter: two loops with no system call interleave, a loop where only memory changes and `rep movsb` copies are preempted, a spin gets its timer's signals, and each replays byte-exact | `tests/qemu/preempt_gate.sh` |
+| Signals: SIGALRM from a timer interrupts a loop at journaled points with FPU state saved in the frame; a SIGSEGV handler recovers; masks, pending, sigsuspend, sigaltstack; every run replays byte-exact; an unhandled fault or abort() stops the machine and gdb shows the signal and the faulting line | `tests/qemu/signal_gate.sh` |
+| Blocking: a sleeping process and a working one replay byte-exact with each timer wake at its journaled step; a 10 s idle adds no steps and replays without waiting; a debugger stops the machine while everything waits | `tests/qemu/sleep_gate.sh` |
+| Incremental keyframes: 256 MiB resident records at about 24 pages per keyframe and replays without the evicted base keyframe; 64 MiB of malloc/free replays exactly | `tests/qemu/scale_gate.sh` |
+| gdb: registers (x87, SSE, AVX, fs_base by a target description), memory, every thread, the program read from the target, stepi/reverse-stepi, continue/reverse-continue, hardware breakpoints and watchpoints | e2e, `tests/qemu/threads_gate.sh` |
+| MCP: protocol handshake, 13 tools (threads, vector registers), stdio bridge | e2e, `tests/test_mcp.c` |
 | Resume live after debugging, recording continues | e2e |
 | Power cut and resume from the disk | `qemu_persistence_demo.sh` |
+| Overhead measured per workload (recording 1.1-1.6x for Lua, SQLite, malloc-heavy code under TCG; rewind in milliseconds), under TCG and KVM | `scripts/bench/overhead.py` (CI artifact, not a gate) |
 
 Limits, stated plainly:
 
-- One CPU. Preemption is at kernel-entry granularity: a process that never
-  enters the kernel is not preempted while recording.
-- The journaled inputs are preemption, clock, and entropy. There is no device
-  input (keyboard, network) yet, so there is nothing else to journal.
-- Programs may not use x87/SSE state; user programs build with
-  `-mgeneral-regs-only`.
-- Workloads are the programs embedded in the kernel (`user/laplace/`).
+- One CPU. A process is preempted at any instruction, but a replay finds each
+  such point by trapping on its instruction: a preempted hot loop replays a
+  trap or two per iteration slower (no branch counter is used yet), 100 to
+  300x the recorded run under TCG ([`docs/benchmarks.md`](docs/benchmarks.md)).
+- The journaled inputs are preemption, clock, entropy, bytes typed on the
+  console (COM1), and frames the network card received (#253).
+- The network stack (#253) is small: IPv4 only (10.0.2.15 on QEMU's
+  user-mode network), no fragments, TCP that takes segments in order and has
+  no retransmission timer (the virtual link does not lose frames), no
+  TIME_WAIT, AF_INET sockets only (no AF_UNIX, so no `socketpair`), and epoll
+  is level-triggered (`EPOLLET` behaves like level).
+- User `rdtsc`/`rdtscp` are trapped and journaled, and user `cpuid` is answered
+  from a recorded, masked table where the CPU has CPUID faulting (KVM, recent
+  bare metal; QEMU's emulator has none, so there `cpuid` runs natively).
+  `rdrand`, `rdseed`, and `rdpid` cannot be trapped: they are hidden from the
+  table, and a program that executes them anyway diverges; `verify` then names
+  the instruction and its address (#241).
+- Keyframes are incremental (#244): each writes only the pages dirtied since
+  the previous one into a reference-counted page pool on the disk, so memory
+  is limited by the pool (the disk's size, or `pool=` for the RAM disk).
+- x87, SSE, and AVX state is saved and verified (#237); AVX-512 is not enabled
+  in XCR0, so programs see no AVX-512.
+- Workloads are Laplace's own programs (`user/laplace/`, `int 0x80`) and
+  unmodified Linux programs (the Linux `syscall` ABI, #238): static ones
+  (`musl-gcc -static` or `-static-pie`), embedded in the kernel
+  (`user/linux/`) or passed as Multiboot modules (`-initrd`, #240), and
+  dynamically linked ones (#254) whose loader and libraries are in the seed
+  image: musl's, and a distribution's glibc programs. The
+  Linux interface so far covers startup, TLS, stdio to the console, the clocks,
+  `getrandom`, memory (`brk`, `mmap`, `munmap`, `mprotect`, `mremap`,
+  `madvise`, with pages mapped on first touch, #239), and files (#247): a
+  filesystem inside the machine, seeded from a read-only cpio image
+  (`rootfs/`, passed with `-initrd`) and checkpointed with it, with `openat`,
+  `read`/`write` and their `p`/`v` forms, `lseek`, `stat` and `statx`,
+  `getdents64`, `mkdir`, `unlink`, `rename`, links, `ftruncate`, `fcntl`,
+  `dup`, `getcwd`/`chdir`, private file `mmap`, and `/dev/null`, `/dev/zero`,
+  `/dev/urandom`; processes (#248): `fork`, `vfork`, `execve`, `wait4`,
+  `kill`, zombies and orphans; threads (#251): `clone` for pthreads,
+  `futex`, `gettid`, `tgkill`; signals (#250); and console input, a tty,
+  pipes, `poll`, and `select` (#249; ppoll's and pselect6's signal masks are
+  not applied). Unimplemented calls return ENOSYS and are logged once.
+  Sockets (#253): `socket`, `bind`, `listen`, `accept4`, `connect`,
+  `send`/`recv` and their `to`/`from`/`msg` forms, `shutdown`,
+  `get`/`setsockopt`, `getsockname`/`getpeername`, and `epoll`. A dynamic
+  loader is loaded at a fixed address (no ASLR), and there is no vDSO, so
+  libc reads the clocks through journaled system calls.
 - Recorded history is read-only from the debuggers.
+- Platforms: QEMU TCG and KVM are tested. No real machine has been booted
+  yet; the console and debug channels need COM ports, and the only disks are
+  IDE and AHCI (no NVMe). See [`docs/architecture/hardware.md`](docs/architecture/hardware.md).
 
 ## The machine
 
 The system being recorded is Laplace's own small kernel (`kernel/core/`): a
-Multiboot entry into long mode, a frame allocator and per-process 4-level page
-tables, ring-3 processes loaded from embedded ELF images, `int 0x80` system
-calls, and a round-robin scheduler. The kernel runs with interrupts disabled and
-never blocks, so a kernel entry is an atomic, deterministic step; the whole
+Multiboot entry into long mode, a higher-half kernel with a direct map of all
+RAM, per-process 4-level page tables over the whole lower half, ring-3
+processes loaded from embedded ELF images, Laplace (`int 0x80`) and Linux
+(`syscall`) system calls, and a round-robin scheduler. The kernel runs with interrupts disabled, so a kernel entry is an atomic, deterministic step; a process that waits (`nanosleep`, and later children, futexes, input) blocks, and when nothing can run the kernel idles with `hlt` (#246); the whole
 time-travel stack (`kernel/*.c`, host-tested under `tests/`) sits on top of it.
 
-The project was formerly named IKOS, and the tree carries a broad scaffold of a
-general-purpose OS from that era (GUI, USB, networking, audio, daemons, a
-multi-stage boot sector). That code is **not** in the bootable kernel and does
-not compile today; `make legacy` runs its old build. Issue #233 tracks either
-repairing or removing it.
+The project was formerly named IKOS. The general-purpose OS scaffold of that
+era (GUI, USB, audio, daemons, a multi-stage boot sector, an earlier network
+stack and VFS) never compiled into the bootable kernel and was removed (#233);
+everything in the tree is built or tested.
 
 ## Getting started
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get install -y gcc make nasm qemu-system-x86 gdb python3
+sudo apt-get install -y gcc make nasm musl-tools qemu-system-x86 gdb python3
 # for make iso: grub-pc-bin xorriso mtools
 
 git clone https://github.com/Ikey168/Laplace.git && cd Laplace
@@ -239,11 +328,18 @@ Kernel command line (`make run APPEND="..."`):
 
 | Option | Meaning |
 |--------|---------|
-| `run=a,b,c` | programs to start on a cold boot: `heisenbug`, `noise`, `counter`, `hello` (default `heisenbug,noise,noise`) |
+| `run=a,b,c` | programs to start on a cold boot, each with arguments: an embedded name (`heisenbug`, `noise`, `counter`, `hello`, `musl_hello`, ...) or the path of a module passed with `-initrd`, e.g. `run="/args.elf one two",noise` (default `heisenbug,noise,noise`) |
+| `root=PATH` | the filesystem's seed image: a cpio module (default: the first cpio module; `make run` passes `rootfs/`) |
+| `env="A=1 B=2"` | the environment of every Linux program |
 | `interval=N` | keyframe cadence in timer ticks (1 ms each; default 100) |
 | `keyframes=N` | retained keyframes, the rewind horizon (default 16) |
 | `fresh` | ignore a recording on the disk and cold-boot |
 | `stop_after=N` | stop for the debugger after N keyframes |
+| `dirty=N` | also take a keyframe once an epoch dirties N pages (default 8192) |
+| `pool=N` | without an IDE or AHCI disk: the RAM disk's page pool in MiB (default 64) |
+| `bench` / `bench=run` | after the run, print its cost and the verify, replay, rewind, and reverse-stepi times (`bench=run`: the cost only); see [`docs/benchmarks.md`](docs/benchmarks.md) |
+| `norecord` | run without recording (the benchmarks' baseline): nothing can be replayed |
+| `sabotage=clock` / `sabotage=entropy` | test hook: every replayed clock read one tick late, or one bit of every replayed random payload flipped; `selftest` must report divergence |
 
 | Target | Description |
 |--------|-------------|
@@ -252,7 +348,6 @@ Kernel command line (`make run APPEND="..."`):
 | `make selftest` | in-kernel verification, exits QEMU with the result |
 | `make test` | `selftest` plus the in-QEMU end-to-end gates |
 | `make iso` | GRUB rescue ISO for BIOS machines |
-| `make legacy` | the old IKOS wildcard build (does not compile; #233) |
 
 ## Testing
 
@@ -260,8 +355,10 @@ CI (`.github/workflows/laplace.yml`) builds the kernel with `-Werror`, runs the
 host unit tests of every time-travel and persistence module, runs the host
 harnesses (`scripts/test/{persistence,timetravel,scrub,mcp_heisenbug,timetravel_live}_demo.sh`,
 which exercise the modules outside the kernel), then boots the kernel in QEMU
-for `make selftest`, `tests/qemu/timetravel_e2e.py`, the power-cut demo, and
-`make iso`.
+for `make selftest`, every gate under `tests/qemu/`, the power-cut demos (IDE
+and AHCI), and `make iso`; under KVM it reruns the self-test, the preemption
+gate, and the e2e gate. Pushes to main also measure the overhead table
+(`scripts/bench/overhead.py`).
 
 ## Project structure
 
@@ -272,32 +369,39 @@ Laplace/
                       restore, replay, navigation), monitor, gdb_target, main
   kernel/*.c          the time-travel and persistence modules (checkpoint,
                       snapshot/keyframe/journal stores, record wrappers, replay,
-                      divergence, rewind/reverse/revbreak, gdbstub, mcp), plus
-                      the legacy IKOS subsystems (not built)
+                      divergence, rewind/reverse/revbreak, gdbstub, mcp, memfs,
+                      page store, kernel-state format), host-tested
   include/            headers (include/core/ for the kernel core)
   user/laplace/       the recorded programs: heisenbug, noise, counter, hello
-  tests/              host unit tests; tests/qemu/ the booted end-to-end gate
-  tools/              laplace-mcp (MCP stdio bridge), record-cast
+  user/linux/         unmodified Linux programs built with musl (probes, threads,
+                      pipelines, an HTTP server, benchmarks)
+  rootfs/             the machine filesystem's seed image (packed to build/rootfs.cpio)
+  tests/              host unit tests; tests/qemu/ the booted end-to-end gates
+  tools/              laplace-mcp (MCP stdio bridge), record-cast, mkcpio
   scripts/test/       host harnesses and the QEMU power-cut demo
+  scripts/build/      third-party programs for the gates (Lua, SQLite, the
+                      dynamically linked programs)
+  scripts/bench/      the overhead table
   docs/               architecture and how-tos
 ```
 
 ## Roadmap
 
-- Journal device input (keyboard, disk completions) so interactive programs
-  can be recorded
-- A loader for programs not embedded in the kernel
-- x87/SSE state in contexts and keyframes
-- Retired-instruction counting (where available) for preemption finer than a
-  kernel entry
+The plan for running real programs (unmodified static Linux binaries, threads
+included) is tracked in #235. Its main steps:
+
+- A branch counter, where the boot-time probe finds an exact one, to skip
+  most of the breakpoint hits a replay of a preempted hot loop takes (#245);
+  a bare-metal machine, NVMe, and a debug channel without COM ports (#236)
 - SMP-safe deterministic replay
-- Repair or remove the legacy subsystems (#233)
 
 ## Documentation
 
 Full index: [`docs/README.md`](docs/README.md).
 
 - [Time-travel debugging: design, module map, limits](docs/architecture/time-travel.md)
+- [Platforms: TCG, KVM, PMU detection, the AHCI disk, bare metal](docs/architecture/hardware.md)
+- [Overhead: recording, keyframes, replay, rewind](docs/benchmarks.md)
 - [Reverse debugging with gdb](docs/testing/reverse-debugging.md)
 - [Driving time travel from MCP](docs/testing/mcp-server.md)
 - [Orthogonal persistence](docs/architecture/orthogonal-persistence.md) and

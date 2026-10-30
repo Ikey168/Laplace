@@ -128,6 +128,18 @@ checkpoint_page_action_t checkpoint_page_action(bool region_writable, pte_t pte)
  * negative code. */
 int checkpoint_capture_context(uint32_t pid, const void* ctx, uint32_t ctx_size);
 
+/* What checkpoint_take() captures as a process's context record (#237): fills
+ * `page` (PAGE_SIZE bytes) and returns the byte count. Unset (the default),
+ * the record is the process_context_t alone. */
+struct process;
+typedef uint32_t (*checkpoint_context_fn)(struct process* proc, uint8_t* page);
+void checkpoint_set_context_fn(checkpoint_context_fn fn);
+
+/* Replace the per-space COW marking checkpoint_take does (default:
+ * checkpoint_mark_space). Returns the pages marked, or < 0. (#244) */
+typedef int (*checkpoint_mark_fn)(vm_space_t* space, uint64_t epoch);
+void checkpoint_set_mark_fn(checkpoint_mark_fn fn);
+
 /* Persist an arbitrary-size kernel-state blob (v2, #139) as one or more
  * CHECKPOINT_REC_KERNEL records, chunked into pages and tagged with `tag` (which
  * kernel structure it is). Each record encodes the total size and chunk index in

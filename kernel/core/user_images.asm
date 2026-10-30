@@ -15,5 +15,24 @@ USER_IMAGE heisenbug
 USER_IMAGE noise
 USER_IMAGE counter
 USER_IMAGE hello
+USER_IMAGE tscprobe
+USER_IMAGE rdrandleak
+USER_IMAGE fpuprobe
+USER_IMAGE musl_hello
+USER_IMAGE musl_sysprobe
+USER_IMAGE musl_vmprobe
+USER_IMAGE musl_bigmem
+USER_IMAGE musl_fileprobe
+USER_IMAGE musl_inputprobe
+USER_IMAGE musl_sleeper
+USER_IMAGE musl_forkexec
+USER_IMAGE musl_sigprobe
+USER_IMAGE musl_spinner
+USER_IMAGE musl_threads
+USER_IMAGE musl_benchcpu
+USER_IMAGE musl_benchalloc
+USER_IMAGE musl_pipeline
+USER_IMAGE musl_httpd
+USER_IMAGE musl_netloop
 
 section .note.GNU-stack noalloc noexec nowrite progbits

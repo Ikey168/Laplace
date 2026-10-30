@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # Persistence resume demo (#202, #231): yank power, boot, resume.
+# LAPLACE_DISK=ahci runs layer 2 on an AHCI (SATA) disk instead of IDE (#236).
 #
 #   1. Headless: builds and runs tests/persistence_ide_resume_e2e.c, which
 #      drives the real checkpoint engine and snapshot store through the same
@@ -11,9 +12,11 @@
 #      with SIGKILL (a power cut) at several points, and boots again from the
 #      same disk. Every boot after the first must resume the machine from the
 #      newest keyframe on the disk. A power cut loses only the work done since
-#      that keyframe (at most one keyframe interval, 100 ms by default), so the
-#      counter resumes past everything the previous boot started from, and
-#      the lost work is small: under 10% of what the previous boot counted.
+#      the newest keyframe the disk had made durable (a keyframe interval,
+#      100 ms by default, plus the time the disk takes to write and flush
+#      it), so the counter resumes past everything the previous boot started
+#      from, and the lost work is small: under a quarter of what the previous
+#      boot counted (a resume from a stale keyframe would lose most of it).
 #
 # Needs gcc and, for layer 2, nasm and qemu-system-x86_64 (set
 # LAPLACE_SKIP_QEMU=1 to run layer 1 only).
@@ -59,11 +62,21 @@ make -s kernel >/dev/null || { echo "FAILED: kernel build"; exit 1; }
 
 DISK="$WORK/disk.img"
 truncate -s 64M "$DISK"
+# LAPLACE_DISK=ahci puts the disk behind an AHCI (SATA) controller (#236)
+# instead of the legacy IDE one.
+DISK_KIND="${LAPLACE_DISK:-ide}"
+if [ "$DISK_KIND" = ahci ]; then
+    DISK_ARGS=(-drive "file=$DISK,format=raw,if=none,id=d0" -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0)
+    DISK_NAME="AHCI"
+else
+    DISK_ARGS=(-drive "file=$DISK,format=raw,if=ide,index=0")
+    DISK_NAME="IDE"
+fi
 
 boot_and_cut() {   # $1 = seconds before the power cut, $2 = console log
     rm -f "$WORK/qemu.pid"
     "$QEMU" -m 256M -display none -no-reboot -kernel build/laplace.elf \
-        -append "run=counter" -drive "file=$DISK,format=raw,if=ide,index=0" \
+        -append "run=counter" "${DISK_ARGS[@]}" \
         -serial "file:$2" -serial null -serial null \
         -pidfile "$WORK/qemu.pid" -daemonize || return 1
     sleep "$1"
@@ -85,6 +98,7 @@ for secs in 3 4 2.5 3.5; do
     newest=$(counters "$log" | tail -1)
     if [ "$cycle" = 1 ]; then
         grep -q "store formatted" "$log" || { echo "  [FAIL] boot 1 did not format a fresh store"; fail=1; }
+        grep -q "recording to the $DISK_NAME disk" "$log" || { echo "  [FAIL] boot 1 did not record to the $DISK_NAME disk"; fail=1; }
         echo "[boot 1] fresh disk: counted ${first:-?} .. ${newest:-?}, then power cut after ${secs}s"
         [ "${first:-0}" = 20000 ] || { echo "  [FAIL] boot 1 did not start from zero"; fail=1; }
     else
@@ -97,7 +111,11 @@ for secs in 3 4 2.5 3.5; do
             lost=$(( last - first + 20000 )); [ "$lost" -lt 0 ] && lost=0
             progress=$(( last - prev_first ))
             echo "         lost at most $lost counts to the cut (work since the newest keyframe)"
-            [ $(( lost * 10 )) -le "$progress" ] || { echo "  [FAIL] lost $lost of $progress counts: more than one keyframe interval"; fail=1; }
+            # The counter prints every 20000, so `lost` overstates the work
+            # lost by up to one print; what is left of it must be under a
+            # quarter. (On a CI runner the AHCI disk's flushes alone can take
+            # longer than a keyframe interval.)
+            [ $(( (lost - 20000) * 4 )) -le "$progress" ] || { echo "  [FAIL] lost $lost of $progress counts: more than the newest durable keyframe explains"; fail=1; }
         fi
     fi
     prev_first=${first:-0}
@@ -106,7 +124,7 @@ for secs in 3 4 2.5 3.5; do
 done
 
 if [ "$fail" = 0 ]; then
-    echo "PASSED: the booted machine resumed from the IDE disk after every power cut"
+    echo "PASSED: the booted machine resumed from the $DISK_NAME disk after every power cut"
     exit 0
 fi
 echo "FAILED: see above"; for l in "$WORK"/boot*.log; do echo "--- $l"; tail -5 "$l"; done

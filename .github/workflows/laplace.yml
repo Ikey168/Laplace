@@ -12,16 +12,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - name: Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm
+          sudo apt-get install -y nasm musl-tools
           gcc --version | head -1
           nasm -v
 
@@ -69,6 +73,11 @@ jobs:
           gcc -I../include -Wall -o /tmp/t_mcp    test_mcp.c                  ../kernel/mcp.c && /tmp/t_mcp
           gcc -I../include -Wall -o /tmp/t_jc     test_journal_capture.c      ../kernel/journal_capture.c ../kernel/checkpoint_journal.c && /tmp/t_jc
           gcc -I../include -Wall -o /tmp/t_ks     test_keyframe_store.c       ../kernel/keyframe_store.c ../kernel/snapshot_store.c ../kernel/keyframe_ring.c && /tmp/t_ks
+          gcc -I../include -Wall -o /tmp/t_ksf    test_kstate_format.c        ../kernel/kstate_format.c ../kernel/snapshot_store.c && /tmp/t_ksf
+          gcc -I../include -Wall -o /tmp/t_ps     test_page_store.c           ../kernel/page_store.c ../kernel/snapshot_store.c && /tmp/t_ps
+          gcc -I../include -Wall -o /tmp/t_memfs  test_memfs.c                ../kernel/memfs.c ../kernel/kstate_format.c ../kernel/snapshot_store.c && /tmp/t_memfs
+          gcc -I../include -Wall -o /tmp/t_iorec  test_iorec.c                ../kernel/iorec.c && /tmp/t_iorec
+          gcc -I../include -Wall -o /tmp/t_pm     test_pmatch.c               ../kernel/pmatch.c && /tmp/t_pm
           gcc -I../include -Wall -o /tmp/t_rd     test_replay_driver.c        ../kernel/replay_driver.c ../kernel/replay_engine.c && /tmp/t_rd
           gcc -I../include -Wall -o /tmp/t_ds     test_divergence_scan.c      ../kernel/divergence_scan.c ../kernel/divergence.c && /tmp/t_ds
           gcc -I../include -Wall -o /tmp/t_gsl    test_gdb_serial.c           ../kernel/gdb_serial.c ../kernel/gdbstub.c ../kernel/gdbstub_sync.c && /tmp/t_gsl
@@ -77,6 +86,7 @@ jobs:
 
   headless-demos:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: unit-tests
     steps:
       - uses: actions/checkout@v4
@@ -93,20 +103,115 @@ jobs:
 
   qemu:
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     needs: unit-tests
+    # The runners' distribution is built for x86-64-v3: TCG guests get
+    # QEMU's max CPU (tools/qemu-tcg-max), KVM guests the host's.
+    env:
+      QEMU: ${{ github.workspace }}/tools/qemu-tcg-max
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm qemu-system-x86 gdb grub-pc-bin xorriso mtools
+          sudo apt-get install -y nasm musl-tools qemu-system-x86 gdb grub-pc-bin xorriso mtools
       - name: Build
         run: make
       - name: Boot, record, verify every epoch byte-exact (in-kernel self-test)
         run: make selftest
+      - name: Raw RDTSC/CPUID replay exactly; an RDRAND leak is located (in QEMU)
+        run: bash tests/qemu/determinism_gate.sh
+      - name: x87/SSE/AVX state survives preemption and is verified (in QEMU)
+        run: bash tests/qemu/fpu_gate.sh
+      - name: Unmodified static Linux programs run and replay (in QEMU)
+        run: bash tests/qemu/linux_gate.sh
+      - name: Programs load from outside the kernel with argv/envp (in QEMU)
+        run: bash tests/qemu/loader_gate.sh
+      - name: brk, mmap, mprotect, and demand paging replay exactly (in QEMU)
+        run: bash tests/qemu/vm_gate.sh
+      - name: Incremental keyframes at 256 MiB resident (in QEMU)
+        run: bash tests/qemu/scale_gate.sh
+      - name: Files from a seed image; Lua writes and reads a file (in QEMU)
+        run: bash tests/qemu/files_gate.sh
+      - name: 10 MiB of journaled input in one epoch; a stray input call is caught (in QEMU)
+        run: bash tests/qemu/input_gate.sh
+      - name: Sleep, idle, and wake at journaled steps (in QEMU)
+        run: bash tests/qemu/sleep_gate.sh
+      - name: fork, execve, wait, kill; rewind between fork and exec (in QEMU)
+        run: bash tests/qemu/proc_gate.sh
+      - name: Signals, handlers, timers; a fault stops for gdb (in QEMU)
+        run: bash tests/qemu/signal_gate.sh
+      - name: Preemption at any instruction, found again by state (in QEMU, TCG, no PMU)
+        run: bash tests/qemu/preempt_gate.sh
+      - name: A Lua session typed on the console and a pipeline replay byte-exact (in QEMU)
+        run: python3 tests/qemu/console_gate.py
+      - name: An HTTP server answers the host while recording; it and a loopback pair replay byte-exact (in QEMU)
+        run: python3 tests/qemu/net_gate.py
+      - name: "Target: a pthreads lost-update race, traced to the other thread's store (MCP + gdb)"
+        run: bash tests/qemu/threads_gate.sh
+      - name: "Target: hello world (record, verify, sabotage caught, MCP + gdb backward)"
+        run: python3 tests/qemu/targets_gate.py hello
+      - name: "Target: Lua 5.4 running a script from the seed image"
+        run: python3 tests/qemu/targets_gate.py lua
+      - name: "Target: the SQLite shell creating, filling, and querying a database file"
+        run: python3 tests/qemu/targets_gate.py sqlite
+      - name: "Dynamically linked: a musl PIE and the distribution's lua5.4 with glibc (record, replay, gdb)"
+        run: |
+          sudo apt-get install -y lua5.4
+          python3 tests/qemu/dynamic_gate.py
+      - name: The same under KVM (the runner's CPU exposes no PMU)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
+          QEMU_ACCEL=kvm bash tests/qemu/preempt_gate.sh
+          make selftest QEMU_FLAGS="-m 256M -display none -no-reboot -enable-kvm -cpu host"
+          QEMU_ACCEL=kvm python3 tests/qemu/timetravel_e2e.py
       - name: Heisenbug debugged backward over MCP and gdb (in QEMU)
         run: python3 tests/qemu/timetravel_e2e.py
       - name: Power cut and resume on the IDE disk (in QEMU)
         run: bash scripts/test/qemu_persistence_demo.sh
+      - name: Power cut and resume on an AHCI (SATA) disk (in QEMU)
+        run: LAPLACE_DISK=ahci bash scripts/test/qemu_persistence_demo.sh
       - name: Bootable ISO (GRUB, BIOS)
         run: make iso
+      - name: The release tarball works on its own (make dist-test)
+        run: make dist-test
+
+  # Recording overhead (#255): not a gate. Every push to main measures the
+  # table under TCG and KVM and keeps it as an artifact.
+  bench:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    needs: unit-tests
+    # The runners' distribution is built for x86-64-v3: TCG guests get
+    # QEMU's max CPU (tools/qemu-tcg-max), KVM guests the host's.
+    env:
+      QEMU: ${{ github.workspace }}/tools/qemu-tcg-max
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm musl-tools qemu-system-x86
+      - name: Build
+        run: make
+      - name: Overhead under TCG
+        run: python3 scripts/bench/overhead.py --out bench-tcg.md
+      - name: Overhead under KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
+          QEMU_ACCEL=kvm python3 scripts/bench/overhead.py --out bench-kvm.md
+      - name: Table
+        if: always()
+        run: cat bench-tcg.md bench-kvm.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: overhead
+          path: bench-*.md

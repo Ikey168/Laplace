@@ -6,9 +6,9 @@
 #   make selftest   boot, record the heisenbug, verify the replay, and exit
 #   make iso        build a GRUB rescue ISO (build/laplace.iso) for BIOS machines
 #   make test       the self-test plus the in-QEMU end-to-end gates
-#   make legacy     the pre-Laplace wildcard build (does not compile; see #233)
+#   make dist       the release tarball (build/dist/laplace-VERSION-x86_64.tar.gz)
 #
-# Needs gcc, GNU ld, nasm, and (to boot) qemu-system-x86_64.
+# Needs gcc, GNU ld, nasm, musl-gcc (musl-tools), and (to boot) qemu-system-x86_64.
 
 NASM    ?= nasm
 CC      ?= gcc
@@ -17,13 +17,21 @@ OBJCOPY ?= objcopy
 QEMU    ?= qemu-system-x86_64
 GRUB_MKRESCUE ?= grub-mkrescue   # needs grub-pc-bin, xorriso, mtools
 
+VERSION := $(shell cat VERSION)
+
 BUILD   := build
 KBUILD  := $(BUILD)/kernel
 UBUILD  := $(BUILD)/user
 
+# Every image the machine runs is built for the baseline x86-64 ISA, whatever
+# the compiler defaults to: QEMU's default CPU (qemu64) has no BMI2 or AVX,
+# and a compiler that targets x86-64-v3 emits shlx and the like.
+ISA     := -march=x86-64 -mtune=generic
+
 # Kernel: freestanding, no SSE/x87 state (the context switch saves only the
 # general registers), -Werror so the bootable build stays green.
-KCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
+KCFLAGS := -m64 $(ISA) -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie -mcmodel=kernel \
+           -DLAPLACE_KERNEL -DLAPLACE_VERSION='"$(VERSION)"' \
            -fno-stack-protector -fno-omit-frame-pointer -mno-red-zone \
            -mgeneral-regs-only -fno-tree-loop-distribute-patterns \
            -Wall -Wextra -Werror -Iinclude
@@ -35,7 +43,9 @@ CORE_ASM := kernel/core/boot.asm kernel/core/isr.asm
 CORE_C   := kernel/core/main.c kernel/core/cpu.c \
             kernel/core/console.c kernel/core/klib.c kernel/core/mm.c \
             kernel/core/proc.c kernel/core/machine.c kernel/core/timetravel.c \
-            kernel/core/monitor.c kernel/core/gdb_target.c
+            kernel/core/monitor.c kernel/core/gdb_target.c kernel/core/kjournal.c kernel/core/fpu.c \
+            kernel/core/clock.c kernel/core/linux.c kernel/core/vm.c kernel/core/kstate.c kernel/core/files.c kernel/core/kio.c kernel/core/pctl.c kernel/core/ksig.c kernel/core/preempt.c kernel/core/ahci.c kernel/core/bmide.c kernel/core/pmu.c kernel/core/tty.c kernel/core/e1000.c kernel/core/net.c \
+            kernel/core/kfpages.c
 
 # The time-travel and persistence modules (host-tested; see tests/) and their
 # kernel adapters.
@@ -50,7 +60,8 @@ TT_C := kernel/checkpoint.c kernel/snapshot_store.c kernel/checkpoint_extstate.c
         kernel/divergence_sync.c kernel/divergence_scan.c kernel/divergence_scan_sync.c \
         kernel/rewind.c kernel/rewind_sync.c kernel/reverse.c kernel/reverse_sync.c \
         kernel/revbreak.c kernel/revbreak_sync.c kernel/gdbstub.c kernel/gdbstub_sync.c \
-        kernel/gdb_serial.c kernel/mcp.c kernel/mcp_sync.c kernel/mcp_server.c
+        kernel/gdb_serial.c kernel/mcp.c kernel/mcp_sync.c kernel/mcp_server.c \
+        kernel/kstate_format.c kernel/page_store.c kernel/memfs.c kernel/iorec.c kernel/pmatch.c
 
 KERNEL_C    := $(CORE_C) $(TT_C)
 KERNEL_OBJS := $(patsubst %.asm,$(KBUILD)/%.o,$(CORE_ASM)) \
@@ -58,18 +69,23 @@ KERNEL_OBJS := $(patsubst %.asm,$(KBUILD)/%.o,$(CORE_ASM)) \
                $(KBUILD)/kernel/core/user_images.o
 
 # User programs (#220, #230, #231): ring-3 ELF images embedded in the kernel.
-USER_PROGS := heisenbug noise counter hello
+USER_PROGS := heisenbug noise counter hello tscprobe rdrandleak fpuprobe
 USER_ELFS  := $(patsubst %,$(UBUILD)/%.elf,$(USER_PROGS))
-UCFLAGS := -m64 -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
-           -fno-stack-protector -fno-omit-frame-pointer -mgeneral-regs-only \
+
+# Linux programs (#238): plain C built against musl, unmodified.
+MUSL_CC     ?= musl-gcc
+LINUX_PROGS := hello sysprobe vmprobe bigmem fileprobe inputprobe sleeper forkexec sigprobe spinner threads benchcpu benchalloc pipeline httpd netloop
+LINUX_ELFS  := $(patsubst %,$(UBUILD)/musl_%.elf,$(LINUX_PROGS))
+UCFLAGS := -m64 $(ISA) -std=gnu11 -O2 -g -ffreestanding -fno-pic -fno-pie \
+           -fno-stack-protector -fno-omit-frame-pointer \
            -fno-tree-loop-distribute-patterns -Wall -Wextra -Werror \
            -Iinclude -Iuser/laplace
 ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -z noexecstack \
             -T user/laplace/user.ld
 
-.PHONY: all kernel user run selftest test iso clean legacy
+.PHONY: all kernel user run selftest test iso dist dist-test clean
 
-all: kernel
+all: kernel $(BUILD)/rootfs.cpio
 
 kernel: $(BUILD)/laplace.elf
 user: $(USER_ELFS)
@@ -77,7 +93,7 @@ user: $(USER_ELFS)
 $(BUILD)/laplace.elf: $(KERNEL_OBJS) kernel/core/laplace.ld
 	$(LD) $(KLDFLAGS) -o $@ $(KERNEL_OBJS)
 
-$(KBUILD)/kernel/core/user_images.o: kernel/core/user_images.asm $(USER_ELFS)
+$(KBUILD)/kernel/core/user_images.o: kernel/core/user_images.asm $(USER_ELFS) $(LINUX_ELFS)
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 -o $@ $<
 
@@ -85,6 +101,13 @@ $(UBUILD)/%.elf: user/laplace/%.c user/laplace/ulib.h include/laplace/syscalls.h
 	@mkdir -p $(dir $@)
 	$(CC) $(UCFLAGS) -c $< -o $(UBUILD)/$*.o
 	$(LD) $(ULDFLAGS) -o $@ $(UBUILD)/$*.o
+
+$(UBUILD)/musl_%.elf: user/linux/%.c
+	@mkdir -p $(dir $@)
+	$(MUSL_CC) $(ISA) -static -O2 -g -o $@ $<
+
+# The boot banner names the version.
+$(KBUILD)/kernel/core/main.o: VERSION
 
 $(KBUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -96,6 +119,8 @@ $(KBUILD)/%.o: %.asm
 
 # The machine's disk: keyframes and journals live here and survive reboots.
 DISK       ?= $(BUILD)/disk.img
+# Sparse; the page pool gets what the keyframe regions leave (#244).
+DISK_SIZE  ?= 1G
 GDB_PORT   ?= 1235
 MCP_PORT   ?= 1236
 APPEND     ?=
@@ -103,31 +128,62 @@ QEMU_FLAGS ?= -m 256M -display none -no-reboot
 
 $(DISK):
 	@mkdir -p $(dir $@)
-	truncate -s 64M $@
+	truncate -s $(DISK_SIZE) $@
 
 # Console on stdio; gdb (COM2) and MCP (COM3) on TCP. Attach with
 #   gdb build/user/heisenbug.elf -ex 'target remote :$(GDB_PORT)'
 #   tools/laplace-mcp --port $(MCP_PORT)
-run: kernel $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -kernel $(BUILD)/laplace.elf -append "$(APPEND)" \
-	    -drive file=$(DISK),format=raw,if=ide,index=0 \
+# The filesystem's seed image (#247): rootfs/, packed deterministically.
+$(BUILD)/rootfs.cpio: tools/mkcpio.py $(shell find rootfs)
+	@mkdir -p $(dir $@)
+	python3 tools/mkcpio.py rootfs $@
+
+# The machine's e1000 on QEMU's user-mode network; guest port 8080 is
+# forwarded to the host's (#253).
+NET_FLAGS ?= -nic user,model=e1000,hostfwd=tcp:127.0.0.1:$(HTTP_PORT)-:8080
+HTTP_PORT ?= 8080
+
+run: kernel $(DISK) $(BUILD)/rootfs.cpio
+	$(QEMU) $(QEMU_FLAGS) -kernel $(BUILD)/laplace.elf -initrd $(BUILD)/rootfs.cpio -append "$(APPEND)" \
+	    -drive file=$(DISK),format=raw,if=ide,index=0 $(NET_FLAGS) \
 	    -serial mon:stdio -serial tcp:127.0.0.1:$(GDB_PORT),server,nowait \
 	    -serial tcp:127.0.0.1:$(MCP_PORT),server,nowait
 
 # Record the heisenbug until it fires, then verify every retained epoch
 # byte-exact, check that a perturbed replay is caught, and find the clobbering
 # store backward. QEMU exits 1 on success (isa-debug-exit), 3 on failure.
+SELFTEST_TIMEOUT ?= 600
+
 selftest: kernel
-	@$(QEMU) $(QEMU_FLAGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+	@timeout $(SELFTEST_TIMEOUT) $(QEMU) $(QEMU_FLAGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 	    -kernel $(BUILD)/laplace.elf -append "selftest exit" \
 	    -serial stdio -serial null -serial null; \
-	 status=$$?; [ $$status -eq 1 ] || { echo "selftest failed (status $$status)"; exit 1; }
+	 status=$$?; [ $$status -ne 124 ] || echo "selftest: no result after $(SELFTEST_TIMEOUT) s"; \
+	 [ $$status -eq 1 ] || { echo "selftest failed (status $$status)"; exit 1; }
 
 # Everything CI runs: host unit tests are in .github/workflows/laplace.yml;
 # these are the booted-kernel gates.
 test: all selftest
+	bash tests/qemu/determinism_gate.sh
+	bash tests/qemu/fpu_gate.sh
+	bash tests/qemu/linux_gate.sh
+	bash tests/qemu/loader_gate.sh
+	bash tests/qemu/vm_gate.sh
+	bash tests/qemu/scale_gate.sh
+	bash tests/qemu/files_gate.sh
+	bash tests/qemu/input_gate.sh
+	bash tests/qemu/sleep_gate.sh
+	bash tests/qemu/proc_gate.sh
+	bash tests/qemu/signal_gate.sh
+	bash tests/qemu/preempt_gate.sh
+	bash tests/qemu/threads_gate.sh
+	python3 tests/qemu/console_gate.py
+	python3 tests/qemu/net_gate.py
+	python3 tests/qemu/targets_gate.py
+	python3 tests/qemu/dynamic_gate.py
 	python3 tests/qemu/timetravel_e2e.py
 	bash scripts/test/qemu_persistence_demo.sh
+	LAPLACE_DISK=ahci bash scripts/test/qemu_persistence_demo.sh
 
 iso: kernel
 	@mkdir -p $(BUILD)/iso/boot/grub
@@ -135,8 +191,13 @@ iso: kernel
 	printf 'set timeout=0\nset default=0\nmenuentry "Laplace" {\n  multiboot /boot/laplace.elf\n  boot\n}\n' > $(BUILD)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD)/laplace.iso $(BUILD)/iso
 
-legacy:
-	$(MAKE) -f Makefile.legacy all
+# The release: build/dist/laplace-$(VERSION)-x86_64.tar.gz, the ISO, and
+# SHA256SUMS; `make dist-test` boots the tarball unpacked elsewhere.
+dist:
+	bash scripts/build/dist.sh
+
+dist-test: dist
+	bash tests/release/smoke.sh $(BUILD)/dist/laplace-$(VERSION)-x86_64.tar.gz
 
 clean:
 	rm -rf $(BUILD)
